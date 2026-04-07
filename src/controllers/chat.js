@@ -152,7 +152,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                             const streamImageTemplate = {
                                 "id": `chatcmpl-${message_id}`,
                                 "object": "chat.completion.chunk",
-                                "created": new Date().getTime(),
+                                "created": Math.round(new Date().getTime() / 1000),
                                 "choices": [
                                     {
                                         "index": 0,
@@ -200,7 +200,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                     const StreamTemplate = {
                         "id": `chatcmpl-${message_id}`,
                         "object": "chat.completion.chunk",
-                        "created": new Date().getTime(),
+                        "created": Math.round(new Date().getTime() / 1000),
                         "choices": [
                             {
                                 "index": 0,
@@ -228,7 +228,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                     res.write(`data: ${JSON.stringify({
                         "id": `chatcmpl-${message_id}`,
                         "object": "chat.completion.chunk",
-                        "created": new Date().getTime(),
+                        "created": Math.round(new Date().getTime() / 1000),
                         "choices": [
                             {
                                 "index": 0,
@@ -258,7 +258,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                 res.write(`data: ${JSON.stringify({
                     "id": `chatcmpl-${message_id}`,
                     "object": "chat.completion.chunk",
-                    "created": new Date().getTime(),
+                    "created": Math.round(new Date().getTime() / 1000),
                     "choices": [
                         {
                             "index": 0,
@@ -272,7 +272,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                 res.write(`data: ${JSON.stringify({
                     "id": `chatcmpl-${message_id}`,
                     "object": "chat.completion.chunk",
-                    "created": new Date().getTime(),
+                    "created": Math.round(new Date().getTime() / 1000),
                     "choices": [],
                     "usage": totalTokens
                 })}\n\n`)
@@ -467,7 +467,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         const bodyTemplate = {
             "id": `chatcmpl-${generateUUID()}`,
             "object": "chat.completion",
-            "created": new Date().getTime(),
+            "created": Math.round(new Date().getTime() / 1000),
             "model": model,
             "choices": [
                 {
