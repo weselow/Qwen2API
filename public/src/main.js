@@ -7,8 +7,8 @@ import zh from './locales/zh.json'
 import "./style.css"
 
 const i18n = createI18n({
-  locale: localStorage.getItem('locale') || 'zh',
-  fallbackLocale: 'ru',
+  locale: localStorage.getItem('locale') || 'ru',
+  fallbackLocale: 'zh',
   messages: { ru, zh },
   globalInjection: true
 })
