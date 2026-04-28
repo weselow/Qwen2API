@@ -276,7 +276,13 @@
               <div>
                 <label class="block text-sm font-medium text-gray-700">{{ t('dash.proxyLabel') }}</label>
                 <input v-model="newAccount.proxy" type="text" :placeholder="t('dash.proxyPlaceholder')"
-                       class="mt-1 block w-full rounded-xl border-gray-300 bg-white/50 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 transition-all duration-300 h-12 text-base px-4">
+                       :class="[
+                         'mt-1 block w-full rounded-xl bg-white/50 shadow-sm transition-all duration-300 h-12 text-base px-4',
+                         newAccountProxyValid
+                           ? 'border-gray-300 focus:border-indigo-500 focus:ring-indigo-500'
+                           : 'border-red-400 focus:border-red-500 focus:ring-red-500'
+                       ]">
+                <p v-if="!newAccountProxyValid" class="mt-1 text-sm text-red-600">{{ t('msg.proxyInvalid') }}</p>
               </div>
               <div class="flex justify-end space-x-4 pt-4">
                 <button @click="closeAddModal"
@@ -284,7 +290,8 @@
                   {{ t('dash.cancel') }}
                 </button>
                 <button @click="addToken"
-                        class="px-4 py-2 rounded-xl bg-black text-white hover:bg-white hover:text-black transition-all duration-300">
+                        :disabled="!newAccountProxyValid"
+                        class="px-4 py-2 rounded-xl bg-black text-white hover:bg-white hover:text-black transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed">
                   {{ t('dash.add') }}
                 </button>
               </div>
@@ -407,7 +414,13 @@
             <label class="block text-sm font-medium text-gray-700">{{ t('dash.proxyLabel') }}</label>
             <input v-model="editProxy.proxy" type="text" :placeholder="t('dash.proxyPlaceholder')"
                    :disabled="isSavingProxy"
-                   class="mt-1 block w-full rounded-xl border-gray-300 bg-white/50 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 transition-all duration-300 h-12 text-base px-4 disabled:opacity-70">
+                   :class="[
+                     'mt-1 block w-full rounded-xl bg-white/50 shadow-sm transition-all duration-300 h-12 text-base px-4 disabled:opacity-70',
+                     editProxyValid
+                       ? 'border-gray-300 focus:border-indigo-500 focus:ring-indigo-500'
+                       : 'border-red-400 focus:border-red-500 focus:ring-red-500'
+                   ]">
+            <p v-if="!editProxyValid" class="mt-1 text-sm text-red-600">{{ t('msg.proxyInvalid') }}</p>
           </div>
           <div class="flex justify-end space-x-3 pt-2">
             <button @click="closeEditProxyModal"
@@ -421,8 +434,8 @@
               {{ t('dash.clearProxy') }}
             </button>
             <button @click="saveProxy"
-                    :disabled="isSavingProxy"
-                    class="px-4 py-2 rounded-xl bg-black text-white hover:bg-white hover:text-black border border-black transition-all duration-300 disabled:opacity-50">
+                    :disabled="isSavingProxy || !editProxyValid"
+                    class="px-4 py-2 rounded-xl bg-black text-white hover:bg-white hover:text-black border border-black transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed">
               {{ t('dash.save') }}
             </button>
           </div>
@@ -471,6 +484,18 @@ const newAccount = ref({
 const showEditProxyModal = ref(false)
 const editProxy = ref({ email: '', proxy: '' })
 const isSavingProxy = ref(false)
+
+// 与后端 src/utils/proxy-helper.js#PROXY_URL_REGEX 保持一致
+const PROXY_URL_REGEX = /^(https?|socks5):\/\/[^\s]+$/i
+const isValidProxy = (value) => {
+  if (!value) return true
+  const trimmed = String(value).trim()
+  if (!trimmed) return true
+  return PROXY_URL_REGEX.test(trimmed)
+}
+const newAccountProxyValid = computed(() => isValidProxy(newAccount.value.proxy))
+const editProxyValid = computed(() => isValidProxy(editProxy.value.proxy))
+
 const batchAccounts = ref('')
 const isBatchAdding = ref(false)
 const batchTask = ref(null)

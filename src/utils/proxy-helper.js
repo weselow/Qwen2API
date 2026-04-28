@@ -4,6 +4,25 @@ const { HttpsProxyAgent } = require('https-proxy-agent')
 // 按代理 URL 缓存 agent 实例（多账号共享同一代理时复用同一个 agent）
 const proxyAgents = new Map()
 
+// 接受 http/https/socks5 协议；正则故意宽松，仅拦截最常见的拼写错误
+// （缺少协议、错误协议如 'htp://'），不强制 host 形态以免拒绝合法的
+// 含用户名/密码、IPv6、自定义路径的代理 URL
+const PROXY_URL_REGEX = /^(https?|socks5):\/\/[^\s]+$/i
+
+/**
+ * 校验代理 URL 格式
+ * 空值（null/undefined/空字符串）视为合法（表示"无账号级代理"）
+ * @param {string|null|undefined} url
+ * @returns {boolean}
+ */
+const isValidProxyUrl = (url) => {
+    if (url === null || url === undefined || url === '') return true
+    if (typeof url !== 'string') return false
+    const trimmed = url.trim()
+    if (!trimmed) return true
+    return PROXY_URL_REGEX.test(trimmed)
+}
+
 /**
  * 解析账号实际使用的代理 URL
  * 优先级: account.proxy > 全局 PROXY_URL > 不使用代理
@@ -109,5 +128,6 @@ module.exports = {
     getChatBaseUrl,
     getCliBaseUrl,
     applyProxyToAxiosConfig,
-    applyProxyToFetchOptions
+    applyProxyToFetchOptions,
+    isValidProxyUrl
 }

@@ -7,6 +7,10 @@ const { JwtDecode } = require('../utils/tools')
 const { adminKeyVerify } = require('../middlewares/authorization')
 const { deleteAccount, saveAccounts, refreshAccountToken } = require('../utils/setting')
 const { parseAccountLine } = require('../utils/account-parser')
+const { isValidProxyUrl } = require('../utils/proxy-helper')
+
+// 仅在 proxy 字段存在时触发；空字符串/null 一律视为"清除代理"，无需校验
+const PROXY_FORMAT_ERROR = '代理 URL 格式无效，应以 http://、https:// 或 socks5:// 开头'
 
 const batchAccountTasks = new Map()
 const BATCH_TASK_RETENTION_MS = 1000 * 60 * 30
@@ -49,6 +53,11 @@ const parseBatchAccountsText = (accountsText) => {
   for (const accountLine of accountLines) {
     const parsed = parseAccountLine(accountLine)
     if (!parsed) {
+      invalidCount++
+      continue
+    }
+    // 行格式合法但 proxy 字段格式错误，整行视为无效，避免后续登录后才暴露失败
+    if (parsed.proxy && !isValidProxyUrl(parsed.proxy)) {
       invalidCount++
       continue
     }
@@ -316,6 +325,14 @@ router.post('/setAccount', adminKeyVerify, async (req, res) => {
       return res.status(400).json({ error: '邮箱和密码不能为空' })
     }
 
+    // 规范化 proxy：空字符串/纯空白/非字符串 → null
+    const normalizedProxy = (typeof proxy === 'string' && proxy.trim()) ? proxy.trim() : null
+
+    // 防御性校验：拦截明显的拼写错误（缺协议等），运行时才暴露的错误对用户不友好
+    if (normalizedProxy && !isValidProxyUrl(normalizedProxy)) {
+      return res.status(400).json({ error: PROXY_FORMAT_ERROR })
+    }
+
     // 检查账号是否已存在
     const exists = accountManager.accountTokens.find(item => item.email === email)
     if (exists) {
@@ -329,9 +346,6 @@ router.post('/setAccount', adminKeyVerify, async (req, res) => {
     // 解析JWT
     const decoded = JwtDecode(authToken)
     const expires = decoded.exp
-
-    // 规范化 proxy：空字符串/纯空白/非字符串 → null
-    const normalizedProxy = (typeof proxy === 'string' && proxy.trim()) ? proxy.trim() : null
 
     const success = await saveAccounts(email, password, authToken, expires, normalizedProxy)
 
@@ -478,12 +492,18 @@ router.post('/updateAccountProxy', adminKeyVerify, async (req, res) => {
       return res.status(400).json({ error: '邮箱不能为空' })
     }
 
+    // 同 /setAccount：仅在传入了非空 proxy 时才校验格式；空值用于清除
+    const normalizedProxy = (typeof proxy === 'string' && proxy.trim()) ? proxy.trim() : null
+    if (normalizedProxy && !isValidProxyUrl(normalizedProxy)) {
+      return res.status(400).json({ error: PROXY_FORMAT_ERROR })
+    }
+
     const exists = accountManager.accountTokens.find(item => item.email === email)
     if (!exists) {
       return res.status(404).json({ error: '账号不存在' })
     }
 
-    const success = await accountManager.updateAccountProxy(email, proxy)
+    const success = await accountManager.updateAccountProxy(email, normalizedProxy)
 
     if (success) {
       res.json({

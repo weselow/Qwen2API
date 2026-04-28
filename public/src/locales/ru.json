@@ -94,7 +94,8 @@
     "refreshAllFailed": "Ошибка обновления: ",
     "forceRefreshAllFailed": "Ошибка принудительного обновления: ",
     "proxyUpdateSuccess": "Proxy обновлён",
-    "proxyUpdateFailed": "Ошибка обновления proxy: "
+    "proxyUpdateFailed": "Ошибка обновления proxy: ",
+    "proxyInvalid": "Неверный формат: ожидается http://, https:// или socks5://"
   },
   "settings": {
     "title": "Настройки",
