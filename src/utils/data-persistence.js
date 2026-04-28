@@ -123,12 +123,21 @@ class DataPersistence {
     const accountTokens = process.env.ACCOUNTS.split(',')
     const accounts = []
 
+    // 支持两种格式（向后兼容）：
+    //   email:password                  — 旧格式，无独立代理
+    //   email:password|proxy_url        — 新格式，附带账号级代理
+    // 用 indexOf 而非 split('|')，避免代理 URL 中可能出现的边缘字符干扰
     for (const item of accountTokens) {
-      const [email, password] = item.split(':')
+      const pipeIdx = item.indexOf('|')
+      const credentials = pipeIdx === -1 ? item : item.slice(0, pipeIdx)
+      const proxyRaw = pipeIdx === -1 ? '' : item.slice(pipeIdx + 1)
+      const proxy = proxyRaw.trim() || null
+
+      const [email, password] = credentials.split(':')
       if (email && password) {
         // 注意：这里需要登录获取token，但在加载阶段不应该进行网络请求
         // 这个逻辑需要在Account类中处理
-        accounts.push({ email, password, token: null, expires: null })
+        accounts.push({ email, password, proxy, token: null, expires: null })
       }
     }
 
@@ -163,7 +172,8 @@ class DataPersistence {
       email,
       password: accountData.password,
       token: accountData.token,
-      expires: accountData.expires
+      expires: accountData.expires,
+      proxy: accountData.proxy ?? null
     }
 
     if (existingIndex !== -1) {
@@ -203,7 +213,8 @@ class DataPersistence {
       email: account.email,
       password: account.password,
       token: account.token,
-      expires: account.expires
+      expires: account.expires,
+      proxy: account.proxy ?? null
     }))
 
     await fs.writeFile(this.dataFilePath, JSON.stringify(data, null, 2), 'utf-8')
