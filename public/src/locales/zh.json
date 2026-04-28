@@ -31,7 +31,7 @@
     "batchAdd": "批量添加",
     "addTitle": "添加账号",
     "batchTitle": "批量添加账号",
-    "batchLabel": "账号列表（每行一个，格式：email:password）",
+    "batchLabel": "账号列表（每行一个，格式：email:password 或 email:password|proxy_url）",
     "taskStatus": "任务状态",
     "taskId": "任务 ID:",
     "progress": "处理进度",

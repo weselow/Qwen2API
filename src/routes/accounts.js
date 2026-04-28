@@ -6,6 +6,7 @@ const { logger } = require('../utils/logger')
 const { JwtDecode } = require('../utils/tools')
 const { adminKeyVerify } = require('../middlewares/authorization')
 const { deleteAccount, saveAccounts, refreshAccountToken } = require('../utils/setting')
+const { parseAccountLine } = require('../utils/account-parser')
 
 const batchAccountTasks = new Map()
 const BATCH_TASK_RETENTION_MS = 1000 * 60 * 30
@@ -29,8 +30,11 @@ const scheduleBatchTaskCleanup = (taskId) => {
 
 /**
  * 解析批量账号文本
+ * 行格式（与 ENV ACCOUNTS 一致）：
+ *   email:password                  — 老格式
+ *   email:password|proxy_url        — 新格式，附带账号级代理
  * @param {string} accountsText - 原始账号文本
- * @returns {{ accountLines: string[], parsedAccounts: Array<{ email: string, password: string }>, invalidCount: number }} 解析结果
+ * @returns {{ accountLines: string[], parsedAccounts: Array<{ email: string, password: string, proxy: string|null }>, invalidCount: number }} 解析结果
  */
 const parseBatchAccountsText = (accountsText) => {
   const normalizedText = String(accountsText).replace(/[\r]/g, '\n')
@@ -43,21 +47,12 @@ const parseBatchAccountsText = (accountsText) => {
   let invalidCount = 0
 
   for (const accountLine of accountLines) {
-    const separatorIndex = accountLine.indexOf(':')
-    if (separatorIndex === -1) {
+    const parsed = parseAccountLine(accountLine)
+    if (!parsed) {
       invalidCount++
       continue
     }
-
-    const email = accountLine.slice(0, separatorIndex).trim()
-    const password = accountLine.slice(separatorIndex + 1).trim()
-
-    if (!email || !password) {
-      invalidCount++
-      continue
-    }
-
-    parsedAccounts.push({ email, password })
+    parsedAccounts.push(parsed)
   }
 
   return {
@@ -175,10 +170,10 @@ const updateBatchTaskMessage = (task) => {
 /**
  * 执行单个账号的批量登录任务
  * @param {object} task - 任务对象
- * @param {{ email: string, password: string }} account - 账号信息
+ * @param {{ email: string, password: string, proxy: string|null }} account - 账号信息
  */
 const processBatchAccountItem = async (task, account) => {
-  const { email, password } = account
+  const { email, password, proxy } = account
   task.activeEmails.push(email)
   updateBatchTaskMessage(task)
 
@@ -189,7 +184,7 @@ const processBatchAccountItem = async (task, account) => {
     }
 
     const decoded = JwtDecode(authToken)
-    const saved = await accountManager.addAccountWithToken(email, password, authToken, decoded.exp)
+    const saved = await accountManager.addAccountWithToken(email, password, authToken, decoded.exp, proxy)
     if (!saved) {
       throw new Error('保存失败')
     }

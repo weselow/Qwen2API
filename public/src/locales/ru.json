@@ -31,7 +31,7 @@
     "batchAdd": "Пакетное добавление",
     "addTitle": "Добавить аккаунт",
     "batchTitle": "Пакетное добавление аккаунтов",
-    "batchLabel": "Список аккаунтов (по одному на строку, формат: email:password)",
+    "batchLabel": "Список аккаунтов (по одному на строку, формат: email:password или email:password|proxy_url)",
     "taskStatus": "Статус задачи",
     "taskId": "ID задачи:",
     "progress": "Прогресс",

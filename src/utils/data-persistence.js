@@ -119,25 +119,16 @@ class DataPersistence {
       return []
     }
 
-    const { JwtDecode } = require('./tools')
+    const { parseAccountLine } = require('./account-parser')
     const accountTokens = process.env.ACCOUNTS.split(',')
     const accounts = []
 
-    // 支持两种格式（向后兼容）：
-    //   email:password                  — 旧格式，无独立代理
-    //   email:password|proxy_url        — 新格式，附带账号级代理
-    // 用 indexOf 而非 split('|')，避免代理 URL 中可能出现的边缘字符干扰
+    // 解析委托给共用 parser，与后台批量添加保持一致；
+    // 注意：这里仅加载凭据，token 在 Account 类中按需登录获取
     for (const item of accountTokens) {
-      const pipeIdx = item.indexOf('|')
-      const credentials = pipeIdx === -1 ? item : item.slice(0, pipeIdx)
-      const proxyRaw = pipeIdx === -1 ? '' : item.slice(pipeIdx + 1)
-      const proxy = proxyRaw.trim() || null
-
-      const [email, password] = credentials.split(':')
-      if (email && password) {
-        // 注意：这里需要登录获取token，但在加载阶段不应该进行网络请求
-        // 这个逻辑需要在Account类中处理
-        accounts.push({ email, password, proxy, token: null, expires: null })
+      const parsed = parseAccountLine(item)
+      if (parsed) {
+        accounts.push({ ...parsed, token: null, expires: null })
       }
     }
 
