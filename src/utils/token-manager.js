@@ -26,11 +26,12 @@ class TokenManager {
      * 用户登录获取令牌
      * @param {string} email - 邮箱
      * @param {string} password - 密码
+     * @param {Object} [account] - 账户对象（用于解析账号级代理；为空时回退到全局 PROXY_URL）
      * @returns {Promise<string|null>} 令牌或null
      */
-    async login(email, password) {
+    async login(email, password, account) {
         try {
-            const proxyAgent = getProxyAgent()
+            const proxyAgent = getProxyAgent(account)
             const requestConfig = {
                 headers: this.defaultHeaders,
                 timeout: 10000 // 10秒超时
@@ -128,7 +129,7 @@ class TokenManager {
      */
     async refreshToken(account) {
         try {
-            const newToken = await this.login(account.email, account.password)
+            const newToken = await this.login(account.email, account.password, account)
             if (!newToken) {
                 return null
             }

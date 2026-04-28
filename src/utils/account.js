@@ -100,7 +100,7 @@ class Account {
     async _loginEnvironmentAccounts() {
         const loginPromises = this.accountTokens.map(async (account) => {
             if (!account.token && account.email && account.password) {
-                const token = await this.tokenManager.login(account.email, account.password)
+                const token = await this.tokenManager.login(account.email, account.password, account)
                 if (token) {
                     const decoded = this.tokenManager.validateToken(token)
                     if (decoded) {
@@ -123,7 +123,7 @@ class Account {
     async _initializeCliAccount(account) {
         try {
             const cliManager = require('./cli.manager')
-            const cliAccount = await cliManager.initCliAccount(account.token)
+            const cliAccount = await cliManager.initCliAccount(account.token, account)
 
             if (cliAccount.access_token && cliAccount.refresh_token && cliAccount.expiry_date) {
                 account.cli_info = {
@@ -136,7 +136,7 @@ class Account {
                                 access_token: account.cli_info.access_token,
                                 refresh_token: account.cli_info.refresh_token,
                                 expiry_date: account.cli_info.expiry_date
-                            })
+                            }, account)
                             if (refreshToken.access_token && refreshToken.refresh_token && refreshToken.expiry_date) {
                                 account.cli_info.access_token = refreshToken.access_token
                                 account.cli_info.refresh_token = refreshToken.refresh_token
@@ -210,7 +210,7 @@ class Account {
             } else if (account.email && account.password) {
                 // 尝试重新登录
                 logger.info(`令牌无效，尝试重新登录: ${account.email}`, 'TOKEN', '🔄')
-                const newToken = await this.tokenManager.login(account.email, account.password)
+                const newToken = await this.tokenManager.login(account.email, account.password, account)
                 if (newToken) {
                     const decoded = this.tokenManager.validateToken(newToken)
                     if (decoded) {
@@ -302,10 +302,10 @@ class Account {
     }
 
     /**
-     * 获取可用的账户令牌
-     * @returns {string|null} 账户令牌或null
+     * 获取下一个可用的账户对象（包含 proxy 等完整字段）
+     * @returns {Object|null} 账户对象或 null
      */
-    getAccountToken() {
+    getAccount() {
         if (!this.isInitialized) {
             logger.warn('账户管理器尚未初始化完成', 'ACCOUNT')
             return null
@@ -316,16 +316,44 @@ class Account {
             return null
         }
 
-        const token = this.accountRotator.getNextToken()
-        if (!token) {
+        const account = this.accountRotator.getNextAccount()
+        if (!account) {
             logger.error('所有账户令牌都不可用', 'ACCOUNT')
         }
 
-        return token
+        return account
     }
 
     /**
-     * 根据邮箱获取特定账户的令牌
+     * 获取可用的账户令牌（向后兼容的便捷方法）
+     * @returns {string|null} 账户令牌或null
+     */
+    getAccountToken() {
+        const account = this.getAccount()
+        return account ? account.token : null
+    }
+
+    /**
+     * 根据邮箱获取特定账户对象
+     * @param {string} email - 邮箱地址
+     * @returns {Object|null} 账户对象或 null
+     */
+    getAccountByEmail(email) {
+        return this.accountRotator.getAccountByEmail(email)
+    }
+
+    /**
+     * 根据令牌反查账户对象（用于只持有 token 的下游调用解析账号级代理）
+     * @param {string} token - 访问令牌
+     * @returns {Object|null} 账户对象或 null
+     */
+    getAccountByToken(token) {
+        if (!token) return null
+        return this.accountTokens.find(acc => acc.token === token) || null
+    }
+
+    /**
+     * 根据邮箱获取特定账户的令牌（向后兼容）
      * @param {string} email - 邮箱地址
      * @returns {string|null} 账户令牌或null
      */

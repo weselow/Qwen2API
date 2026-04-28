@@ -663,8 +663,8 @@ const sendOpenAIErrorResponse = (res, error) => {
  * @param {string} contentUrl - 资源链接
  * @returns {Promise<string>} Base64 内容
  */
-const downloadAssetAsBase64 = async (contentUrl) => {
-    const proxyAgent = getProxyAgent()
+const downloadAssetAsBase64 = async (contentUrl, account) => {
+    const proxyAgent = getProxyAgent(account)
     const requestConfig = {
         responseType: 'arraybuffer',
         timeout: 1000 * 60 * 2
@@ -754,7 +754,8 @@ const uploadMultipartMediaFile = async (file, mediaType) => {
 
     const fallbackExtension = mediaType === 'video' ? 'mp4' : 'png'
     const originalFilename = file.originalname || `upload.${fallbackExtension}`
-    const uploadResult = await uploadFileToQwenOss(file.buffer, originalFilename, accountManager.getAccountToken())
+    const uploadAccount = accountManager.getAccount()
+    const uploadResult = await uploadFileToQwenOss(file.buffer, originalFilename, uploadAccount ? uploadAccount.token : null, uploadAccount)
 
     if (!uploadResult || uploadResult.status !== 200) {
         throw new Error('文件上传失败')
@@ -787,7 +788,8 @@ const normalizeInlineMediaItem = async (value, mediaType) => {
     const mimeType = matchedDataURI[1]
     const base64Content = matchedDataURI[2]
     const fileExtension = mimeType?.split('/')[1] || (mediaType === 'video' ? 'mp4' : 'png')
-    const uploadResult = await uploadFileToQwenOss(Buffer.from(base64Content, 'base64'), `upload.${fileExtension}`, accountManager.getAccountToken())
+    const uploadAccount = accountManager.getAccount()
+    const uploadResult = await uploadFileToQwenOss(Buffer.from(base64Content, 'base64'), `upload.${fileExtension}`, uploadAccount ? uploadAccount.token : null, uploadAccount)
 
     if (!uploadResult || uploadResult.status !== 200) {
         throw new Error('文件上传失败')
@@ -1031,7 +1033,9 @@ const readImageUpstreamResult = async (responseStream) => {
 const getChatDetail = async (chatID, token) => {
     try {
         const chatBaseUrl = getChatBaseUrl()
-        const proxyAgent = getProxyAgent()
+        // 通过 token 反查 account 解析账号级代理（找不到则回退到全局 PROXY_URL）
+        const account = accountManager.getAccountByToken(token)
+        const proxyAgent = getProxyAgent(account)
         const cookieHeader = buildUpstreamCookieHeader(token)
 
         const requestConfig = {
@@ -1238,7 +1242,9 @@ const resolveVideoResultContentUrl = async (responseStream, token, chatID) => {
  */
 const generateImageVideoResult = async (payload) => {
     const { model, messages, size, chat_type } = payload
-    const token = accountManager.getAccountToken()
+    // 一次取出账户对象，确保 token 与 proxy 走同一个账号
+    const account = accountManager.getAccount()
+    const token = account ? account.token : null
 
     try {
         const reqBody = {
@@ -1355,7 +1361,7 @@ const generateImageVideoResult = async (payload) => {
         }
 
         const chatBaseUrl = getChatBaseUrl()
-        const proxyAgent = getProxyAgent()
+        const proxyAgent = getProxyAgent(account)
         const cookieHeader = buildUpstreamCookieHeader(token)
 
         logger.info('发送图片视频请求', 'CHAT')
@@ -1846,7 +1852,8 @@ const handleVideoCompletion = async (res, responseStream, token, model, downstre
 const getVideoTaskStatus = async (videoTaskID, token) => {
     try {
         const chatBaseUrl = getChatBaseUrl()
-        const proxyAgent = getProxyAgent()
+        const account = accountManager.getAccountByToken(token)
+        const proxyAgent = getProxyAgent(account)
         const cookieHeader = buildUpstreamCookieHeader(token)
 
         const requestConfig = {

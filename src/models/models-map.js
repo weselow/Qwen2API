@@ -18,11 +18,13 @@ const getLatestModels = async (force = false) => {
     }
 
     const chatBaseUrl = getChatBaseUrl()
-    const proxyAgent = getProxyAgent()
+    // 一次取出账户对象，token 与 proxy 走同一个账号，避免 round-robin 错位
+    const account = accountManager.getAccount()
+    const proxyAgent = getProxyAgent(account)
 
     const requestConfig = {
         headers: {
-            'Authorization': `Bearer ${accountManager.getAccountToken()}`,
+            'Authorization': `Bearer ${account ? account.token : ''}`,
             'Content-Type': 'application/json',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             ...(getSsxmodItna() && { 'Cookie': `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}` })

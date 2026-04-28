@@ -66,9 +66,10 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
  * @param {string} filetypeSimple - 简化文件类型
  * @param {string} authToken - 认证Token
  * @param {number} retryCount - 重试次数
+ * @param {Object} [account] - 账户对象（用于解析账号级代理）
  * @returns {Promise<Object>} STS Token响应数据
  */
-const requestStsToken = async (filename, filesize, filetypeSimple, authToken, retryCount = 0) => {
+const requestStsToken = async (filename, filesize, filetypeSimple, authToken, retryCount = 0, account) => {
     try {
         // 参数验证
         if (!filename || !authToken) {
@@ -83,7 +84,7 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
 
         const requestId = generateUUID()
         const bearerToken = authToken.startsWith('Bearer ') ? authToken : `Bearer ${authToken}`
-        const proxyAgent = getProxyAgent()
+        const proxyAgent = getProxyAgent(account)
 
         const headers = {
             'Authorization': bearerToken,
@@ -168,7 +169,7 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
             logger.warn(`等待 ${delayMs}ms 后重试...`, 'UPLOAD', '⏳')
             await delay(delayMs)
 
-            return requestStsToken(filename, filesize, filetypeSimple, authToken, retryCount + 1)
+            return requestStsToken(filename, filesize, filetypeSimple, authToken, retryCount + 1, account)
         }
 
         throw error
@@ -237,11 +238,12 @@ const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileConte
  * 完整的文件上传流程：获取STS Token -> 上传到OSS。
  * @param {Buffer} fileBuffer - 图片文件的Buffer。
  * @param {string} originalFilename - 原始文件名 (例如 "image.png")。
- * @param {string} qwenAuthToken - 通义千问认证Token (纯token，不含Bearer)。
+ * @param {string} authToken - 通义千问认证Token (纯token，不含Bearer)。
+ * @param {Object} [account] - 账户对象（用于解析账号级代理）
  * @returns {Promise<{file_url: string, file_id: string, message: string}>} 包含上传后的URL、文件ID和成功消息。
  * @throws {Error} 如果任何步骤失败。
  */
-const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken) => {
+const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, account) => {
     try {
         // 参数验证
         if (!fileBuffer || !originalFilename || !authToken) {
@@ -266,7 +268,9 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken) => {
             originalFilename,
             filesize,
             filetypeSimple,
-            authToken
+            authToken,
+            0,
+            account
         )
 
         // 第二步：上传到OSS

@@ -61,9 +61,10 @@ class CliAuthManager {
 
     /**
      * 启动 OAuth 设备授权流程
+     * @param {Object} [account] - Qwen 账户对象（用于解析账号级代理）
      * @returns {Promise<Object>} 包含设备代码、验证URL和代码验证器的对象
      */
-    async initiateDeviceFlow() {
+    async initiateDeviceFlow(account) {
         // 生成 PKCE 代码验证器和挑战
         const { code_verifier, code_challenge } = generatePKCEPair()
 
@@ -85,7 +86,7 @@ class CliAuthManager {
             body: bodyData,
         }
 
-        applyProxyToFetchOptions(fetchOptions)
+        applyProxyToFetchOptions(fetchOptions, account)
 
         try {
             const response = await fetch(`${chatBaseUrl}/api/v1/oauth2/device/code`, fetchOptions)
@@ -127,9 +128,10 @@ class CliAuthManager {
      * 授权登录
      * @param {string} user_code - 用户代码
      * @param {string} access_token - 访问令牌
+     * @param {Object} [account] - Qwen 账户对象（用于解析账号级代理）
      * @returns {Promise<boolean>} 是否授权成功
      */
-    async authorizeLogin(user_code, access_token) {
+    async authorizeLogin(user_code, access_token, account) {
         try {
             const chatBaseUrl = getChatBaseUrl()
 
@@ -145,7 +147,7 @@ class CliAuthManager {
                 })
             }
 
-            applyProxyToFetchOptions(fetchOptions)
+            applyProxyToFetchOptions(fetchOptions, account)
 
             const response = await fetch(`${chatBaseUrl}/api/v2/oauth2/authorize`, fetchOptions)
 
@@ -173,9 +175,10 @@ class CliAuthManager {
      * 轮询获取访问令牌
      * @param {string} device_code - 设备代码
      * @param {string} code_verifier - 代码验证器
+     * @param {Object} [account] - Qwen 账户对象（用于解析账号级代理）
      * @returns {Promise<Object>} 访问令牌信息
      */
-    async pollForToken(device_code, code_verifier) {
+    async pollForToken(device_code, code_verifier, account) {
         let pollInterval = 5000
         const maxAttempts = 60
         const chatBaseUrl = getChatBaseUrl()
@@ -197,7 +200,7 @@ class CliAuthManager {
                 body: bodyData,
             }
 
-            applyProxyToFetchOptions(fetchOptions)
+            applyProxyToFetchOptions(fetchOptions, account)
 
             try {
                 const response = await fetch(`${chatBaseUrl}/api/v1/oauth2/token`, fetchOptions)
@@ -250,10 +253,11 @@ class CliAuthManager {
     /**
      * 初始化 CLI 账户
      * @param {string} access_token - 访问令牌
+     * @param {Object} [account] - Qwen 账户对象（用于解析账号级代理）
      * @returns {Promise<Object>} 账户信息
      */
-    async initCliAccount(access_token) {
-        const deviceFlow = await this.initiateDeviceFlow()
+    async initCliAccount(access_token, account) {
+        const deviceFlow = await this.initiateDeviceFlow(account)
         if (!deviceFlow.status) {
             logger.error('CLI账户初始化失败：设备授权流程未成功启动', 'CLI')
             return {
@@ -264,7 +268,7 @@ class CliAuthManager {
             }
         }
 
-        if (!await this.authorizeLogin(deviceFlow.user_code, access_token)) {
+        if (!await this.authorizeLogin(deviceFlow.user_code, access_token, account)) {
             logger.error('CLI账户初始化失败：设备授权确认未通过', 'CLI', '', {
                 user_code: deviceFlow.user_code
             })
@@ -276,7 +280,7 @@ class CliAuthManager {
             }
         }
 
-        const cliToken = await this.pollForToken(deviceFlow.device_code, deviceFlow.code_verifier)
+        const cliToken = await this.pollForToken(deviceFlow.device_code, deviceFlow.code_verifier, account)
         if (!cliToken.access_token || !cliToken.refresh_token || !cliToken.expiry_date) {
             logger.error('CLI账户初始化失败：轮询令牌返回数据不完整', 'CLI', '', cliToken)
         }
@@ -286,9 +290,10 @@ class CliAuthManager {
     /**
      * 刷新访问令牌
      * @param {Object} CliAccount - 账户信息
+     * @param {Object} [account] - Qwen 账户对象（用于解析账号级代理）
      * @returns {Promise<Object>} 账户信息
      */
-    async refreshAccessToken(CliAccount) {
+    async refreshAccessToken(CliAccount, account) {
         try {
 
             if (!CliAccount || !CliAccount.refresh_token) {
@@ -312,7 +317,7 @@ class CliAuthManager {
                 body: bodyData
             }
 
-            applyProxyToFetchOptions(fetchOptions)
+            applyProxyToFetchOptions(fetchOptions, account)
 
             const response = await fetch(`${chatBaseUrl}/api/v1/oauth2/token`, fetchOptions)
 

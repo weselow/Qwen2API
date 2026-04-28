@@ -14,8 +14,9 @@ const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./pr
  */
 const sendChatRequest = async (body) => {
     try {
-        // 获取可用的令牌
-        const currentToken = accountManager.getAccountToken()
+        // 获取可用的账户（包含 proxy 等完整字段）
+        const currentAccount = accountManager.getAccount()
+        const currentToken = currentAccount ? currentAccount.token : null
 
         if (!currentToken) {
             logger.error('无法获取有效的访问令牌', 'TOKEN')
@@ -26,7 +27,7 @@ const sendChatRequest = async (body) => {
         }
 
         const chatBaseUrl = getChatBaseUrl()
-        const proxyAgent = getProxyAgent()
+        const proxyAgent = getProxyAgent(currentAccount)
 
         // 构建请求配置
         const requestConfig = {
@@ -63,7 +64,7 @@ const sendChatRequest = async (body) => {
         // console.log(body)
         // console.log(requestConfig)
 
-        const chat_id = await generateChatID(currentToken, body.model)
+        const chat_id = await generateChatID(currentToken, body.model, currentAccount)
 
         logger.network(`发送聊天请求`, 'REQUEST')
         const response = await axios.post(`${chatBaseUrl}/api/v2/chat/completions?chat_id=` + chat_id, {
@@ -94,13 +95,15 @@ const sendChatRequest = async (body) => {
 
 /**
  * 生成chat_id
- * @param {*} currentToken 
+ * @param {string} currentToken
+ * @param {string} model
+ * @param {Object} [account] - 当前账户对象（用于解析账号级代理）
  * @returns {Promise<string|null>} 返回生成的chat_id，如果失败则返回null
  */
-const generateChatID = async (currentToken, model) => {
+const generateChatID = async (currentToken, model, account) => {
     try {
         const chatBaseUrl = getChatBaseUrl()
-        const proxyAgent = getProxyAgent()
+        const proxyAgent = getProxyAgent(account)
 
         const requestConfig = {
             headers: {

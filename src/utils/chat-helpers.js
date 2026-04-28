@@ -162,7 +162,8 @@ const normalizeMediaContentItem = async (item, imgCacheManager) => {
         }
 
         const buffer = Buffer.from(base64Content, 'base64')
-        const uploadResult = await uploadFileToQwenOss(buffer, filename, accountManager.getAccountToken())
+        const uploadAccount = accountManager.getAccount()
+        const uploadResult = await uploadFileToQwenOss(buffer, filename, uploadAccount ? uploadAccount.token : null, uploadAccount)
 
         if (!uploadResult || uploadResult.status !== 200) {
             return null
