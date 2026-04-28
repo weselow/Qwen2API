@@ -52,7 +52,14 @@
     "statusRunning": "进行中",
     "statusPending": "排队中",
     "statusNotStarted": "未开始",
-    "copiedToClipboard": "已复制到剪贴板"
+    "copiedToClipboard": "已复制到剪贴板",
+    "proxyLabel": "代理地址（可选）",
+    "proxyPlaceholder": "http://user:pass@host:port",
+    "editProxy": "修改代理",
+    "editProxyTitle": "修改代理",
+    "editProxyHint": "留空将清除该账号代理，回退到全局 PROXY_URL",
+    "clearProxy": "清除",
+    "save": "保存"
   },
   "msg": {
     "batchComplete": "批量添加完成: 成功{n}个",
@@ -85,7 +92,9 @@
     "exportEmpty": "没有可导出的账号",
     "copyFailed": "复制失败",
     "refreshAllFailed": "批量刷新失败: ",
-    "forceRefreshAllFailed": "强制刷新失败: "
+    "forceRefreshAllFailed": "强制刷新失败: ",
+    "proxyUpdateSuccess": "代理更新成功",
+    "proxyUpdateFailed": "代理更新失败: "
   },
   "settings": {
     "title": "系统设置",

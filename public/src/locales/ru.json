@@ -52,7 +52,14 @@
     "statusRunning": "Выполняется",
     "statusPending": "В очереди",
     "statusNotStarted": "Не начато",
-    "copiedToClipboard": "Скопировано"
+    "copiedToClipboard": "Скопировано",
+    "proxyLabel": "Proxy URL (необязательно)",
+    "proxyPlaceholder": "http://user:pass@host:port",
+    "editProxy": "Изменить proxy",
+    "editProxyTitle": "Изменить proxy",
+    "editProxyHint": "Оставьте пустым, чтобы очистить и использовать глобальный PROXY_URL",
+    "clearProxy": "Очистить",
+    "save": "Сохранить"
   },
   "msg": {
     "batchComplete": "Добавление завершено: успешно {n}",
@@ -85,7 +92,9 @@
     "exportEmpty": "Нет аккаунтов для экспорта",
     "copyFailed": "Ошибка копирования",
     "refreshAllFailed": "Ошибка обновления: ",
-    "forceRefreshAllFailed": "Ошибка принудительного обновления: "
+    "forceRefreshAllFailed": "Ошибка принудительного обновления: ",
+    "proxyUpdateSuccess": "Proxy обновлён",
+    "proxyUpdateFailed": "Ошибка обновления proxy: "
   },
   "settings": {
     "title": "Настройки",

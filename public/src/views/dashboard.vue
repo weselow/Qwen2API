@@ -184,9 +184,20 @@
                   </div>
                   <button @click="copyToClipboard(new Date(token.expires * 1000).toLocaleString())" class="absolute right-2 opacity-0 hover:opacity-100 transition-opacity bg-blue-200 hover:bg-blue-300 rounded px-2 py-1 text-base">📋</button>
                 </div>
+                <div class="relative flex items-center bg-blue-50/80 rounded-lg px-2 py-1">
+                  <div class="overflow-x-auto scrollbar-hide flex-1 flex items-center space-x-2">
+                    <span class="text-gray-700 min-w-[96px] text-left font-semibold">🌐 Proxy:</span>
+                    <span class="font-medium whitespace-nowrap text-left text-sm" :title="token.proxy || ''">{{ token.proxy || '—' }}</span>
+                  </div>
+                  <button v-if="token.proxy" @click="copyToClipboard(token.proxy)" class="absolute right-2 opacity-0 hover:opacity-100 transition-opacity bg-blue-200 hover:bg-blue-300 rounded px-2 py-1 text-base">📋</button>
+                </div>
               </div>
 
               <div class="pt-4 mt-auto border-t border-gray-200/50 space-y-2">
+                <button @click="openEditProxy(token)"
+                        class="w-full py-2 rounded-lg transition-all duration-300 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200">
+                  {{ t('dash.editProxy') }}
+                </button>
                 <button @click="refreshToken(token.email)"
                         :disabled="refreshingTokens.includes(token.email)"
                         :class="[
@@ -260,6 +271,11 @@
               <div>
                 <label class="block text-sm font-medium text-gray-700">Password</label>
                 <input v-model="newAccount.password" type="password"
+                       class="mt-1 block w-full rounded-xl border-gray-300 bg-white/50 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 transition-all duration-300 h-12 text-base px-4">
+              </div>
+              <div>
+                <label class="block text-sm font-medium text-gray-700">{{ t('dash.proxyLabel') }}</label>
+                <input v-model="newAccount.proxy" type="text" :placeholder="t('dash.proxyPlaceholder')"
                        class="mt-1 block w-full rounded-xl border-gray-300 bg-white/50 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 transition-all duration-300 h-12 text-base px-4">
               </div>
               <div class="flex justify-end space-x-4 pt-4">
@@ -375,6 +391,45 @@
       </div>
     </div>
 
+    <!-- 修改代理模态框 -->
+    <div v-if="showEditProxyModal"
+         class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50"
+         @click.self="closeEditProxyModal">
+      <div class="relative bg-white/90 backdrop-blur-lg rounded-2xl p-6 w-11/12 max-w-md transform transition-all duration-300 scale-100 opacity-100">
+        <h2 class="text-xl font-bold mb-2">{{ t('dash.editProxyTitle') }}</h2>
+        <p class="text-sm text-gray-600 mb-4">{{ t('dash.editProxyHint') }}</p>
+        <div class="space-y-4">
+          <div>
+            <label class="block text-sm font-medium text-gray-700">Email</label>
+            <div class="mt-1 px-4 py-2 rounded-xl bg-gray-100 text-gray-700">{{ editProxy.email }}</div>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700">{{ t('dash.proxyLabel') }}</label>
+            <input v-model="editProxy.proxy" type="text" :placeholder="t('dash.proxyPlaceholder')"
+                   :disabled="isSavingProxy"
+                   class="mt-1 block w-full rounded-xl border-gray-300 bg-white/50 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 transition-all duration-300 h-12 text-base px-4 disabled:opacity-70">
+          </div>
+          <div class="flex justify-end space-x-3 pt-2">
+            <button @click="closeEditProxyModal"
+                    :disabled="isSavingProxy"
+                    class="px-4 py-2 rounded-xl bg-gray-100 hover:bg-gray-200 transition-all duration-300 disabled:opacity-50">
+              {{ t('dash.cancel') }}
+            </button>
+            <button @click="clearProxy"
+                    :disabled="isSavingProxy"
+                    class="px-4 py-2 rounded-xl bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 transition-all duration-300 disabled:opacity-50">
+              {{ t('dash.clearProxy') }}
+            </button>
+            <button @click="saveProxy"
+                    :disabled="isSavingProxy"
+                    class="px-4 py-2 rounded-xl bg-black text-white hover:bg-white hover:text-black border border-black transition-all duration-300 disabled:opacity-50">
+              {{ t('dash.save') }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Toast 通知 -->
     <div v-if="toast.show"
          :class="[
@@ -410,8 +465,12 @@ const showAddModal = ref(false)
 const addMode = ref('single')
 const newAccount = ref({
   email: '',
-  password: ''
+  password: '',
+  proxy: ''
 })
+const showEditProxyModal = ref(false)
+const editProxy = ref({ email: '', proxy: '' })
+const isSavingProxy = ref(false)
 const batchAccounts = ref('')
 const isBatchAdding = ref(false)
 const batchTask = ref(null)
@@ -698,16 +757,56 @@ const getTokens = async () => {
 
 const addToken = async () => {
   try {
-    await axios.post('/api/setAccount', newAccount.value, {
+    const payload = {
+      email: newAccount.value.email,
+      password: newAccount.value.password,
+      proxy: newAccount.value.proxy?.trim() || null
+    }
+    await axios.post('/api/setAccount', payload, {
       headers: getAuthHeaders()
     })
     closeAddModal()
-    newAccount.value = { email: '', password: '' }
+    newAccount.value = { email: '', password: '', proxy: '' }
     await getTokens()
     showToast(t('msg.addSuccess'))
   } catch (error) {
     console.error('addToken error:', error)
     showToast(t('msg.addFailed') + error.message, 'error')
+  }
+}
+
+const openEditProxy = (token) => {
+  editProxy.value = { email: token.email, proxy: token.proxy || '' }
+  showEditProxyModal.value = true
+}
+
+const closeEditProxyModal = () => {
+  if (isSavingProxy.value) return
+  showEditProxyModal.value = false
+}
+
+const clearProxy = () => {
+  editProxy.value.proxy = ''
+}
+
+const saveProxy = async () => {
+  if (isSavingProxy.value) return
+  isSavingProxy.value = true
+  try {
+    await axios.post('/api/updateAccountProxy', {
+      email: editProxy.value.email,
+      proxy: editProxy.value.proxy.trim() || null
+    }, {
+      headers: getAuthHeaders()
+    })
+    showEditProxyModal.value = false
+    await getTokens()
+    showToast(t('msg.proxyUpdateSuccess'))
+  } catch (error) {
+    console.error('saveProxy error:', error)
+    showToast(t('msg.proxyUpdateFailed') + error.message, 'error')
+  } finally {
+    isSavingProxy.value = false
   }
 }
 
