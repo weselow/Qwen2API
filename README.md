@@ -52,6 +52,47 @@ PROXY_URL=http://127.0.0.1:8282  # ProxyFlow 代理地址
 QWEN_CHAT_PROXY_URL=http://127.0.0.1:8000/qwen  # UrlProxy 反代地址（UrlProxy 配置 HTTP_PROXY 指向 ProxyFlow）
 ```
 
+### 🌐 账号级代理 / Per-account proxy
+
+每个账号可以配置自己专属的出站代理，从而让多个账号通过不同的 IP 同时使用，规避 `chat.qwen.ai` 基于 IP 的关联封禁。
+
+**优先级：** `account.proxy` > 全局 `PROXY_URL` > 不使用代理
+
+**支持的代理协议：** HTTP / HTTPS / SOCKS5（与 `PROXY_URL` 一致）
+
+**前端配置（推荐）：**
+打开管理面板 → 添加账号时填写 "代理地址" 字段，或在已有账号卡片上点击 "修改代理" 按钮。
+
+**ENV 配置（DATA_SAVE_MODE=none）：**
+
+```bash
+# 旧格式（向后兼容，账号级代理留空）
+ACCOUNTS=user1@mail.com:pass1,user2@mail.com:pass2
+
+# 新格式（用 | 分隔代理 URL，可与旧格式混用）
+ACCOUNTS=user1@mail.com:pass1|http://10.0.0.1:8080,user2@mail.com:pass2|socks5://10.0.0.2:1080
+```
+
+**file 模式 (`data/data.json`) schema：**
+
+```json
+{
+  "accounts": [
+    {
+      "email": "user@mail.com",
+      "password": "...",
+      "token": "...",
+      "expires": 1234567890,
+      "proxy": "http://10.0.0.1:8080"
+    }
+  ]
+}
+```
+
+`proxy` 字段为 `null` 或缺失时，账号回退到全局 `PROXY_URL`（若配置）。
+
+> ⚠️ **注意：** 接口返回的代理 URL 不做脱敏处理。本项目假设运行在受信任的本地或私有网络环境中，由单一管理员使用。
+
 ### 环境要求
 
 - Node.js 18+ (源码部署时需要)
@@ -69,7 +110,7 @@ SERVICE_PORT=3000             # 服务端口
 
 # 🔐 安全配置
 API_KEY=sk-123456,sk-456789   # API 密钥 (必填，支持多密钥)
-ACCOUNTS=                     # 账户配置 (格式: user1:pass1,user2:pass2)
+ACCOUNTS=                     # 账户配置 (格式: user1:pass1[|proxy_url],user2:pass2[|proxy_url])
 
 # 🚀 PM2 多进程配置
 PM2_INSTANCES=1               # PM2进程数量 (1/数字/max)
