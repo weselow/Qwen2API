@@ -54,7 +54,7 @@
     "statusNotStarted": "未开始",
     "copiedToClipboard": "已复制到剪贴板",
     "proxyLabel": "代理地址（可选）",
-    "proxyPlaceholder": "http://user:pass@host:port",
+    "proxyPlaceholder": "http://user:pass{'@'}host:port",
     "editProxy": "修改代理",
     "editProxyTitle": "修改代理",
     "editProxyHint": "留空将清除该账号代理，回退到全局 PROXY_URL",

@@ -54,7 +54,7 @@
     "statusNotStarted": "Не начато",
     "copiedToClipboard": "Скопировано",
     "proxyLabel": "Proxy URL (необязательно)",
-    "proxyPlaceholder": "http://user:pass@host:port",
+    "proxyPlaceholder": "http://user:pass{'@'}host:port",
     "editProxy": "Изменить proxy",
     "editProxyTitle": "Изменить proxy",
     "editProxyHint": "Оставьте пустым, чтобы очистить и использовать глобальный PROXY_URL",
