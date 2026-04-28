@@ -12,9 +12,10 @@ const { logger } = require('./logger')
  * @param {string} password - 密码
  * @param {string} token - 访问令牌
  * @param {number} expires - 过期时间戳
+ * @param {string|null} [proxy] - 账号专属代理 URL
  * @returns {Promise<boolean>} 保存是否成功
  */
-const saveAccounts = async (email, password, token, expires) => {
+const saveAccounts = async (email, password, token, expires, proxy = null) => {
   try {
     // 参数验证
     if (!email || !password) {
@@ -23,7 +24,7 @@ const saveAccounts = async (email, password, token, expires) => {
     }
 
     // 使用账户管理器的统一方法
-    const success = await accountManager.addAccount(email, password)
+    const success = await accountManager.addAccount(email, password, proxy)
 
     if (success) {
       logger.success(`账户 ${email} 保存成功`, 'SETTING')
