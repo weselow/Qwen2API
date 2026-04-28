@@ -269,7 +269,8 @@ class Account {
                     await this.dataPersistence.saveAccount(account.email, {
                         password: updatedAccount.password,
                         token: updatedAccount.token,
-                        expires: updatedAccount.expires
+                        expires: updatedAccount.expires,
+                        proxy: updatedAccount.proxy ?? account.proxy ?? null
                     })
 
                     // 重置失败计数
@@ -343,7 +344,8 @@ class Account {
                 await this.dataPersistence.saveAccount(account.email, {
                     password: account.password,
                     token: account.token,
-                    expires: account.expires
+                    expires: account.expires,
+                    proxy: account.proxy ?? null
                 })
             }
         } catch (error) {
@@ -375,7 +377,8 @@ class Account {
             await this.dataPersistence.saveAccount(email, {
                 password: updatedAccount.password,
                 token: updatedAccount.token,
-                expires: updatedAccount.expires
+                expires: updatedAccount.expires,
+                proxy: updatedAccount.proxy ?? account.proxy ?? null
             })
 
             // 重置失败计数
