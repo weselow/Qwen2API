@@ -10,3 +10,14 @@ pkg_dist/*
 pkg_dist/
 .idea
 /public/dist
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+
+# Beads orchestration
+.worktrees/
+
+# Our fork notes (not for upstream)
+docs_fork/
