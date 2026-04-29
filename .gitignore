@@ -12,9 +12,11 @@ pkg_dist/
 /public/dist
 
 # Beads / Dolt files (added by bd init)
+.beads/
 .dolt/
 *.db
 .beads-credential-key
+issues.jsonl
 
 # Beads orchestration
 .worktrees/
