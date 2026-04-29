@@ -1,5 +1,6 @@
 const { generateUUID } = require('../utils/tools.js')
 const { isChatType, isThinkingEnabled, parserModel, parserMessages } = require('../utils/chat-helpers.js')
+const { buildToolSystemPrompt, foldToolMessages } = require('../utils/tool-prompt.js')
 const { logger } = require('../utils/logger')
 
 /**
@@ -28,7 +29,9 @@ const processRequestBody = async (req, res, next) => {
       stream,              // 流式输出
       enable_thinking,     // 是否启用思考
       thinking_budget,      // 思考预算
-      size                  //图片尺寸
+      size,                  //图片尺寸
+      tools,                // 工具列表（OpenAI function calling）
+      tool_choice           // 工具调用控制
     } = req.body
 
     // 处理 stream 参数
@@ -37,17 +40,53 @@ const processRequestBody = async (req, res, next) => {
     } else {
       body.stream = false
     }
-    
+
     // 处理 chat_type 参数 : 聊天类型
     body.chat_type = isChatType(model)
 
     req.enable_web_search = body.chat_type === 'search' ? true : false
-    
+
     // 处理 model 参数 : 模型
     body.model = await parserModel(model)
-    
+
+    // 处理 tools 参数 : 通过提示词为网页版模型注入工具调用能力
+    const hasTools = Array.isArray(tools) && tools.length > 0 && body.chat_type === 't2t'
+    let preparedMessages = messages
+    let toolSystemPrompt = ''
+    if (hasTools) {
+      toolSystemPrompt = buildToolSystemPrompt(tools, { tool_choice })
+      // 仅折叠 assistant.tool_calls / role=tool 历史，不在此插入 system 消息，
+      // 避免被下游 parserMessages 折叠成 "system:<提示词>;user:..." 干扰模型理解。
+      preparedMessages = foldToolMessages(messages || [])
+      req.has_tools = true
+      req.tool_choice = tool_choice || 'auto'
+    } else {
+      req.has_tools = false
+    }
+
     // 处理 messages 参数 : 消息历史
-    body.messages = await parserMessages(messages, isThinkingEnabled(model, enable_thinking, thinking_budget), body.chat_type)
+    body.messages = await parserMessages(preparedMessages, isThinkingEnabled(model, enable_thinking, thinking_budget), body.chat_type)
+
+    // 工具提示词在 parserMessages 折叠完成后，作为前缀拼接到最终用户消息内容上，
+    // 这样既不会被角色前缀污染，也能让模型在每一轮都看到完整工具说明。
+    if (hasTools && toolSystemPrompt && Array.isArray(body.messages) && body.messages.length > 0) {
+      const last = body.messages[body.messages.length - 1]
+      if (typeof last.content === 'string') {
+        last.content = `${toolSystemPrompt}\n\n${last.content}`
+      } else if (Array.isArray(last.content)) {
+        const textIdx = last.content.findIndex(c => c?.type === 'text')
+        if (textIdx >= 0) {
+          last.content[textIdx].text = `${toolSystemPrompt}\n\n${last.content[textIdx].text || ''}`
+        } else {
+          last.content.unshift({
+            type: 'text',
+            text: toolSystemPrompt,
+            chat_type: 't2t',
+            feature_config: { output_schema: 'phase', thinking_enabled: false }
+          })
+        }
+      }
+    }
     
     // 处理 enable_thinking 参数 : 是否启用思考
     req.enable_thinking = isThinkingEnabled(model, enable_thinking, thinking_budget).thinking_enabled

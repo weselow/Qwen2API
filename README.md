@@ -4,7 +4,7 @@
 
 # 🚀 Qwen-Proxy
 
-[![Version](https://img.shields.io/badge/version-2026.04.14.09.30-blue.svg)](https://github.com/Rfym21/Qwen2API)
+[![Version](https://img.shields.io/badge/version-2026.04.29.23.45-blue.svg)](https://github.com/Rfym21/Qwen2API)
 [![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
 [![Docker](https://img.shields.io/badge/Docker-supported-blue.svg)](https://hub.docker.com/r/rfym21/qwen2api)
 
@@ -20,6 +20,8 @@ Qwen-Proxy 是一个将 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli` 转换
 
 **主要特性：**
 - 兼容 OpenAI API 格式，无缝对接各类客户端
+- 兼容 Anthropic Messages API（`/v1/messages`），支持 Claude Code、Anthropic SDK 等客户端
+- 支持 Function Calling（OpenAI `tools` / Anthropic `tools`），含流式 `arguments` 增量分片与 `tool_choice=required` 强校验重试
 - 支持多账户轮询，提高可用性
 - 支持流式/非流式响应
 - 支持多模态（图片识别、视频理解、图片/视频生成）
@@ -498,6 +500,146 @@ Authorization: Bearer sk-your-api-key
     "total_tokens": 70
   }
 }
+```
+
+### 🛠️ Function Calling（工具调用）
+
+`/v1/chat/completions` 支持完整的 OpenAI Function Calling 协议。即便上游 Web 接口本身不具备原生 tools 能力，本服务通过提示词注入与流式状态机解析，使其行为与 OpenAI API 一致：
+
+- 自动将 `tools[]` 压缩为 TS 风格签名注入提示词，节省约 70% token 开销
+- 流式输出按 OpenAI 规范分片：先发 `function.name + 空 arguments` 头块，随后多个 `arguments` 切片
+- 历史消息中的 `assistant.tool_calls` 与 `role:"tool"` 自动折叠回链，`tool_call_id` 精确关联
+- `tool_choice` 全四态：`"auto"` / `"required"` / `{type:"function",function:{name:"..."}}` / `"none"`
+- `tool_choice="required"` 或指定函数时，若首次未触发工具调用，自动追加强约束提示重试一次
+
+**请求示例：**
+
+```json
+{
+  "model": "qwen3-coder-plus",
+  "stream": true,
+  "messages": [
+    {"role": "user", "content": "查一下北京的天气"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "获取城市天气",
+        "parameters": {
+          "type": "object",
+          "properties": { "city": { "type": "string" } },
+          "required": ["city"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "required"
+}
+```
+
+**流式响应（节选）：**
+
+```
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_xxx","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"Beijing\"}"}}]}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+```
+
+OpenAI SDK、LangChain、Cline、Continue 等遵循 OpenAI 工具协议的客户端可直接接入。
+
+### 🤖 Anthropic Messages API
+
+兼容 Anthropic 的 `/v1/messages` 端点，可直接对接 Claude Code、Anthropic SDK、aider 等客户端。
+
+```http
+POST /v1/messages
+Content-Type: application/json
+Authorization: Bearer sk-your-api-key
+```
+
+支持的字段：
+
+| 字段 | 说明 |
+|---|---|
+| `model` | 任意 Qwen 模型名（如 `qwen3-coder-plus`） |
+| `system` | 字符串或 `{type:"text"}` 块数组 |
+| `messages[].content` | 字符串、文本块、图片块、`tool_use` 块、`tool_result` 块 |
+| `tools[]` | Anthropic 风格 `{name,input_schema,description}` |
+| `tool_choice` | `{type:"auto"}` / `{type:"any"}`（=必须调用） / `{type:"tool",name:"..."}` / `{type:"none"}` |
+| `thinking` | `{type:"enabled",budget_tokens:N}` 启用思考模式 |
+| `stream` | 流式 SSE 输出 |
+
+**请求示例（含工具调用）：**
+
+```json
+{
+  "model": "qwen3-coder-plus",
+  "max_tokens": 1024,
+  "messages": [
+    {"role": "user", "content": "查广州天气"}
+  ],
+  "tools": [
+    {
+      "name": "get_weather",
+      "input_schema": {
+        "type": "object",
+        "properties": { "city": { "type": "string" } },
+        "required": ["city"]
+      }
+    }
+  ],
+  "tool_choice": { "type": "any" }
+}
+```
+
+**非流式响应：**
+
+```json
+{
+  "id": "msg_xxx",
+  "type": "message",
+  "role": "assistant",
+  "model": "qwen3-coder-plus",
+  "content": [
+    {
+      "type": "tool_use",
+      "id": "call_xxx",
+      "name": "get_weather",
+      "input": { "city": "广州" }
+    }
+  ],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": { "input_tokens": 233, "output_tokens": 25 }
+}
+```
+
+**流式 SSE 事件序列：**
+
+```
+event: message_start
+data: {"type":"message_start","message":{...}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_xxx","name":"get_weather","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"广州\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":234,"output_tokens":25}}
+
+event: message_stop
+data: {"type":"message_stop"}
 ```
 
 ### 🎨 图像与视频生成
