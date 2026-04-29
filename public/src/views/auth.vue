@@ -1,4 +1,7 @@
 <template>
+  <div class="fixed top-4 right-4 z-50">
+    <LangSwitcher />
+  </div>
   <div class="flex flex-col items-center justify-center w-screen h-screen">
     <transition name="fade-slide">
       <div
@@ -20,6 +23,7 @@ import { ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import axios from 'axios'
 import { useRouter } from 'vue-router'
+import LangSwitcher from '../components/LangSwitcher.vue'
 
 const { t } = useI18n()
 const router = useRouter()
