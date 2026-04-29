@@ -10,3 +10,11 @@ pkg_dist/*
 pkg_dist/
 .idea
 /public/dist
+
+# Beads / Dolt task-tracking artifacts (fork tooling, not for upstream)
+.beads/
+.dolt/
+*.db
+.beads-credential-key
+issues.jsonl
+.worktrees/
