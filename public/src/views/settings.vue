@@ -4,11 +4,6 @@
             <div class="flex flex-col md:flex-row justify-between items-center mb-6 px-4 space-y-4 md:space-y-0 pt-5">
                 <h1 class="text-3xl font-bold">{{ t('settings.title') }}</h1>
                 <div class="flex items-center space-x-3">
-                    <select v-model="locale" @change="onLocaleChange"
-                        class="rounded-xl border border-gray-200 bg-white/60 backdrop-blur-sm shadow-sm px-3 py-2 text-sm focus:border-indigo-500 focus:ring-indigo-500 transition-all duration-300">
-                        <option value="ru">{{ t('lang.ru') }}</option>
-                        <option value="zh">{{ t('lang.zh') }}</option>
-                    </select>
                     <router-link to="/"
                         class="action-button font-bold border border-blue-200 bg-blue-50 text-blue-900 px-4 py-2 rounded-xl shadow-sm hover:bg-blue-100 hover:border-blue-400 transition-all duration-300 transform hover:-translate-y-1 active:translate-y-0 text-center">
                         {{ t('settings.backToDash') }}
@@ -169,7 +164,7 @@ import { ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import axios from 'axios'
 
-const { t, locale } = useI18n()
+const { t } = useI18n()
 
 const settings = ref({
     apiKey: localStorage.getItem('apiKey'),
@@ -187,10 +182,6 @@ const settings = ref({
 
 const showAddKeyModal = ref(false)
 const newApiKey = ref('')
-
-const onLocaleChange = () => {
-    localStorage.setItem('locale', locale.value)
-}
 
 const loadSettings = async () => {
     try {
