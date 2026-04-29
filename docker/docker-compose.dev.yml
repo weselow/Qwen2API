@@ -1,0 +1,38 @@
+services:
+  qwen2api:
+    container_name: qwen2api
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    restart: always
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./caches:/app/caches
+    environment:
+      # To change the exposed port, modify the ports mapping above
+      - SERVICE_PORT=3000
+      # API key (optional). Required for multi-account or built-in account usage
+      - API_KEY=sk-123456
+      # Listen address (optional)
+      - LISTEN_ADDRESS=
+      # PM2 multi-process: max (all cores), number, or 1 (single)
+      - PM2_INSTANCES=1
+      # PM2 memory limit — process restarts when exceeded
+      - PM2_MAX_MEMORY=1G
+      # Search info display mode (table / text)
+      - SEARCH_INFO_MODE=table
+      # Whether to output the thinking process
+      - OUTPUT_THINK=true
+      # Simplified model mapping (true: base models only, false: full list)
+      - SIMPLE_MODEL_MAP=false
+      # Redis URL (required for redis mode; use rediss:// for TLS)
+      - REDIS_URL=
+      # Data save mode (none / file / redis)
+      - DATA_SAVE_MODE=file
+      # Accounts (not needed for redis/file mode)
+      - ACCOUNTS=
+      # Image cache mode (default: memory / file: disk)
+      - CACHE_MODE=file
