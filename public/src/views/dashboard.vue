@@ -47,9 +47,10 @@
             {{ t('dash.export') }}
           </button>
           <router-link to="/settings"
-                       class="action-button col-span-2 sm:col-span-1 font-bold border border-blue-200 bg-blue-50 text-blue-900 px-4 py-2 rounded-xl shadow-sm hover:bg-blue-100 hover:border-blue-400 transition-all duration-300 transform hover:-translate-y-1 active:translate-y-0 text-center">
+                       class="action-button font-bold border border-blue-200 bg-blue-50 text-blue-900 px-4 py-2 rounded-xl shadow-sm hover:bg-blue-100 hover:border-blue-400 transition-all duration-300 transform hover:-translate-y-1 active:translate-y-0 text-center">
             {{ t('dash.settings') }}
           </router-link>
+          <LangSwitcher class="col-span-2 sm:col-span-1 justify-self-center" />
         </div>
       </div>
 
@@ -470,6 +471,7 @@
 import { ref, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import axios from 'axios'
+import LangSwitcher from '../components/LangSwitcher.vue'
 
 const { t } = useI18n()
 

@@ -8,6 +8,7 @@
                         class="action-button font-bold border border-blue-200 bg-blue-50 text-blue-900 px-4 py-2 rounded-xl shadow-sm hover:bg-blue-100 hover:border-blue-400 transition-all duration-300 transform hover:-translate-y-1 active:translate-y-0 text-center">
                         {{ t('settings.backToDash') }}
                     </router-link>
+                    <LangSwitcher />
                 </div>
             </div>
             <div class="grid grid-cols-1 gap-6 p-4">
@@ -163,6 +164,7 @@
 import { ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import axios from 'axios'
+import LangSwitcher from '../components/LangSwitcher.vue'
 
 const { t } = useI18n()
 
