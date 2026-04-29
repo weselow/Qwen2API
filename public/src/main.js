@@ -6,9 +6,15 @@ import ru from './locales/ru.json'
 import zh from './locales/zh.json'
 import "./style.css"
 
+const detectLocale = () => {
+  const stored = localStorage.getItem('locale')
+  if (stored === 'ru' || stored === 'zh') return stored
+  return navigator.language?.startsWith('ru') ? 'ru' : 'zh'
+}
+
 const i18n = createI18n({
-  locale: localStorage.getItem('locale') || 'zh',
-  fallbackLocale: 'ru',
+  locale: detectLocale(),
+  fallbackLocale: 'zh',
   messages: { ru, zh },
   globalInjection: true
 })
