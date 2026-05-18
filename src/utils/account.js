@@ -14,29 +14,65 @@ const createDefaultStats = () => ({
 })
 
 /**
- * 保证账户具备 stats 字段（兼容老 data.json/Redis 数据）
+ * 保证账户具备 stats 和 statsHistory 字段（兼容老 data.json/Redis 数据）
  * @param {Object} account - 账户对象
  */
 const ensureStats = (account) => {
     if (!account) return
     if (!account.stats || typeof account.stats !== 'object') {
         account.stats = createDefaultStats()
-        return
-    }
-    if (!account.stats.chat || typeof account.stats.chat !== 'object') {
-        account.stats.chat = { input: 0, output: 0 }
     } else {
-        account.stats.chat.input = Number(account.stats.chat.input) || 0
-        account.stats.chat.output = Number(account.stats.chat.output) || 0
+        if (!account.stats.chat || typeof account.stats.chat !== 'object') {
+            account.stats.chat = { input: 0, output: 0 }
+        } else {
+            account.stats.chat.input = Number(account.stats.chat.input) || 0
+            account.stats.chat.output = Number(account.stats.chat.output) || 0
+        }
+        if (!account.stats.cli || typeof account.stats.cli !== 'object') {
+            account.stats.cli = { calls: 0, input: 0, output: 0 }
+        } else {
+            account.stats.cli.calls = Number(account.stats.cli.calls) || 0
+            account.stats.cli.input = Number(account.stats.cli.input) || 0
+            account.stats.cli.output = Number(account.stats.cli.output) || 0
+        }
     }
-    if (!account.stats.cli || typeof account.stats.cli !== 'object') {
-        account.stats.cli = { calls: 0, input: 0, output: 0 }
-    } else {
-        account.stats.cli.calls = Number(account.stats.cli.calls) || 0
-        account.stats.cli.input = Number(account.stats.cli.input) || 0
-        account.stats.cli.output = Number(account.stats.cli.output) || 0
+    // statsHistory: { 'YYYY-MM-DD': { chat:{input,output}, cli:{calls,input,output} } }
+    // Backward-compat: старые записи без поля — инициализируем пустым объектом
+    if (!account.statsHistory || typeof account.statsHistory !== 'object') {
+        account.statsHistory = {}
     }
 }
+
+/**
+ * Ключ даты YYYY-MM-DD для (now + offsetDays) в локальной TZ Node-процесса
+ * @param {number} offsetDays - смещение в днях (отрицательное = в прошлое)
+ * @returns {string}
+ */
+const _formatDateKey = (offsetDays) => {
+    const d = new Date()
+    d.setDate(d.getDate() + offsetDays)
+    const yyyy = d.getFullYear()
+    const mm = String(d.getMonth() + 1).padStart(2, '0')
+    const dd = String(d.getDate()).padStart(2, '0')
+    return `${yyyy}-${mm}-${dd}`
+}
+
+const _getTodayKey = () => _formatDateKey(0)
+const _getYesterdayKey = () => _formatDateKey(-1)
+const _dateKeyDaysAgo = (n) => _formatDateKey(-n)
+
+const _hasNonZeroStats = (stats) => {
+    if (!stats || typeof stats !== 'object') return false
+    const c = stats.chat || {}
+    const l = stats.cli || {}
+    return (Number(c.input) || 0) > 0
+        || (Number(c.output) || 0) > 0
+        || (Number(l.calls) || 0) > 0
+        || (Number(l.input) || 0) > 0
+        || (Number(l.output) || 0) > 0
+}
+
+const STATS_HISTORY_RETENTION_DAYS = 90
 /**
  * 账户管理器
  * 统一管理账户、令牌、模型等功能
@@ -59,8 +95,8 @@ class Account {
         this.cliRequestNumberInterval = null
         this.cliDailyResetInterval = null
 
-        // 初始化
-        this._initialize()
+        // 初始化（промис сохраняем, чтобы debug-методы могли дождаться готовности)
+        this._initPromise = this._initialize()
     }
 
     /**
@@ -229,7 +265,16 @@ class Account {
 
     /**
      * 每日 00:00 重置：CLI 请求计数 + chat/cli daily stats
-     * 重置后立即 persist——否则 PM2 重启会从磁盘恢复昨日数据，让 reset 失去意义
+     * Перед обнулением сохраняем снэпшот вчерашнего дня в account.statsHistory,
+     * обрезаем записи старше STATS_HISTORY_RETENTION_DAYS дней,
+     * затем один батч-вызов saveAllAccounts (вместо 30 отдельных).
+     *
+     * Ограничения:
+     * - PM2_INSTANCES > 1: каждый воркер архивирует свою частичную копию stats;
+     *   итог за день будет занижен пропорционально числу воркеров. У текущей
+     *   инсталляции instances=1 (ecosystem.config.js), проблема не проявляется.
+     * - DATA_SAVE_MODE=none: saveAllAccounts возвращает false, история не персистится.
+     *   Для использования фичи в проде задать DATA_SAVE_MODE=file или redis.
      * @private
      */
     async _resetDailyCounters() {
@@ -239,9 +284,32 @@ class Account {
             account.cli_info.request_number = 0
         })
 
-        // 新增：chat/cli daily stats
+        const yesterday = _getYesterdayKey()
+        const cutoff = _dateKeyDaysAgo(STATS_HISTORY_RETENTION_DAYS)
+        let archivedCount = 0
+
+        // Для КАЖДОГО аккаунта (включая неактивных) обрезаем старую историю,
+        // для аккаунтов с ненулевыми счётчиками — пишем снэпшот вчерашнего дня
         this.accountTokens.forEach(account => {
             ensureStats(account)
+
+            // Прунинг по дате (строковое сравнение валидно для YYYY-MM-DD)
+            for (const key of Object.keys(account.statsHistory)) {
+                if (key < cutoff) {
+                    delete account.statsHistory[key]
+                }
+            }
+
+            // Снэпшот только если был хоть один ненулевой счётчик
+            if (_hasNonZeroStats(account.stats)) {
+                account.statsHistory[yesterday] = {
+                    chat: { ...account.stats.chat },
+                    cli: { ...account.stats.cli }
+                }
+                archivedCount++
+            }
+
+            // Обнуление today
             account.stats.chat.input = 0
             account.stats.chat.output = 0
             account.stats.cli.calls = 0
@@ -249,14 +317,44 @@ class Account {
             account.stats.cli.output = 0
         })
 
-        logger.info(`已重置 ${cliAccounts.length} 个CLI账户的请求次数 + ${this.accountTokens.length} 个账户的 daily stats`, 'CLI')
+        logger.info(
+            `已重置 ${cliAccounts.length} 个CLI账户请求次数 + ${this.accountTokens.length} 个账户 daily stats，归档 ${archivedCount} 条 statsHistory[${yesterday}]`,
+            'CLI'
+        )
 
-        // 立即 persist 以挺过 PM2 重启
+        // Один батч-вызов; в file-режиме — одна перезапись data.json,
+        // в redis-режиме — последовательные HSET (debounce saveAccountStats не задействован)
         try {
             await this.dataPersistence.saveAllAccounts(this.accountTokens)
         } catch (error) {
             logger.error('每日重置后 persist 失败', 'ACCOUNT', '', error)
         }
+    }
+
+    /**
+     * Публичный helper: ключ YYYY-MM-DD текущего дня в локальной TZ Node-процесса.
+     * Парный к _getYesterdayKey, используемому в _resetDailyCounters.
+     * Роут /statsHistory обязан использовать его, а не new Date() в браузере —
+     * иначе при разном TZ браузера/контейнера на границе месяца возможны сдвиги.
+     * @returns {string}
+     */
+    getTodayKey() {
+        return _getTodayKey()
+    }
+
+    /**
+     * Debug: ручной запуск архивации/сброса (используется dev-эндпоинтом из B2).
+     * Readiness-guard защищает от перезаписи data.accounts = [] до окончания init.
+     * @returns {Promise<void>}
+     */
+    async archiveYesterdayForTest() {
+        if (this._initPromise) {
+            await this._initPromise
+        }
+        if (!this.isInitialized || !Array.isArray(this.accountTokens) || this.accountTokens.length === 0) {
+            throw new Error('account manager not initialized — refusing to archive (would wipe data)')
+        }
+        return this._resetDailyCounters()
     }
 
     /**
