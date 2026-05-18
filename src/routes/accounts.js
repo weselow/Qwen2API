@@ -703,9 +703,24 @@ router.get('/statsHistory', adminKeyVerify, async (req, res) => {
     const today = accountManager.getTodayKey()
 
     const accounts = accountManager.getAllAccountKeys().map(account => {
-      // Копия history — наружу не отдаём ссылку на внутренний объект (его
-      // мутирует _resetDailyCounters и сам этот мерж today ниже).
-      const history = { ...(account.statsHistory || {}) }
+      // Глубокая копия history: 5-сек окно в 00:00 _resetDailyCounters
+      // мутирует вложенные chat/cli; shallow-copy верхнего уровня от этого
+      // не защищает. Глубокая копия снимает риск отдать клиенту полу-сброшенный объект.
+      const history = {}
+      const src = account.statsHistory || {}
+      for (const key of Object.keys(src)) {
+        const entry = src[key] || {}
+        const chat = entry.chat || {}
+        const cli = entry.cli || {}
+        history[key] = {
+          chat: { input: Number(chat.input) || 0, output: Number(chat.output) || 0 },
+          cli: {
+            calls: Number(cli.calls) || 0,
+            input: Number(cli.input) || 0,
+            output: Number(cli.output) || 0
+          }
+        }
+      }
 
       // Сегодняшний день — живой счётчик из account.stats.
       // Глубокая копия chat/cli: иначе accumulateStats в параллельном

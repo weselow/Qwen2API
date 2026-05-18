@@ -150,12 +150,20 @@ const aggregateTotals = computed(() => aggregateDaily.value.reduce((acc, d) => (
   cliCalls: acc.cliCalls + d.cliCalls
 }), { chatInput: 0, chatOutput: 0, cliInput: 0, cliOutput: 0, cliCalls: 0 }))
 
+// Жёсткая валидация today перед использованием в построении dateRange:
+// без неё мусорный '2026-13-99' пройдёт через new Date(y, m-1, d) (JS
+// перевернёт даты) и весь UI покажет неверный диапазон.
+const DATE_KEY_REGEX = /^\d{4}-\d{2}-\d{2}$/
+
 onMounted(async () => {
   try {
     const response = await axios.get('/api/statsHistory', {
       headers: { Authorization: localStorage.getItem('apiKey') || '' }
     })
-    if (response.data?.today) serverToday.value = response.data.today
+    const apiToday = response.data?.today
+    if (typeof apiToday === 'string' && DATE_KEY_REGEX.test(apiToday)) {
+      serverToday.value = apiToday
+    }
     accounts.value = response.data?.accounts || []
   } catch (error) {
     console.error('Failed to load statsHistory', error)
