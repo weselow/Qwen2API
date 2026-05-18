@@ -676,4 +676,87 @@ router.get('/accountStats', adminKeyVerify, async (req, res) => {
   }
 })
 
+/**
+ * GET /statsHistory
+ * 返回 dashboard /statistics 用 — 历史每日 token 消耗 (90 天 retention).
+ * 今日数据合并自 account.stats (live counter) 到 history[today]，
+ * 避免新部署后首日 UI 全空。
+ *
+ * Известный edge-case: 5-сек окно между сбросом stats=0 и записью
+ * statsHistory[yesterday] через saveAllAccounts — короткое «провисание»
+ * раз в сутки в 00:00. Не лечим (секунды раз в сутки).
+ *
+ * @returns {{
+ *   today: string,                            // YYYY-MM-DD по серверной TZ
+ *   accounts: Array<{
+ *     email: string,
+ *     history: Record<string, { chat: {input,output}, cli: {calls,input,output} }>
+ *   }>
+ * }}
+ */
+router.get('/statsHistory', adminKeyVerify, async (req, res) => {
+  try {
+    // today тот же helper, что используется в архивации (parный _getYesterdayKey).
+    // ВАЖНО: фронт ДОЛЖЕН строить диапазоны (currentMonth/prevMonth/last90)
+    // от этого today, а не от new Date() — иначе при разном TZ браузера и
+    // контейнера на границе месяца возможны сдвиги.
+    const today = accountManager.getTodayKey()
+
+    const accounts = accountManager.getAllAccountKeys().map(account => {
+      // Копия history — наружу не отдаём ссылку на внутренний объект (его
+      // мутирует _resetDailyCounters и сам этот мерж today ниже).
+      const history = { ...(account.statsHistory || {}) }
+
+      // Сегодняшний день — живой счётчик из account.stats.
+      // Глубокая копия chat/cli: иначе accumulateStats в параллельном
+      // запросе может мутировать выданный наружу объект.
+      const s = account.stats || { chat: { input: 0, output: 0 }, cli: { calls: 0, input: 0, output: 0 } }
+      history[today] = {
+        chat: { input: Number(s.chat?.input) || 0, output: Number(s.chat?.output) || 0 },
+        cli: {
+          calls: Number(s.cli?.calls) || 0,
+          input: Number(s.cli?.input) || 0,
+          output: Number(s.cli?.output) || 0
+        }
+      }
+
+      return { email: account.email, history }
+    })
+
+    res.json({ today, accounts })
+  } catch (error) {
+    logger.error('获取 statsHistory 失败', 'ACCOUNT', '', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+/**
+ * POST /debug/archiveYesterday
+ * Debug-only: ручной триггер архивации/сброса (используется при ручном тестировании B1).
+ *
+ * Регистрируется ТОЛЬКО при ENABLE_STATS_DEBUG_ARCHIVE === 'true'.
+ * NODE_ENV намеренно НЕ используется — репо его не выставляет (src/start.js,
+ * ecosystem.config.js), поэтому 'production' нельзя гарантировать.
+ *
+ * В обычной (включая прод) конфигурации роут отсутствует — POST вернёт 404.
+ * Внимание: GET на любой неизвестный путь падает в app.get('*') и отдаёт SPA
+ * со статусом 200, поэтому при проверке отсутствия роута обязательно `-X POST`.
+ */
+if (process.env.ENABLE_STATS_DEBUG_ARCHIVE === 'true') {
+  router.post('/debug/archiveYesterday', adminKeyVerify, async (req, res) => {
+    try {
+      await accountManager.archiveYesterdayForTest()
+      res.json({ ok: true, archivedAt: new Date().toISOString() })
+    } catch (error) {
+      // Readiness-guard из archiveYesterdayForTest бросает с этим сообщением.
+      if (error && error.message && error.message.includes('not initialized')) {
+        return res.status(503).json({ error: 'account manager not initialized, try again' })
+      }
+      logger.error('debug/archiveYesterday 失败', 'ACCOUNT', '', error)
+      res.status(500).json({ error: error.message })
+    }
+  })
+  logger.info('已启用 debug/archiveYesterday 端点 (ENABLE_STATS_DEBUG_ARCHIVE=true)', 'ACCOUNT')
+}
+
 module.exports = router

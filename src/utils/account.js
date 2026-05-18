@@ -332,6 +332,17 @@ class Account {
     }
 
     /**
+     * Публичный helper: ключ YYYY-MM-DD текущего дня в локальной TZ Node-процесса.
+     * Парный к _getYesterdayKey, используемому в _resetDailyCounters.
+     * Роут /statsHistory обязан использовать его, а не new Date() в браузере —
+     * иначе при разном TZ браузера/контейнера на границе месяца возможны сдвиги.
+     * @returns {string}
+     */
+    getTodayKey() {
+        return _getTodayKey()
+    }
+
+    /**
      * Debug: ручной запуск архивации/сброса (используется dev-эндпоинтом из B2).
      * Readiness-guard защищает от перезаписи data.accounts = [] до окончания init.
      * @returns {Promise<void>}
