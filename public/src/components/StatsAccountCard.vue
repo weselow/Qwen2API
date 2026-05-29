@@ -43,7 +43,7 @@ import { formatCompact } from '../utils/format.js'
 
 const props = defineProps({
   account: { type: Object, required: true }, // { email, history }
-  range: { type: Array, required: true }     // ['YYYY-MM-DD', ...] в хронологическом порядке
+  range: { type: Array, required: true }     // ['YYYY-MM-DD', ...] in chronological order
 })
 
 const { t } = useI18n()

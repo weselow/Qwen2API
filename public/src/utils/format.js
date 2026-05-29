@@ -1,6 +1,7 @@
-// Компактный формат чисел: 415575 → '415к', 1500 → '1.5к', 1500000 → '1.5M'.
-// <1000 — без суффикса. Утилита не знает про vue-i18n: единицы передаются явно,
-// чтобы оставаться чистой и тестируемой. Вызывающий код подставляет t('dash.acct.unitK') и т.д.
+// Compact number formatting: 415575 → '415k', 1500 → '1.5k', 1500000 → '1.5M'.
+// <1000 — no suffix. Utility stays vue-i18n-agnostic: units are passed in
+// explicitly so this remains pure and testable. Callers supply
+// t('dash.acct.unitK') / t('dash.acct.unitM').
 export function formatCompact(n, units = {}) {
   const { unitK = 'k', unitM = 'M' } = units
   const num = Number(n) || 0

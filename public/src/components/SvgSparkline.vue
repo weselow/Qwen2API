@@ -29,7 +29,7 @@ const props = defineProps({
 
 const width = 100
 
-// Полилиния по нормализованным values. Если все нули или меньше двух точек — ничего не рисуем.
+// Polyline built from normalized values. Skip when all zero or fewer than two points.
 const points = computed(() => {
   const vals = Array.isArray(props.values) ? props.values : []
   if (vals.length < 2) return ''

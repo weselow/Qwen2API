@@ -8,6 +8,7 @@ const { adminKeyVerify } = require('../middlewares/authorization')
 const { deleteAccount, saveAccounts, refreshAccountToken } = require('../utils/setting')
 const { parseAccountLine } = require('../utils/account-parser')
 const { isValidProxyUrl } = require('../utils/proxy-helper')
+const { DEFAULT_CLI_QUOTA_LIMIT, getAccountCliState } = require('../utils/cli-support')
 
 // 仅在 proxy 字段存在时触发；空字符串/null 一律视为"清除代理"，无需校验
 const PROXY_FORMAT_ERROR = '代理 URL 格式无效，应以 http://、https:// 或 socks5:// 开头'
@@ -624,12 +625,6 @@ router.post('/forceRefreshAllAccounts', adminKeyVerify, async (req, res) => {
 router.get('/accountStats', adminKeyVerify, async (req, res) => {
   try {
     const now = Date.now()
-    // 15 分钟 warn 窗口——recordError 写 lastErrorAt 后, UI 显示 🟡 warn 一段时间
-    const WARN_WINDOW_MS = 15 * 60 * 1000
-    // 6 小时——与 tokenManager.isTokenExpiringSoon default 一致
-    const TOKEN_EXPIRING_MS = 6 * 60 * 60 * 1000
-    // CLI 每日配额（与 routes/cli.chat.js:22 同步，dashboard 进度条用）
-    const CLI_QUOTA_LIMIT = 2000
 
     const rotatorStats = accountManager.accountRotator.getStats()
     const usageStats = rotatorStats.usageStats || {}
@@ -637,38 +632,21 @@ router.get('/accountStats', adminKeyVerify, async (req, res) => {
     const accounts = accountManager.getAllAccountKeys().map(account => {
       const email = account.email
       const rotatorRecord = usageStats[email] || {}
-      const cooldownEndsAt = rotatorRecord.cooldownEndsAt || null
-      const lastErrorAt = rotatorRecord.lastErrorAt || null
-      const lastErrorCode = rotatorRecord.lastErrorCode || null
-
-      // 优先级：cooldown > warn > token_expiring > active
-      let kind = 'active'
-      if (cooldownEndsAt && now < cooldownEndsAt) {
-        kind = 'cooldown'
-      } else if (lastErrorAt && (now - lastErrorAt) < WARN_WINDOW_MS) {
-        kind = 'warn'
-      } else if (account.expires && (account.expires * 1000 - now) < TOKEN_EXPIRING_MS) {
-        // account.expires 是 UNIX seconds（JWT exp 直接保存）——*1000 得到 ms
-        // 直接对比 timestamp, 不调用 isTokenExpiringSoon(token)（后者接受 token 字符串而非 expires）
-        kind = 'token_expiring'
-      }
+      const cliState = getAccountCliState(account, rotatorRecord, now)
 
       return {
         email,
-        stats: account.stats || { chat: { input: 0, output: 0 }, cli: { calls: 0, input: 0, output: 0 } },
-        cliRequestNumber: account.cli_info?.request_number || 0,
-        status: {
-          kind,
-          cooldownEndsAt,
-          lastErrorAt,
-          lastErrorCode
-        }
+        ...cliState
       }
     })
 
+    const cliQuotaLimit = accounts.some(account => account.cliQuotaLimit === DEFAULT_CLI_QUOTA_LIMIT)
+      ? DEFAULT_CLI_QUOTA_LIMIT
+      : 0
+
     res.json({
       accounts,
-      cliQuotaLimit: CLI_QUOTA_LIMIT
+      cliQuotaLimit
     })
   } catch (error) {
     logger.error('获取账户 stats 失败', 'ACCOUNT', '', error)
@@ -682,12 +660,12 @@ router.get('/accountStats', adminKeyVerify, async (req, res) => {
  * 今日数据合并自 account.stats (live counter) 到 history[today]，
  * 避免新部署后首日 UI 全空。
  *
- * Известный edge-case: 5-сек окно между сбросом stats=0 и записью
- * statsHistory[yesterday] через saveAllAccounts — короткое «провисание»
- * раз в сутки в 00:00. Не лечим (секунды раз в сутки).
+ * Known edge-case: a ~5 s window at 00:00 between resetting stats=0 and
+ * writing statsHistory[yesterday] via saveAllAccounts — a brief "sag"
+ * once per day. Not patched (seconds, once per day).
  *
  * @returns {{
- *   today: string,                            // YYYY-MM-DD по серверной TZ
+ *   today: string,                            // YYYY-MM-DD in server TZ
  *   accounts: Array<{
  *     email: string,
  *     history: Record<string, { chat: {input,output}, cli: {calls,input,output} }>
@@ -696,16 +674,17 @@ router.get('/accountStats', adminKeyVerify, async (req, res) => {
  */
 router.get('/statsHistory', adminKeyVerify, async (req, res) => {
   try {
-    // today тот же helper, что используется в архивации (parный _getYesterdayKey).
-    // ВАЖНО: фронт ДОЛЖЕН строить диапазоны (currentMonth/prevMonth/last90)
-    // от этого today, а не от new Date() — иначе при разном TZ браузера и
-    // контейнера на границе месяца возможны сдвиги.
+    // today is the same helper used by the archival routine (paired with
+    // _getYesterdayKey). The frontend MUST build ranges (currentMonth /
+    // prevMonth / last90) off this value, not new Date() — otherwise
+    // differing browser/container TZs can shift month boundaries.
     const today = accountManager.getTodayKey()
 
     const accounts = accountManager.getAllAccountKeys().map(account => {
-      // Глубокая копия history: 5-сек окно в 00:00 _resetDailyCounters
-      // мутирует вложенные chat/cli; shallow-copy верхнего уровня от этого
-      // не защищает. Глубокая копия снимает риск отдать клиенту полу-сброшенный объект.
+      // Deep copy of history: the 5 s window at 00:00 has _resetDailyCounters
+      // mutating nested chat/cli entries; a shallow top-level copy does not
+      // protect against that. The deep copy avoids handing the client a
+      // half-reset snapshot.
       const history = {}
       const src = account.statsHistory || {}
       for (const key of Object.keys(src)) {
@@ -722,9 +701,9 @@ router.get('/statsHistory', adminKeyVerify, async (req, res) => {
         }
       }
 
-      // Сегодняшний день — живой счётчик из account.stats.
-      // Глубокая копия chat/cli: иначе accumulateStats в параллельном
-      // запросе может мутировать выданный наружу объект.
+      // Today is the live counter from account.stats.
+      // Deep copy of chat/cli — otherwise a concurrent accumulateStats call
+      // may mutate the object already handed out.
       const s = account.stats || { chat: { input: 0, output: 0 }, cli: { calls: 0, input: 0, output: 0 } }
       history[today] = {
         chat: { input: Number(s.chat?.input) || 0, output: Number(s.chat?.output) || 0 },
@@ -747,15 +726,17 @@ router.get('/statsHistory', adminKeyVerify, async (req, res) => {
 
 /**
  * POST /debug/archiveYesterday
- * Debug-only: ручной триггер архивации/сброса (используется при ручном тестировании B1).
+ * Debug-only: manual trigger for the archival/reset routine (used while
+ * smoke-testing the storage layer).
  *
- * Регистрируется ТОЛЬКО при ENABLE_STATS_DEBUG_ARCHIVE === 'true'.
- * NODE_ENV намеренно НЕ используется — репо его не выставляет (src/start.js,
- * ecosystem.config.js), поэтому 'production' нельзя гарантировать.
+ * Registered ONLY when ENABLE_STATS_DEBUG_ARCHIVE === 'true'.
+ * NODE_ENV is intentionally NOT used — this repo does not set it
+ * (src/start.js, ecosystem.config.js), so 'production' cannot be guaranteed.
  *
- * В обычной (включая прод) конфигурации роут отсутствует — POST вернёт 404.
- * Внимание: GET на любой неизвестный путь падает в app.get('*') и отдаёт SPA
- * со статусом 200, поэтому при проверке отсутствия роута обязательно `-X POST`.
+ * In any normal (including production) configuration the route is absent —
+ * POST returns 404. Caveat: GET on any unknown path falls into app.get('*')
+ * and returns the SPA with status 200, so always verify route absence with
+ * `-X POST`.
  */
 if (process.env.ENABLE_STATS_DEBUG_ARCHIVE === 'true') {
   router.post('/debug/archiveYesterday', adminKeyVerify, async (req, res) => {
@@ -763,7 +744,7 @@ if (process.env.ENABLE_STATS_DEBUG_ARCHIVE === 'true') {
       await accountManager.archiveYesterdayForTest()
       res.json({ ok: true, archivedAt: new Date().toISOString() })
     } catch (error) {
-      // Readiness-guard из archiveYesterdayForTest бросает с этим сообщением.
+      // The readiness guard inside archiveYesterdayForTest throws with this message.
       if (error && error.message && error.message.includes('not initialized')) {
         return res.status(503).json({ error: 'account manager not initialized, try again' })
       }

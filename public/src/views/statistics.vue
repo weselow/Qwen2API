@@ -69,9 +69,10 @@ const { t } = useI18n()
 
 const loading = ref(true)
 const accounts = ref([])
-// Серверная дата — точка отсчёта для всех диапазонов.
-// Парный helper к _getYesterdayKey в архивации; не использовать new Date() в браузере
-// (иначе при разном TZ браузера и контейнера на границе месяца будут сдвиги).
+// Server-side date — anchor for every period range. Paired with the
+// _getYesterdayKey helper used by the archival routine; do not switch this
+// to new Date() in the browser — differing browser/container TZs would
+// shift month boundaries.
 const serverToday = ref(new Date().toISOString().slice(0, 10))
 
 const period = ref('currentMonth')
@@ -81,7 +82,7 @@ const periodOptions = computed(() => [
   { value: 'last90', label: t('stats.filter.last90') }
 ])
 
-// Парсим YYYY-MM-DD как локальную дату.
+// Parse YYYY-MM-DD as a local date.
 function parseDateKey(key) {
   const [y, m, d] = key.split('-').map(Number)
   return new Date(y, m - 1, d)
@@ -96,7 +97,7 @@ function daysInMonth(year, monthIndex0) {
   return new Date(year, monthIndex0 + 1, 0).getDate()
 }
 
-// dateRange — массив YYYY-MM-DD в хронологическом порядке, от serverToday.
+// dateRange — array of YYYY-MM-DD keys in chronological order, anchored to serverToday.
 const dateRange = computed(() => {
   const today = parseDateKey(serverToday.value)
   const result = []
@@ -125,7 +126,7 @@ const dateRange = computed(() => {
   return result
 })
 
-// Дневной агрегат по всем аккаунтам — для сводного бара
+// Daily aggregate across all accounts — feeds the summary bar chart.
 const aggregateDaily = computed(() => dateRange.value.map(date => {
   let chatInput = 0, chatOutput = 0, cliInput = 0, cliOutput = 0, cliCalls = 0
   for (const acc of accounts.value) {
@@ -150,9 +151,9 @@ const aggregateTotals = computed(() => aggregateDaily.value.reduce((acc, d) => (
   cliCalls: acc.cliCalls + d.cliCalls
 }), { chatInput: 0, chatOutput: 0, cliInput: 0, cliOutput: 0, cliCalls: 0 }))
 
-// Жёсткая валидация today перед использованием в построении dateRange:
-// без неё мусорный '2026-13-99' пройдёт через new Date(y, m-1, d) (JS
-// перевернёт даты) и весь UI покажет неверный диапазон.
+// Strictly validate `today` before using it to build dateRange — without this,
+// a malformed '2026-13-99' would slip through new Date(y, m-1, d) (JS would
+// roll the date over) and the UI would render the wrong window.
 const DATE_KEY_REGEX = /^\d{4}-\d{2}-\d{2}$/
 
 onMounted(async () => {

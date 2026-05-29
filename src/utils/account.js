@@ -37,15 +37,15 @@ const ensureStats = (account) => {
         }
     }
     // statsHistory: { 'YYYY-MM-DD': { chat:{input,output}, cli:{calls,input,output} } }
-    // Backward-compat: старые записи без поля — инициализируем пустым объектом
+    // Backward-compat: legacy records without the field — initialize to {}
     if (!account.statsHistory || typeof account.statsHistory !== 'object') {
         account.statsHistory = {}
     }
 }
 
 /**
- * Ключ даты YYYY-MM-DD для (now + offsetDays) в локальной TZ Node-процесса
- * @param {number} offsetDays - смещение в днях (отрицательное = в прошлое)
+ * YYYY-MM-DD date key for (now + offsetDays) in Node process local TZ
+ * @param {number} offsetDays - day offset (negative = past)
  * @returns {string}
  */
 const _formatDateKey = (offsetDays) => {
@@ -95,7 +95,7 @@ class Account {
         this.cliRequestNumberInterval = null
         this.cliDailyResetInterval = null
 
-        // 初始化（промис сохраняем, чтобы debug-методы могли дождаться готовности)
+        // Keep the init promise so debug methods can await readiness
         this._initPromise = this._initialize()
     }
 
@@ -205,6 +205,7 @@ class Account {
             const cliAccount = await cliManager.initCliAccount(account.token, account)
 
             if (cliAccount.access_token && cliAccount.refresh_token && cliAccount.expiry_date) {
+                account.cli_unavailable_reason = null
                 account.cli_info = {
                     access_token: cliAccount.access_token,
                     refresh_token: cliAccount.refresh_token,
@@ -231,6 +232,8 @@ class Account {
                 }
                 logger.success(`CLI账户 ${account.email} 初始化成功`, 'CLI')
             } else {
+                account.cli_info = null
+                account.cli_unavailable_reason = 'unsupported'
                 logger.error(`CLI账户 ${account.email} 初始化失败：无效的响应数据`, 'CLI', '', cliAccount)
             }
         } catch (error) {
@@ -264,17 +267,18 @@ class Account {
     }
 
     /**
-     * 每日 00:00 重置：CLI 请求计数 + chat/cli daily stats
-     * Перед обнулением сохраняем снэпшот вчерашнего дня в account.statsHistory,
-     * обрезаем записи старше STATS_HISTORY_RETENTION_DAYS дней,
-     * затем один батч-вызов saveAllAccounts (вместо 30 отдельных).
+     * Daily 00:00 reset: CLI request counters + chat/cli daily stats.
+     * Before zeroing, snapshot yesterday into account.statsHistory and prune
+     * entries older than STATS_HISTORY_RETENTION_DAYS days, then a single
+     * saveAllAccounts batch (instead of 30 individual saves).
      *
-     * Ограничения:
-     * - PM2_INSTANCES > 1: каждый воркер архивирует свою частичную копию stats;
-     *   итог за день будет занижен пропорционально числу воркеров. У текущей
-     *   инсталляции instances=1 (ecosystem.config.js), проблема не проявляется.
-     * - DATA_SAVE_MODE=none: saveAllAccounts возвращает false, история не персистится.
-     *   Для использования фичи в проде задать DATA_SAVE_MODE=file или redis.
+     * Caveats:
+     * - PM2_INSTANCES > 1: each worker archives its own partial copy of stats;
+     *   the daily total would be under-reported proportionally to the worker
+     *   count. With instances=1 (ecosystem.config.js default) this is not
+     *   triggered.
+     * - DATA_SAVE_MODE=none: saveAllAccounts returns false and history is not
+     *   persisted. Set DATA_SAVE_MODE=file or redis to enable the feature.
      * @private
      */
     async _resetDailyCounters() {
@@ -288,19 +292,19 @@ class Account {
         const cutoff = _dateKeyDaysAgo(STATS_HISTORY_RETENTION_DAYS)
         let archivedCount = 0
 
-        // Для КАЖДОГО аккаунта (включая неактивных) обрезаем старую историю,
-        // для аккаунтов с ненулевыми счётчиками — пишем снэпшот вчерашнего дня
+        // For every account (including inactive ones) prune old history;
+        // for accounts with any non-zero counters, snapshot yesterday.
         this.accountTokens.forEach(account => {
             ensureStats(account)
 
-            // Прунинг по дате (строковое сравнение валидно для YYYY-MM-DD)
+            // Date-based pruning (string compare is valid for YYYY-MM-DD).
             for (const key of Object.keys(account.statsHistory)) {
                 if (key < cutoff) {
                     delete account.statsHistory[key]
                 }
             }
 
-            // Снэпшот только если был хоть один ненулевой счётчик
+            // Snapshot only if there was at least one non-zero counter.
             if (_hasNonZeroStats(account.stats)) {
                 account.statsHistory[yesterday] = {
                     chat: { ...account.stats.chat },
@@ -309,7 +313,7 @@ class Account {
                 archivedCount++
             }
 
-            // Обнуление today
+            // Reset today.
             account.stats.chat.input = 0
             account.stats.chat.output = 0
             account.stats.cli.calls = 0
@@ -322,8 +326,8 @@ class Account {
             'CLI'
         )
 
-        // Один батч-вызов; в file-режиме — одна перезапись data.json,
-        // в redis-режиме — последовательные HSET (debounce saveAccountStats не задействован)
+        // Single batch save. In file mode — one data.json rewrite; in redis
+        // mode — sequential HSETs (the saveAccountStats debounce is not used).
         try {
             await this.dataPersistence.saveAllAccounts(this.accountTokens)
         } catch (error) {
@@ -332,10 +336,11 @@ class Account {
     }
 
     /**
-     * Публичный helper: ключ YYYY-MM-DD текущего дня в локальной TZ Node-процесса.
-     * Парный к _getYesterdayKey, используемому в _resetDailyCounters.
-     * Роут /statsHistory обязан использовать его, а не new Date() в браузере —
-     * иначе при разном TZ браузера/контейнера на границе месяца возможны сдвиги.
+     * Public helper: today's YYYY-MM-DD key in Node process local TZ.
+     * Paired with the _getYesterdayKey used inside _resetDailyCounters.
+     * The /statsHistory route must use this rather than new Date() in the
+     * browser — otherwise differing browser/container TZs can shift month
+     * boundaries.
      * @returns {string}
      */
     getTodayKey() {
@@ -343,8 +348,8 @@ class Account {
     }
 
     /**
-     * Debug: ручной запуск архивации/сброса (используется dev-эндпоинтом из B2).
-     * Readiness-guard защищает от перезаписи data.accounts = [] до окончания init.
+     * Debug: manual trigger for archive/reset (used by the dev endpoint).
+     * The readiness guard prevents wiping data.accounts = [] before init finishes.
      * @returns {Promise<void>}
      */
     async archiveYesterdayForTest() {

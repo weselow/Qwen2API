@@ -4,8 +4,8 @@
       <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 px-4 space-y-4 md:space-y-0 pt-5">
         <h1 class="text-4xl font-bold">{{ t('dash.title') }} <span class="text-gray-500 text-sm">by 兜豆子</span></h1>
         <div class="flex flex-col md:flex-row md:items-center w-full md:w-auto gap-3">
-          <!-- 6 кнопок в 2 ряда на десктопе (3+3), 2 колонки на мобиле -->
-          <div class="grid grid-cols-2 md:grid-cols-3 gap-2 md:gap-3 w-full md:w-auto">
+          <!-- 6 buttons in 2 rows on desktop (3+3), 2 columns on mobile -->
+          <div class="flex gap-2">
           <button @click="showAddModal = true"
                   class="action-button font-bold border border-green-200 bg-green-50 text-green-900 px-4 py-2 rounded-xl shadow-sm hover:bg-green-100 hover:border-green-400 transition-all duration-300 transform hover:-translate-y-1 active:translate-y-0 text-center">
             {{ t('dash.addAccount') }}
@@ -55,6 +55,10 @@
           <router-link to="/settings"
                        class="action-button font-bold border border-blue-200 bg-blue-50 text-blue-900 px-4 py-2 rounded-xl shadow-sm hover:bg-blue-100 hover:border-blue-400 transition-all duration-300 transform hover:-translate-y-1 active:translate-y-0 text-center">
             {{ t('dash.settings') }}
+          </router-link>
+          <router-link to="/chat"
+                       class="action-button font-bold border border-blue-200 bg-blue-50 text-blue-900 px-4 py-2 rounded-xl shadow-sm hover:bg-blue-100 hover:border-blue-400 transition-all duration-300 transform hover:-translate-y-1 active:translate-y-0 text-center">
+            {{ t('dash.chat') }}
           </router-link>
           </div>
           <LangSwitcher class="self-center md:self-auto" />
@@ -220,19 +224,31 @@
                     out
                   </span>
                 </div>
-                <button type="button"
+                <template v-if="getStatusKind(token.email) === 'cli_unsupported'">
+                  <div class="flex items-baseline justify-between gap-2 w-full text-left">
+                    <span class="text-gray-400 border-b border-dotted border-gray-300 transition-colors"
+                          :title="getStatusTooltip(token.email)">
+                      {{ t('dash.acct.cliToday') }}:
+                    </span>
+                    <span class="font-medium text-gray-400 text-xs md:text-sm"
+                          :title="getStatusTooltip(token.email)">
+                      {{ t('dash.acct.cliUnavailableShort') }}
+                    </span>
+                  </div>
+                </template>
+                <button v-else type="button"
                         @click="toggleCliExpanded"
                         class="flex items-baseline justify-between gap-2 w-full text-left focus:outline-none">
                   <span class="text-gray-600 border-b border-dotted border-gray-400 hover:text-gray-800 transition-colors">
                     {{ t('dash.acct.cliToday') }}:
                   </span>
                   <span class="font-medium text-gray-800 text-xs md:text-sm flex items-center gap-1">
-                    <span>{{ getCliRequestNumber(token.email) }} / {{ cliQuotaLimit }} {{ t('dash.acct.calls') }}</span>
+                    <span>{{ getCliRequestNumber(token.email) }} / {{ getCliQuotaLimit(token.email) }} {{ t('dash.acct.calls') }}</span>
                     <span class="text-xs text-gray-400 transition-transform duration-200" :class="{ 'rotate-90': cliExpanded }">▸</span>
                   </span>
                 </button>
                 <transition name="fade">
-                  <div v-if="cliExpanded" class="space-y-1 pt-1">
+                  <div v-if="cliExpanded && getStatusKind(token.email) !== 'cli_unsupported'" class="space-y-1 pt-1">
                     <div class="text-xs text-gray-500 text-right">
                       {{ t('dash.acct.cliSuccess') }}: {{ getAccountStats(token.email).cli.calls }}
                     </div>
@@ -593,8 +609,14 @@ const DEFAULT_STATS = Object.freeze({
 
 const getAccountStats = (email) => accountStats.value[email]?.stats || DEFAULT_STATS
 const getCliRequestNumber = (email) => accountStats.value[email]?.cliRequestNumber || 0
+const getCliQuotaLimit = (email) => {
+  const perAccountLimit = accountStats.value[email]?.cliQuotaLimit
+  if (typeof perAccountLimit === 'number') return perAccountLimit
+  return cliQuotaLimit.value
+}
 const getCliProgressPct = (email) => {
-  const limit = cliQuotaLimit.value || 2000
+  const limit = getCliQuotaLimit(email)
+  if (limit <= 0) return 0
   return Math.min(100, getCliRequestNumber(email) / limit * 100)
 }
 const getCliProgressColor = (email) => {
@@ -605,7 +627,7 @@ const getCliProgressColor = (email) => {
 }
 
 // Compact number formatting (Qwen2API-j7x): 415575 → '415к', 1500 → '1.5к', 1500000 → '1.5M'.
-// Реализация вынесена в ../utils/format.js (переиспользуется в /statistics).
+// Implementation moved to ../utils/format.js (shared with /statistics).
 const formatCompact = (n) => _formatCompact(n, { unitK: t('dash.acct.unitK'), unitM: t('dash.acct.unitM') })
 
 // CLI accordion (Qwen2API-ao2): свёрнут по умолчанию, состояние общее для всех карточек в localStorage.
@@ -620,7 +642,8 @@ const STATUS_EMOJI = Object.freeze({
   active: '🟢',
   warn: '🟡',
   cooldown: '🔴',
-  token_expiring: '🪫'
+  token_expiring: '🪫',
+  cli_unsupported: '⚪'
 })
 const nowTick = ref(Date.now())
 let tickInterval = null
@@ -670,6 +693,9 @@ const getStatusTooltip = (email) => {
   if (kind === 'token_expiring') {
     return t('dash.acct.status.tokenExpiring')
   }
+  if (kind === 'cli_unsupported') {
+    return t('dash.acct.status.cliUnsupported')
+  }
   return t('dash.acct.status.active')
 }
 
@@ -683,7 +709,7 @@ const fetchAccountStats = async () => {
       if (entry?.email) map[entry.email] = entry
     }
     accountStats.value = map
-    if (typeof res.data?.cliQuotaLimit === 'number' && res.data.cliQuotaLimit > 0) {
+    if (typeof res.data?.cliQuotaLimit === 'number') {
       cliQuotaLimit.value = res.data.cliQuotaLimit
     }
     // Drop suppression entries where account is no longer in cooldown OR
