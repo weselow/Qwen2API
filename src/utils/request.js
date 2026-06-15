@@ -49,25 +49,24 @@ const sendChatRequest = async (body) => {
     // 构建请求配置
     const requestConfig = {
         headers: {
-            'Authorization': `Bearer ${currentToken}`,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
-            "Connection": "keep-alive",
-            // Accept 必须是浏览器 fetch 的默认值; 单一 application/json 或 text/event-stream 会被 BxVista 风控识别为非浏览器
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Content-Type": "application/json",
-            "sec-ch-ua": "\"Microsoft Edge\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
-            "sec-ch-ua-mobile": "?0",
+            // 全部小写、值对齐 fix.md (#132): 浏览器 fetch 在 HTTP/2 下发送小写头, BxVista 据头部大小写/取值识别非浏览器
+            'authorization': `Bearer ${currentToken}`,
             "sec-ch-ua-platform": "\"Windows\"",
+            "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+            "sec-ch-ua-mobile": "?0",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "accept-language": "zh-CN,zh;q=0.9",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "referer": `${chatBaseUrl}/`,
+            "origin": chatBaseUrl,
             "bx-v": "2.5.36",
-            "Origin": chatBaseUrl,
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Dest": "empty",
-            "Referer": `${chatBaseUrl}/c/guest`,
-            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            // Cookie 必须含与 Authorization 相同的 JWT token (会话绑定校验); 缺失会被判为未登录
-            "Cookie": `token=${currentToken};ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+            "connection": "keep-alive",
+            "cookie": `token=${currentToken};ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
         },
         responseType: 'stream', // Always use streaming (upstream doesn't support stream=false)
         timeout: 60 * 1000,
@@ -171,25 +170,24 @@ const generateChatID = async (currentToken, model, account) => {
 
         const requestConfig = {
             headers: {
-                'Authorization': `Bearer ${currentToken}`,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
-                "Connection": "keep-alive",
-                // Accept 必须是浏览器 fetch 的默认值; 单一 application/json 或 text/event-stream 会被 BxVista 风控识别为非浏览器
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Encoding": "gzip, deflate, br, zstd",
-                "Content-Type": "application/json",
-                "sec-ch-ua": "\"Microsoft Edge\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
-                "sec-ch-ua-mobile": "?0",
+                // 全部小写、值对齐 fix.md (#132): 浏览器 fetch 在 HTTP/2 下发送小写头, BxVista 据头部大小写/取值识别非浏览器
+                'authorization': `Bearer ${currentToken}`,
                 "sec-ch-ua-platform": "\"Windows\"",
+                "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+                "sec-ch-ua-mobile": "?0",
+                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+                "accept": "application/json, text/plain, */*",
+                "content-type": "application/json",
+                "accept-language": "zh-CN,zh;q=0.9",
+                "accept-encoding": "gzip, deflate, br, zstd",
+                "referer": `${chatBaseUrl}/`,
+                "origin": chatBaseUrl,
                 "bx-v": "2.5.36",
-                "Origin": chatBaseUrl,
-                "Sec-Fetch-Site": "same-origin",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Dest": "empty",
-                "Referer": `${chatBaseUrl}/c/guest`,
-                "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-                // Cookie 必须含与 Authorization 相同的 JWT token (会话绑定校验); 缺失会被判为未登录
-                "Cookie": `token=${currentToken};ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
+                "sec-fetch-site": "same-origin",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-dest": "empty",
+                "connection": "keep-alive",
+                "cookie": `token=${currentToken};ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
             }
         }
 
