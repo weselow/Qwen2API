@@ -2,7 +2,7 @@ const { isJson, generateUUID } = require('../utils/tools.js');
 const { createUsageObject } = require('../utils/precise-tokenizer.js');
 const { sendChatRequest } = require('../utils/request.js');
 const accountManager = require('../utils/account.js');
-const { isChatType, isThinkingEnabled, parserModel, parserMessages } = require('../utils/chat-helpers.js');
+const { isChatType, isThinkingEnabled, parserModel, parserMessages, createUpstreamDeltaNormalizer } = require('../utils/chat-helpers.js');
 const {
   buildToolSystemPrompt,
   foldToolMessages,
@@ -207,7 +207,7 @@ const buildInternalRequest = async (anthropicReq) => {
 
   // 3. 走现有 parserMessages 复用图片上传与 thinking 配置
   const enable_thinking = !!(thinking && thinking.type === 'enabled');
-  const thinkingCfg = isThinkingEnabled(model, enable_thinking, thinking?.budget_tokens);
+  const thinkingCfg = await isThinkingEnabled(model, enable_thinking, thinking?.budget_tokens);
   const chatType = isChatType(model);
   const parsedMessages = await parserMessages(flat, thinkingCfg, chatType);
   const parsedModel = await parserModel(model);
@@ -491,6 +491,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let completionContent = '';
   let webSearchInfo = null;
   let thinkingStarted = false;
+  const normalizeDelta = createUpstreamDeltaNormalizer();
 
   /**
    * 处理一个上游 delta JSON
@@ -506,9 +507,10 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     if (delta && delta.name === 'web_search') {
       webSearchInfo = delta.extra?.web_search_info;
     }
-    if (!delta || !delta.content || (delta.phase !== 'think' && delta.phase !== 'answer')) return;
-
-    let content = delta.content;
+    const normalized = normalizeDelta(delta);
+    if (!normalized) return;
+    delta.phase = normalized.phase;
+    let content = normalized.content;
     completionContent += content;
 
     if (delta.phase === 'think') {
@@ -594,6 +596,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   let promptTokens = 0;
   let completionTokens = 0;
   let webSearchInfo = null;
+  const normalizeDelta = createUpstreamDeltaNormalizer();
 
   /**
    * 处理一个上游 delta JSON
@@ -609,8 +612,10 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     if (delta && delta.name === 'web_search') {
       webSearchInfo = delta.extra?.web_search_info;
     }
-    if (!delta || !delta.content || (delta.phase !== 'think' && delta.phase !== 'answer')) return;
-    const content = delta.content;
+    const normalized = normalizeDelta(delta);
+    if (!normalized) return;
+    delta.phase = normalized.phase;
+    const content = normalized.content;
     if (delta.phase === 'think') {
       thinkingContent += content;
     } else if (delta.phase === 'answer') {

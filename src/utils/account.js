@@ -148,7 +148,7 @@ class Account {
 
             // 初始化 CLI 账户（后台执行，不阻塞 chat-flow init）
             // 为所有账户启动 CLI 初始化，确保没有 CLI 额度的账号被正确标记为 unsupported
-            if (this.accountTokens.length > 0) {
+            if (this.accountTokens.length > 0 && config.cliEnabled) {
                 logger.info(`后台初始化所有 ${this.accountTokens.length} 个账户的 CLI`, 'ACCOUNT')
                 Promise.allSettled(
                     this.accountTokens.map(account => this._initializeCliAccount(account))
@@ -199,6 +199,11 @@ class Account {
      * @private
      */
     async _initializeCliAccount(account) {
+        if (!config.cliEnabled) {
+            account.cli_info = null
+            account.cli_unavailable_reason = 'disabled'
+            return null
+        }
         try {
             const cliManager = require('./cli.manager')
             const cliAccount = await cliManager.initCliAccount(account.token, account)

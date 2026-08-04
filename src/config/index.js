@@ -48,6 +48,8 @@ const config = {
     qwenCliProxyUrl: process.env.QWEN_CLI_PROXY_URL || "https://portal.qwen.ai",
     // 代理配置
     proxyUrl: process.env.PROXY_URL || null,
+    // CLI 账户初始化开关（OAuth 设备授权流程需要人工确认，默认关闭避免初始化失败刷屏）
+    cliEnabled: process.env.ENABLE_CLI === 'true',
     // chat 请求重试配置（运行时可被 web UI 覆盖，见 src/utils/data-persistence.js#loadSettings）
     chatRetryCount: Math.max(0, parseInt(process.env.CHAT_RETRY_COUNT, 10) || 1),
     chatRetryBackoffMs: Math.max(0, parseInt(process.env.CHAT_RETRY_BACKOFF_MS, 10) || 400)

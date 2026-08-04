@@ -2,7 +2,7 @@ const axios = require('axios')
 const accountManager = require('../utils/account.js')
 const { getSsxmodItna, getSsxmodItna2 } = require('../utils/ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
-const { generateUUID } = require('../utils/tools.js')
+const { generateUUID, getTimezoneHeader } = require('../utils/tools.js')
 const { logger } = require('../utils/logger')
 const config = require('../config/index.js')
 
@@ -34,20 +34,18 @@ const getLatestModels = async (force = false) => {
     const requestConfig = {
         headers: {
             'sec-ch-ua-platform': '"Windows"',
-            'authorization': `Bearer ${account ? account.token : ''}`,
             'referer': `${chatBaseUrl}/`,
             'accept-language': 'zh-CN,zh;q=0.9',
             'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
             'sec-ch-ua-mobile': '?0',
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
             'content-type': 'application/json',
-            'bx-v': '2.5.36',
             'accept': '*/*',
             'accept-encoding': 'gzip, deflate, br, zstd',
             // WAF 客户端标识头
             'source': 'web',
-            'version': '0.2.63',
-            'timezone': new Date().toString().replace(/GMT\+0800/, 'GMT+0800'),
+            'version': '0.2.81',
+            'timezone': getTimezoneHeader(),
             'x-request-id': generateUUID(),
             'connection': 'keep-alive',
             ...(account?.token && {

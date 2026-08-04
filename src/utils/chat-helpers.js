@@ -210,7 +210,7 @@ const isChatType = (model) => {
  * @param {number} thinking_budget - 思考预算
  * @returns {object} 思考配置对象
  */
-const isThinkingEnabled = (model, enable_thinking, thinking_budget) => {
+const isThinkingEnabled = async (model, enable_thinking, thinking_budget) => {
     const thinking_config = {
         "output_schema": "phase",
         "thinking_enabled": false,
@@ -219,7 +219,19 @@ const isThinkingEnabled = (model, enable_thinking, thinking_budget) => {
 
     if (!model) return thinking_config
 
-    if (model.includes('-thinking') || enable_thinking) {
+    // 上游对不可跳过思考的模型（think_skip.enable === false，如 qwen3.8 系列）强制要求
+    // thinking_enabled=true，否则返回 invalid_input 错误；qwen3.7 及以下系列可接受 false
+    let modelSupportsThinking = false
+    try {
+        const latestModels = await getLatestModels()
+        const { baseModel } = splitModelSuffix(model)
+        const matchedModel = findMatchedModel(latestModels, baseModel)
+        modelSupportsThinking = matchedModel?.info?.meta?.think_skip?.enable === false
+    } catch (e) {
+        // 查询失败时退回名称判断，不阻塞请求
+    }
+
+    if (model.includes('-thinking') || enable_thinking || modelSupportsThinking) {
         thinking_config.thinking_enabled = true
     }
 
@@ -480,9 +492,49 @@ const processOriginalLogic = async (messages, thinking_config, chat_type, imgCac
     return messages
 }
 
+/**
+ * 是否为思考阶段 phase（兼容 thinking_summary）
+ * @param {string} phase
+ * @returns {boolean}
+ */
+const isThinkPhase = (phase) => phase === 'think' || phase === 'thinking' || phase === 'thinking_summary'
+
+/**
+ * 创建上游 delta 归一化器：将 thinking_summary 的 extra.summary_thought 增量转为 phase=think 的 content
+ * summary 帧为增长数组，只 emit 新增段落，避免重复。
+ * @returns {(delta: object) => ({ phase: string, content: string }|null)}
+ */
+const createUpstreamDeltaNormalizer = () => {
+    let summaryThoughtCount = 0
+    return (delta) => {
+        if (!delta) return null
+        const rawPhase = delta.phase
+        if (!isThinkPhase(rawPhase) && rawPhase !== 'answer') return null
+
+        let content = typeof delta.content === 'string' ? delta.content : ''
+        if (rawPhase === 'thinking_summary') {
+            const thoughts = delta.extra && delta.extra.summary_thought && delta.extra.summary_thought.content
+            if (Array.isArray(thoughts) && thoughts.length > summaryThoughtCount) {
+                content = thoughts.slice(summaryThoughtCount).filter(Boolean).join('\n')
+                summaryThoughtCount = thoughts.length
+            } else {
+                content = ''
+            }
+        }
+
+        if (!content) return null
+        return {
+            phase: isThinkPhase(rawPhase) ? 'think' : 'answer',
+            content
+        }
+    }
+}
+
 module.exports = {
     isChatType,
     isThinkingEnabled,
     parserModel,
-    parserMessages
+    parserMessages,
+    isThinkPhase,
+    createUpstreamDeltaNormalizer
 }

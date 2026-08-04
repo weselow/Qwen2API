@@ -1266,7 +1266,7 @@ const generateImageVideoResult = async (payload) => {
             ]
         }
 
-        const chatID = await generateChatID(token, model)
+        const chatID = await generateChatID(token, model, account, chat_type)
 
         if (!chatID) {
             throw new Error('生成 chat_id 失败')

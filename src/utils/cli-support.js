@@ -12,6 +12,8 @@ function getAccountCliState(account, rotatorRecord = {}, now = Date.now()) {
   let kind = 'active'
   if (cliUnavailableReason === 'unsupported') {
     kind = 'cli_unsupported'
+  } else if (cliUnavailableReason === 'disabled') {
+    kind = 'cli_disabled'
   } else if (!account.cli_info && !cliUnavailableReason) {
     kind = 'cli_pending'
   } else if (cooldownEndsAt && now < cooldownEndsAt) {

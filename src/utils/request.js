@@ -4,7 +4,7 @@ const config = require('../config/index.js')
 const { logger } = require('./logger')
 const { getSsxmodItna, getSsxmodItna2 } = require('./ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./proxy-helper')
-const { generateUUID } = require('./tools.js')
+const { generateUUID, getTimezoneHeader } = require('./tools.js')
 
 // 传输层（非 HTTP）错误码 — 这些重试的, HTTP 响应不重试
 const RETRYABLE_ERROR_CODES = new Set([
@@ -47,27 +47,25 @@ const sendChatRequest = async (body) => {
     const chatBaseUrl = getChatBaseUrl()
     const proxyAgent = getProxyAgent(currentAccount)
 
-    // 构建请求配置（与通义千问 React Web 客户端完全一致）
+    // 构建请求配置（与通义千问 React Web 客户端完全一致，对齐 FE 0.2.81）
     const requestConfig = {
         headers: {
             'sec-ch-ua-platform': '"Windows"',
-            'authorization': `Bearer ${currentToken}`,
             'referer': `${chatBaseUrl}/`,
             'accept-language': 'zh-CN,zh;q=0.9',
             'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
             'sec-ch-ua-mobile': '?0',
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
             'content-type': 'application/json',
-            'bx-v': '2.5.36',
-            'accept': 'text/event-stream',
+            'accept': 'application/json',
             'accept-encoding': 'gzip, deflate, br, zstd',
             // WAF 客户端标识头（必须与 React Web 客户端一致）
             'source': 'web',
-            'version': '0.2.63',
-            'timezone': new Date().toString().replace(/GMT\+0800/, 'GMT+0800'),
+            'version': '0.2.81',
+            'timezone': getTimezoneHeader(),
             'x-request-id': generateUUID(),
             'connection': 'keep-alive',
-            // Cookie: JWT token + SSXMOD 反爬链（双重认证）
+            // Cookie: JWT token + SSXMOD 反爬链（双重认证；浏览器不带 authorization 头，鉴权全走 cookie）
             'cookie': `token=${currentToken};ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
             'host': chatBaseUrl.replace('https://', ''),
             'origin': chatBaseUrl,
@@ -77,7 +75,7 @@ const sendChatRequest = async (body) => {
             'x-accel-buffering': 'no',
         },
         responseType: 'stream', // Always use streaming (upstream doesn't support stream=false)
-        timeout: 60 * 1000,
+        timeout: 10 * 60 * 1000, // Max/thinking models may exceed 60s before answer
     }
 
     // 添加代理配置
@@ -86,9 +84,20 @@ const sendChatRequest = async (body) => {
         requestConfig.proxy = false // 禁用axios默认代理，使用httpsAgent
     }
 
-    const chat_id = await generateChatID(currentToken, body.model, currentAccount)
+    const chatType = body.chat_type || body.messages?.[0]?.chat_type || 't2t'
+    const chat_id = await generateChatID(currentToken, body.model, currentAccount, chatType)
+    // 浏览器 referer 为 /c/<chat_id>（在 chat_id 生成后动态设置）
+    requestConfig.headers.referer = `${chatBaseUrl}/c/${chat_id}`
     const url = `${chatBaseUrl}/api/v2/chat/completions?chat_id=` + chat_id
-    const payload = { ...body, stream: true, chat_id }
+    // 对齐网页双写 chatId/parentId（FE 0.2.81）
+    const payload = {
+        ...body,
+        stream: true,
+        chat_id,
+        chatId: chat_id,
+        parent_id: body.parent_id ?? null,
+        parentId: body.parentId ?? body.parent_id ?? null
+    }
 
     const maxRetries = Math.max(0, parseInt(config.chatRetryCount, 10) || 0)
     const backoffMs = Math.max(0, parseInt(config.chatRetryBackoffMs, 10) || 0)
@@ -171,7 +180,7 @@ const sendChatRequest = async (body) => {
  * @param {Object} [account] - 当前账户对象（用于解析账号级代理）
  * @returns {Promise<string|null>} 返回生成的chat_id，如果失败则返回null
  */
-const generateChatID = async (currentToken, model, account) => {
+const generateChatID = async (currentToken, model, account, chatType = 't2t') => {
     try {
         const chatBaseUrl = getChatBaseUrl()
         const proxyAgent = getProxyAgent(account)
@@ -179,20 +188,18 @@ const generateChatID = async (currentToken, model, account) => {
         const requestConfig = {
             headers: {
                 'sec-ch-ua-platform': '"Windows"',
-                'authorization': `Bearer ${currentToken}`,
-                'referer': `${chatBaseUrl}/`,
+                'referer': `${chatBaseUrl}/c/new-chat`,
                 'accept-language': 'zh-CN,zh;q=0.9',
                 'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
                 'sec-ch-ua-mobile': '?0',
                 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
                 'content-type': 'application/json',
-                'bx-v': '2.5.36',
-                'accept': '*/*',
+                'accept': 'application/json, text/plain, */*',
                 'accept-encoding': 'gzip, deflate, br, zstd',
                 // WAF 客户端标识头
                 'source': 'web',
-                'version': '0.2.63',
-                'timezone': new Date().toString().replace(/GMT\+0800/, 'GMT+0800'),
+                'version': '0.2.81',
+                'timezone': getTimezoneHeader(),
                 'x-request-id': generateUUID(),
                 'connection': 'keep-alive',
                 // Cookie: JWT token + SSXMOD 反爬链
@@ -211,14 +218,14 @@ const generateChatID = async (currentToken, model, account) => {
             requestConfig.proxy = false
         }
 
+        // 对齐 chat.qwen.ai FE 0.2.81：chatId/project_id + normal 模式
         const response_data = await axios.post(`${chatBaseUrl}/api/v2/chats/new`, {
-            "title": "New Chat",
-            "models": [
-                model
-            ],
-            "chat_mode": "local",
-            "chat_type": "t2i",
-            "timestamp": new Date().getTime()
+            chatId: '',
+            models: [model],
+            project_id: '',
+            timestamp: Date.now(),
+            chat_type: chatType || 't2t',
+            chat_mode: 'normal'
         }, requestConfig)
 
         return response_data.data?.data?.id || null

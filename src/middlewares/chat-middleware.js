@@ -23,7 +23,7 @@ const processRequestBody = async (req, res, next) => {
 
     const now = Math.floor(Date.now() / 1000)
     const fid = generateUUID()
-    const thinkingConfig = isThinkingEnabled(model, enable_thinking, thinking_budget)
+    const thinkingConfig = await isThinkingEnabled(model, enable_thinking, thinking_budget)
 
     // 构建请求体 — 对齐 React 前端格式
     const body = {
@@ -31,19 +31,24 @@ const processRequestBody = async (req, res, next) => {
       version: '2.1',
       incremental_output: true,
       chat_id: null,                    // 由 sendChatRequest 填充
+      chatId: null,
       chat_mode: 'normal',
       model: await parserModel(model),
       parent_id: null,
+      parentId: null,
       messages: [{
+        id: null,
         fid: fid,
         parentId: null,
-        childrenIds: [],
+        parent_id: null,
+        childrenIds: [generateUUID()],
         role: 'user',                   // 取最后一条消息的角色
         content: '',                    // 由下方 parserMessages 填充
         user_action: 'chat',
         files: [],
         timestamp: now,
         models: [await parserModel(model)],
+        model: '',
         chat_type: isChatType(model),
         feature_config: {
           output_schema: 'phase', // 必需：缺失时上游不再返回 delta.phase，chat.js 会丢弃全部增量（completion=0）
@@ -51,7 +56,7 @@ const processRequestBody = async (req, res, next) => {
           research_mode: 'normal',
           auto_thinking: true,
           thinking_mode: 'Auto',
-          thinking_format: 'detail',
+          thinking_format: 'summary', // 与官方 FE + Max 模型 meta 一致
           auto_search: true
         },
         extra: { meta: { subChatType: isChatType(model) } },
@@ -110,6 +115,7 @@ const processRequestBody = async (req, res, next) => {
 
     // 保存完整消息历史供下游使用（用于多轮对话上下文）
     req.parsed_messages = parsedMessages
+    req.enable_thinking = thinkingConfig.thinking_enabled
     req.enable_web_search = chatType === 'search' ? true : false
 
     // 顶层 chat_type 供路由选择器使用 (selectChatCompletion)

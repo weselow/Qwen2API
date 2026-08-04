@@ -45,10 +45,21 @@ const generateUUID = () => {
   return crypto.randomUUID()
 }
 
+/**
+ * 浏览器风格 timezone 请求头（仅 ASCII）
+ * 中文 Windows 的 Date#toString 含“中国标准时间”，会破坏 HTTP 头。
+ * @returns {string}
+ */
+const getTimezoneHeader = () => {
+  // 去掉非 ASCII（如“中国标准时间”），并压缩空白
+  return new Date().toString().replace(/[^\x20-\x7E]/g, '').replace(/\s+/g, ' ').trim()
+}
+
 module.exports = {
   isJson,
   sleep,
   sha256Encrypt,
   JwtDecode,
-  generateUUID
+  generateUUID,
+  getTimezoneHeader
 }

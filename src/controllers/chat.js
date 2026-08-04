@@ -6,6 +6,7 @@ const accountManager = require('../utils/account.js')
 const config = require('../config/index.js')
 const axios = require('axios')
 const { logger } = require('../utils/logger')
+const { createUpstreamDeltaNormalizer } = require('../utils/chat-helpers.js')
 
 /**
  * 设置响应头
@@ -103,6 +104,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         let web_search_info = null
         let thinking_start = false
         let thinking_end = false
+        const normalizeDelta = createUpstreamDeltaNormalizer()
         let emittedImageMarkdownSet = new Set()
         let pendingImageMarkdownList = []
 
@@ -292,12 +294,14 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                 }
             }
 
-            if (!delta || !delta.content ||
-                (delta.phase !== 'think' && delta.phase !== 'answer')) {
+            // 兼容 think / thinking_summary；summary 内容来自 extra
+            const normalized = normalizeDelta(delta)
+            if (!normalized) {
                 return
             }
-
-            let content = delta.content
+            // 后续逻辑统一用 phase=think|answer
+            delta.phase = normalized.phase
+            let content = normalized.content
             completionContent += content
 
             if (config.legacyReasoningInContent) {
@@ -509,6 +513,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         let web_search_info = null
         let thinking_start = false
         let thinking_end = false
+        const normalizeDelta = createUpstreamDeltaNormalizer()
         let appendedImageMarkdownSet = new Set()
         let pendingImageMarkdownList = []
 
@@ -603,12 +608,12 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                             }
                         }
 
-                        if (!delta || !delta.content ||
-                            (delta.phase !== 'think' && delta.phase !== 'answer')) {
+                        const normalized = normalizeDelta(delta)
+                        if (!normalized) {
                             continue
                         }
-
-                        let content = delta.content
+                        delta.phase = normalized.phase
+                        let content = normalized.content
 
                         if (config.legacyReasoningInContent) {
                             // 旧版：推理以 <think>...</think> 包裹并入 content
