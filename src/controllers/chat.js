@@ -6,7 +6,7 @@ const accountManager = require('../utils/account.js')
 const config = require('../config/index.js')
 const axios = require('axios')
 const { logger } = require('../utils/logger')
-const { createUpstreamDeltaNormalizer } = require('../utils/chat-helpers.js')
+const { createUpstreamDeltaNormalizer, createUpstreamResponseFilter } = require('../utils/chat-helpers.js')
 
 /**
  * 设置响应头
@@ -105,6 +105,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         let thinking_start = false
         let thinking_end = false
         const normalizeDelta = createUpstreamDeltaNormalizer()
+        const acceptUpstreamFrame = createUpstreamResponseFilter()
         let emittedImageMarkdownSet = new Set()
         let pendingImageMarkdownList = []
 
@@ -259,6 +260,10 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         const processSSEPayload = async (dataContent) => {
             const decodeJson = isJson(dataContent) ? JSON.parse(dataContent) : null
             if (decodeJson === null || !decodeJson.choices || decodeJson.choices.length === 0) {
+                return
+            }
+            // 丢弃其余候选回答的帧：上游多路并发会让内容重复
+            if (!acceptUpstreamFrame(decodeJson)) {
                 return
             }
 
@@ -514,6 +519,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         let thinking_start = false
         let thinking_end = false
         const normalizeDelta = createUpstreamDeltaNormalizer()
+        const acceptUpstreamFrame = createUpstreamResponseFilter()
         let appendedImageMarkdownSet = new Set()
         let pendingImageMarkdownList = []
 
@@ -575,6 +581,10 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                         const dataContent = item.replace("data: ", '')
                         const decodeJson = isJson(dataContent) ? JSON.parse(dataContent) : null
                         if (decodeJson === null || !decodeJson.choices || decodeJson.choices.length === 0) {
+                            continue
+                        }
+                        // 丢弃其余候选回答的帧：上游多路并发会让内容重复
+                        if (!acceptUpstreamFrame(decodeJson)) {
                             continue
                         }
 

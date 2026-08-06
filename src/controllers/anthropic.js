@@ -2,7 +2,7 @@ const { isJson, generateUUID } = require('../utils/tools.js');
 const { createUsageObject } = require('../utils/precise-tokenizer.js');
 const { sendChatRequest } = require('../utils/request.js');
 const accountManager = require('../utils/account.js');
-const { isChatType, isThinkingEnabled, parserModel, parserMessages, createUpstreamDeltaNormalizer } = require('../utils/chat-helpers.js');
+const { isChatType, isThinkingEnabled, parserModel, parserMessages, createUpstreamDeltaNormalizer, createUpstreamResponseFilter } = require('../utils/chat-helpers.js');
 const {
   buildToolSystemPrompt,
   foldToolMessages,
@@ -492,6 +492,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let webSearchInfo = null;
   let thinkingStarted = false;
   const normalizeDelta = createUpstreamDeltaNormalizer();
+  const acceptUpstreamFrame = createUpstreamResponseFilter();
 
   /**
    * 处理一个上游 delta JSON
@@ -499,6 +500,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
    */
   const onUpstreamDelta = async (json) => {
     if (!json.choices || json.choices.length === 0) return;
+    // 丢弃其余候选回答的帧：上游多路并发会让内容重复
+    if (!acceptUpstreamFrame(json)) return;
     if (json.usage) {
       promptTokens = json.usage.prompt_tokens || promptTokens;
       completionTokens = json.usage.completion_tokens || completionTokens;
@@ -597,6 +600,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   let completionTokens = 0;
   let webSearchInfo = null;
   const normalizeDelta = createUpstreamDeltaNormalizer();
+  const acceptUpstreamFrame = createUpstreamResponseFilter();
 
   /**
    * 处理一个上游 delta JSON
@@ -604,6 +608,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
    */
   const onUpstreamDelta = async (json) => {
     if (!json.choices || json.choices.length === 0) return;
+    // 丢弃其余候选回答的帧：上游多路并发会让内容重复
+    if (!acceptUpstreamFrame(json)) return;
     if (json.usage) {
       promptTokens = json.usage.prompt_tokens || promptTokens;
       completionTokens = json.usage.completion_tokens || completionTokens;
