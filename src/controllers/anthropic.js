@@ -725,7 +725,7 @@ const handleAnthropicMessages = async (req, res) => {
     if (!upstreamResp.status || !upstreamResp.response) {
       return res.status(500).json({
         type: 'error',
-        error: { type: 'api_error', message: 'Request failed' }
+        error: { type: 'api_error', message: upstreamResp.message || 'Request failed' }
       });
     }
 

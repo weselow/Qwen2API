@@ -87,6 +87,8 @@ class Account {
         // 账户数据
         this.accountTokens = []
         this.isInitialized = false
+        // 初始化失败的原因（例如 data.json 损坏），用于给客户端返回可读的错误
+        this.initError = null
 
         // 配置信息
         this.defaultHeaders = config.defaultHeaders || {}
@@ -117,11 +119,30 @@ class Account {
             }
 
             this.isInitialized = true
+            this.initError = null
             logger.success(`账户管理器初始化完成，共加载 ${this.accountTokens.length} 个账户`, 'ACCOUNT')
         } catch (error) {
             this.isInitialized = false
+            this.initError = error
             logger.error('账户管理器初始化失败', 'ACCOUNT', '', error)
         }
+    }
+
+    /**
+     * 账户不可用的原因——供上层把「Request failed」换成人能看懂的说明
+     * @returns {string|null} 不可用原因；null 表示账户可用
+     */
+    getUnavailableReason() {
+        if (this.initError) {
+            return `账户管理器初始化失败：${this.initError.message}`
+        }
+        if (!this.isInitialized) {
+            return '账户管理器尚未初始化完成，请稍后重试'
+        }
+        if (!Array.isArray(this.accountTokens) || this.accountTokens.length === 0) {
+            return '没有可用的账户，请在管理面板中添加账户'
+        }
+        return null
     }
 
     /**

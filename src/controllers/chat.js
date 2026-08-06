@@ -783,7 +783,7 @@ const handleChatCompletion = async (req, res) => {
         if (!response_data.status || !response_data.response) {
             res.status(500)
                 .json({
-                    error: "Request failed"
+                    error: response_data.message || "Request failed"
                 })
             return
         }
