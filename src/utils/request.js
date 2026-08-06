@@ -37,10 +37,14 @@ const sendChatRequest = async (body) => {
     const currentToken = currentAccount ? currentAccount.token : null
 
     if (!currentToken) {
-        logger.error('无法获取有效的访问令牌', 'TOKEN')
+        // 把具体原因（data.json 损坏 / 尚未初始化 / 没有账户）透传给客户端，
+        // 否则调用方只能看到笼统的「Request failed」，排查要靠翻服务端日志
+        const reason = accountManager.getUnavailableReason() || '无法获取有效的访问令牌'
+        logger.error(reason, 'TOKEN')
         return {
             status: false,
-            response: null
+            response: null,
+            message: reason
         }
     }
 
