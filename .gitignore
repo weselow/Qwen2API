@@ -24,3 +24,13 @@ issues.jsonl
 
 # Our fork notes (not for upstream)
 docs_fork/
+
+# Локальные конфиги ИИ-инструментов (содержат API-ключи) — не коммитить
+.mcp.json
+.codex/
+
+# Локальный docker-стенд: данные, журналы, кэш картинок
+.volumes/
+
+# Локальные настройки Claude Code (разрешения конкретной машины)
+.claude/settings.local.json

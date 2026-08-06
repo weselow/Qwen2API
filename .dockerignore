@@ -99,3 +99,14 @@ docs/
 .gitignore
 .github/
 
+
+# Наши локальные каталоги — в образ не нужны и раздувают контекст сборки
+.worktrees/
+.volumes/
+.beads/
+.dolt/
+docs_fork/
+.claude/
+.agents/
+.codex/
+.mcp.json
