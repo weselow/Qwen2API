@@ -13,6 +13,51 @@ const TOOL_CALL_OPEN = '<tool_call>';
  */
 const TOOL_CALL_CLOSE = '</tool_call>';
 
+const normalizeAllowedToolNames = (allowedToolNames) => {
+  if (!allowedToolNames) return null;
+  const names = allowedToolNames instanceof Set ? allowedToolNames : new Set(allowedToolNames);
+  return names.size > 0 ? names : null;
+};
+
+const serializeToolArguments = (args) => {
+  if (typeof args === 'string') {
+    try {
+      JSON.parse(args);
+      return args;
+    } catch (_) {
+      return JSON.stringify(args);
+    }
+  }
+  return JSON.stringify(args ?? {});
+};
+
+const compactDescription = (value, maxLength = 320) => {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength - 1)}…`;
+};
+
+/**
+ * 识别模型用“我将执行/Let me inspect”代替真实工具调用的占位回复。
+ * 仅匹配明确的动作动词，避免把普通解释或建议误判成工具回合。
+ */
+const looksLikeUnexecutedToolAction = (value) => {
+  const text = String(value || '').trim().replace(/^[#>*\-\s]+/, '');
+  const english = /^(?:i(?:['’]ll| will)|let me|i need to|next,?\s+i(?:['’]ll| will))\s+(?:now\s+)?(?:run|execute|check|inspect|read|edit|write|search|open|call|use|look|test|verify|build|deploy|create|update|fetch)\b/i;
+  const chinese = /^(?:我(?:将|会|先|需要|正在)|让我|接下来(?:我)?(?:将|会|先)?|现在(?:我)?(?:将|会|先|来)?|下面(?:我)?(?:将|会|先)?|正在)(?:立即|马上|先|来)?(?:运行|执行|检查|查看|读取|编辑|修改|写入|搜索|打开|调用|使用|测试|验证|构建|部署|创建|更新|获取)/;
+  return english.test(text) || chinese.test(text);
+};
+
+const createToolCallObject = (payload, index = 0, id = null) => ({
+  index,
+  id: id || `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
+  type: 'function',
+  function: {
+    name: payload.name,
+    arguments: serializeToolArguments(payload.arguments)
+  }
+});
+
 /**
  * 将 JSON Schema 类型压缩为简短 TypeScript 风格签名
  * @param {Object} schema - JSON Schema 节点
@@ -41,7 +86,8 @@ const compressSchemaType = (schema) => {
     const requiredKeys = new Set(Array.isArray(schema.required) ? schema.required : []);
     const fields = Object.entries(schema.properties).map(([key, value]) => {
       const optional = requiredKeys.has(key) ? '' : '?';
-      return `${key}${optional}: ${compressSchemaType(value)}`;
+      const description = compactDescription(value?.description, 180);
+      return `${key}${optional}: ${compressSchemaType(value)}${description ? ` /* ${description.replace(/\*\//g, '* /')} */` : ''}`;
     });
     return `{ ${fields.join('; ')} }`;
   }
@@ -61,7 +107,7 @@ const compressSchemaType = (schema) => {
 const compressToolDefinition = (tool) => {
   const fn = tool?.function || tool;
   const name = fn?.name || 'unknown';
-  const description = (fn?.description || '').trim();
+  const description = compactDescription(fn?.description);
   const params = fn?.parameters || { type: 'object', properties: {} };
   const signature = compressSchemaType(params);
 
@@ -91,7 +137,7 @@ const buildToolSystemPrompt = (tools, options = {}) => {
   const lines = [
     '# Tools',
     '',
-    'You have access to the following tools. When a tool call is needed, output a `<tool_call>` block exactly as shown below.',
+    'You have access to the following tools. This is an Agent tool protocol, not a suggestion.',
     '',
     '## Available tools',
     compressed,
@@ -110,12 +156,15 @@ const buildToolSystemPrompt = (tools, options = {}) => {
     '</tool_response>',
     '',
     'Rules:',
+    '- If the task requires reading, writing, editing, searching, shell execution, browser use, or any action covered by an available tool, your visible response MUST be a `<tool_call>` block. Call the tool instead of describing the action.',
+    '- A tool call must be the first non-whitespace content of the visible answer. Do not write “I will…”, “Let me…”, “我将…”, “正在…”, a plan, or a completion claim before it.',
     '- The JSON inside `<tool_call>` must be valid and on a single logical block.',
     '- Use the exact tool name listed above.',
     '- Provide all required arguments; omit unknown ones.',
     '- You may emit multiple `<tool_call>` blocks back-to-back when more than one tool is needed.',
-    '- After tool results are returned (as user/tool messages), continue the reply normally.',
-    '- Do not wrap `<tool_call>` blocks in code fences or extra commentary.'
+    '- After every tool result, evaluate the actual task state. If work remains, emit the next tool call. Only return a normal-language final answer after the requested task is genuinely complete or you are blocked on user input.',
+    '- Never claim that a file was changed, a command succeeded, or a result was verified unless the corresponding tool result proves it.',
+    '- Do not call nonexistent tools, fabricate tool results, wrap `<tool_call>` in code fences, or mix extra commentary into a tool-call turn.'
   ];
 
   const choice = options.tool_choice;
@@ -172,8 +221,8 @@ const foldToolMessages = (messages) => {
       const callId = message.tool_call_id || '';
       const name = message.name || callIdToName.get(callId) || 'tool';
       const content = typeof message.content === 'string'
-        ? message.content
-        : JSON.stringify(message.content ?? '');
+        ? (message.content || 'null')
+        : JSON.stringify(message.content ?? null);
       const idAttr = callId ? ` tool_call_id="${escapeAttr(callId)}"` : '';
       return {
         role: 'user',
@@ -226,31 +275,47 @@ const parseToolCallPayload = (raw) => {
 /**
  * 从完整文本中提取所有工具调用块
  * @param {string} fullText - 模型完整输出
- * @returns {{ cleanedText: string, toolCalls: Array<Object> }} 抽取结果
+ * @param {Object} [options]
+ * @param {Set<string>|Array<string>} [options.allowedToolNames]
+ * @returns {{ cleanedText: string, toolCalls: Array<Object>, errors: Array<Object> }} 抽取结果
  */
-const parseToolCallsFromText = (fullText) => {
+const parseToolCallsFromText = (fullText, options = {}) => {
   if (typeof fullText !== 'string' || !fullText.includes(TOOL_CALL_OPEN)) {
-    return { cleanedText: fullText || '', toolCalls: [] };
+    return { cleanedText: fullText || '', toolCalls: [], errors: [] };
   }
 
+  const allowedToolNames = normalizeAllowedToolNames(options.allowedToolNames);
   const toolCalls = [];
+  const errors = [];
   const pattern = /<tool_call>([\s\S]*?)<\/tool_call>/g;
   const cleanedText = fullText.replace(pattern, (_, inner) => {
     const payload = parseToolCallPayload(inner);
-    if (payload) {
-      toolCalls.push({
-        id: `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
-        type: 'function',
-        function: {
-          name: payload.name,
-          arguments: JSON.stringify(payload.arguments ?? {})
-        }
-      });
+    if (!payload) {
+      errors.push({ type: 'invalid_json', raw: inner });
+    } else if (allowedToolNames && !allowedToolNames.has(payload.name)) {
+      errors.push({ type: 'unknown_tool', name: payload.name });
+    } else {
+      toolCalls.push(createToolCallObject(payload, toolCalls.length));
     }
     return '';
   });
 
-  return { cleanedText: cleanedText.trim(), toolCalls };
+  const unclosedIndex = cleanedText.indexOf(TOOL_CALL_OPEN);
+  let finalText = cleanedText;
+  if (unclosedIndex !== -1) {
+    const raw = cleanedText.slice(unclosedIndex + TOOL_CALL_OPEN.length);
+    const payload = parseToolCallPayload(raw);
+    if (!payload) {
+      errors.push({ type: 'truncated_tool_call', raw });
+    } else if (allowedToolNames && !allowedToolNames.has(payload.name)) {
+      errors.push({ type: 'unknown_tool', name: payload.name });
+    } else {
+      toolCalls.push(createToolCallObject(payload, toolCalls.length));
+    }
+    finalText = cleanedText.slice(0, unclosedIndex);
+  }
+
+  return { cleanedText: finalText.trim(), toolCalls, errors };
 };
 
 /**
@@ -264,11 +329,26 @@ const parseToolCallsFromText = (fullText) => {
  *   hasEmittedAnyCall: () => boolean
  * }} 解析器实例
  */
-const createToolCallStreamParser = () => {
+const createToolCallStreamParser = (options = {}) => {
+  const allowedToolNames = normalizeAllowedToolNames(options.allowedToolNames);
   let pendingText = '';
   let inToolCall = false;
   let toolCallBuffer = '';
   let emittedCallCount = 0;
+  const errors = [];
+
+  const acceptPayload = (payload, raw, result) => {
+    if (!payload) {
+      errors.push({ type: 'invalid_json', raw });
+      return;
+    }
+    if (allowedToolNames && !allowedToolNames.has(payload.name)) {
+      errors.push({ type: 'unknown_tool', name: payload.name });
+      return;
+    }
+    result.completedCalls.push(createToolCallObject(payload, emittedCallCount));
+    emittedCallCount += 1;
+  };
 
   /**
    * 在等待标签出现时，安全地输出已确定不是标签前缀的部分
@@ -308,18 +388,7 @@ const createToolCallStreamParser = () => {
         buffer = toolCallBuffer.slice(closeIdx + TOOL_CALL_CLOSE.length);
         toolCallBuffer = '';
         const payload = parseToolCallPayload(inner);
-        if (payload) {
-          result.completedCalls.push({
-            index: emittedCallCount,
-            id: `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
-            type: 'function',
-            function: {
-              name: payload.name,
-              arguments: JSON.stringify(payload.arguments ?? {})
-            }
-          });
-          emittedCallCount += 1;
-        }
+        acceptPayload(payload, inner, result);
         inToolCall = false;
         continue;
       }
@@ -350,18 +419,7 @@ const createToolCallStreamParser = () => {
     const result = { textDelta: '', completedCalls: [] };
     if (inToolCall && toolCallBuffer) {
       const payload = parseToolCallPayload(toolCallBuffer);
-      if (payload) {
-        result.completedCalls.push({
-          index: emittedCallCount,
-          id: `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
-          type: 'function',
-          function: {
-            name: payload.name,
-            arguments: JSON.stringify(payload.arguments ?? {})
-          }
-        });
-        emittedCallCount += 1;
-      }
+      acceptPayload(payload, toolCallBuffer, result);
       toolCallBuffer = '';
       inToolCall = false;
     }
@@ -376,7 +434,86 @@ const createToolCallStreamParser = () => {
     push,
     flush,
     hasPendingCall: () => inToolCall,
-    hasEmittedAnyCall: () => emittedCallCount > 0
+    hasEmittedAnyCall: () => emittedCallCount > 0,
+    hasParseError: () => errors.length > 0,
+    getErrors: () => [...errors]
+  };
+};
+
+/**
+ * 累积 OpenAI 原生 delta.tool_calls。网页上游一旦开始原生返回工具调用，桥接层无需再依赖 XML。
+ */
+const createNativeToolCallAccumulator = (options = {}) => {
+  const allowedToolNames = normalizeAllowedToolNames(options.allowedToolNames);
+  const calls = new Map();
+  const errors = [];
+
+  const push = (deltas) => {
+    if (!Array.isArray(deltas)) return;
+    for (const delta of deltas) {
+      if (!delta || typeof delta !== 'object') continue;
+      const index = Number.isInteger(delta.index) ? delta.index : calls.size;
+      const current = calls.get(index) || {
+        index,
+        id: delta.id || null,
+        type: delta.type || 'function',
+        function: { name: '', arguments: '' }
+      };
+      if (delta.id) current.id = delta.id;
+      if (delta.type) current.type = delta.type;
+      if (typeof delta.function?.name === 'string' && delta.function.name) {
+        const incomingName = delta.function.name;
+        if (!current.function.name) {
+          current.function.name = incomingName;
+        } else if (incomingName === current.function.name || current.function.name.endsWith(incomingName)) {
+          // 某些兼容上游会在每个 delta 重复完整 name，不能重复拼接。
+        } else if (incomingName.startsWith(current.function.name)) {
+          current.function.name = incomingName;
+        } else {
+          current.function.name += incomingName;
+        }
+      }
+      if (typeof delta.function?.arguments === 'string') current.function.arguments += delta.function.arguments;
+      calls.set(index, current);
+    }
+  };
+
+  const finalize = () => {
+    const finalized = [];
+    for (const [index, call] of [...calls.entries()].sort((a, b) => a[0] - b[0])) {
+      if (!call.function.name) {
+        errors.push({ type: 'missing_tool_name', index });
+        continue;
+      }
+      if (allowedToolNames && !allowedToolNames.has(call.function.name)) {
+        errors.push({ type: 'unknown_tool', name: call.function.name });
+        continue;
+      }
+      try {
+        JSON.parse(call.function.arguments || '{}');
+      } catch (_) {
+        errors.push({ type: 'invalid_arguments', name: call.function.name });
+        continue;
+      }
+      finalized.push({
+        index: finalized.length,
+        id: call.id || `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
+        type: 'function',
+        function: {
+          name: call.function.name,
+          arguments: call.function.arguments || '{}'
+        }
+      });
+    }
+    return finalized;
+  };
+
+  return {
+    push,
+    finalize,
+    hasAny: () => calls.size > 0,
+    hasParseError: () => errors.length > 0,
+    getErrors: () => [...errors]
   };
 };
 
@@ -386,5 +523,8 @@ module.exports = {
   buildToolSystemPrompt,
   foldToolMessages,
   parseToolCallsFromText,
-  createToolCallStreamParser
+  createToolCallStreamParser,
+  createNativeToolCallAccumulator,
+  looksLikeUnexecutedToolAction,
+  serializeToolArguments
 };

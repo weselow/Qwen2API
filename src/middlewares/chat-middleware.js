@@ -82,8 +82,12 @@ const processRequestBody = async (req, res, next) => {
       preparedMessages = foldToolMessages(messages || [])
       req.has_tools = true
       req.tool_choice = tool_choice || 'auto'
+      req.allowed_tool_names = tools
+        .map(tool => tool?.function?.name)
+        .filter(name => typeof name === 'string' && name.length > 0)
     } else {
       req.has_tools = false
+      req.allowed_tool_names = []
     }
 
     // 处理 messages 参数 : 消息历史（返回 OpenAI 格式消息数组）

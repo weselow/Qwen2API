@@ -1,7 +1,8 @@
 const axios = require('axios')
 const { logger } = require('../utils/logger')
 const accountManager = require('../utils/account')
-const { getProxyAgent, getCliBaseUrl, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
+const { getProxyAgent, getCliBaseUrl } = require('../utils/proxy-helper')
+const { consumeSSEStream, formatSSEFrame } = require('../utils/sse')
 
 /**
  * 静默累计 CLI daily stats——异常不影响响应
@@ -281,9 +282,10 @@ function formatCliJsonResponse(data, fallbackModel) {
  * @param {Object} res - Express响应对象
  */
 const handleCliChatCompletion = async (req, res) => {
+    let body = {}
     try {
         const access_token = req.account.cli_info.access_token
-        const body = preprocessCliRequestBody(req.body)
+        body = preprocessCliRequestBody(req.body)
         const isStream = body.stream === true
 
         // 打印当前使用的账号邮箱
@@ -317,7 +319,7 @@ const handleCliChatCompletion = async (req, res) => {
                 'X-Stainless-Runtime': 'node'
             },
             data: body,
-            timeout: 5 * 60 * 1000,
+            timeout: 10 * 60 * 1000,
             validateStatus: function () {
                 return true
             }
@@ -366,60 +368,43 @@ const handleCliChatCompletion = async (req, res) => {
 
         // 处理流式响应
         if (isStream) {
-            // 缓冲 SSE 解析——usage 帧可能跨 TCP 块（仅 split('\n\n') 会丢失），
-            // 沿用 chat.js/anthropic.js 的 buffer + while indexOf('\n\n') 模式
-            let sseBuffer = ''
             let cliUsage = null
-
-            response.data.on('data', (chunk) => {
-                const text = chunk.toString('utf8')
-                // 透传客户端: 逐行回写，保持原有行为
-                const lines = text.split('\n')
-                for (const line of lines) {
-                    if (!line || !line.startsWith('data:')) continue
-                    res.write(`${line}\n\n`)
-                }
-
-                // 解析 usage 帧（带缓冲——帧可能被分块切开）
-                sseBuffer += text
-                let idx
-                while ((idx = sseBuffer.indexOf('\n\n')) !== -1) {
-                    const frame = sseBuffer.slice(0, idx)
-                    sseBuffer = sseBuffer.slice(idx + 2)
-                    if (!frame.startsWith('data:')) continue
-                    const payload = frame.slice(frame.indexOf(':') + 1).trim()
-                    if (!payload || payload === '[DONE]') continue
+            let upstreamFinishReason = null
+            const streamResult = await consumeSSEStream(response.data, async (frame) => {
+                const payload = frame.data.trim()
+                if (payload && payload !== '[DONE]') {
                     try {
                         const parsed = JSON.parse(payload)
                         if (parsed?.usage) cliUsage = parsed.usage
-                    } catch (e) {
-                        // 部分/非法 JSON——继续累计
+                        const reason = parsed?.choices?.[0]?.finish_reason ?? parsed?.choices?.[0]?.delta?.finish_reason
+                        if (reason !== undefined && reason !== null) upstreamFinishReason = reason
+                    } catch (_) {
+                        // 非 JSON 的合法 SSE 事件仍按原语义透传。
                     }
                 }
+                res.write(formatSSEFrame(frame))
             })
 
-            // 处理流错误
-            response.data.on('error', (streamError) => {
-                logger.error(`CLI请求使用账号[${req.account.email}]流式传输失败 - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI', '❌')
-                // 传输错误——记 failure（影响 cooldown）
-                accountManager.recordAccountFailure(req.account.email, streamError?.code)
-                if (!res.headersSent) {
-                    res.status(500).json({
+            if (!streamResult.sawDone && !upstreamFinishReason) {
+                res.write(formatSSEFrame({
+                    data: JSON.stringify({
                         error: {
-                            message: 'stream_error',
-                            type: 'stream_error',
-                            code: 500
+                            message: 'upstream stream ended before a terminal marker',
+                            type: 'upstream_stream_error',
+                            code: 'upstream_incomplete'
                         }
                     })
-                }
-            })
-
-            // 处理流结束
-            response.data.on('end', () => {
-                logger.success(`CLI请求使用账号[${req.account.email}]转发成功 (流式) - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI')
-                attributeCliUsage(req.account.email, cliUsage)
+                }))
+                res.write('data: [DONE]\n\n')
                 res.end()
-            })
+                accountManager.recordAccountFailure(req.account.email, 'UPSTREAM_INCOMPLETE')
+                return
+            }
+
+            if (!streamResult.sawDone) res.write('data: [DONE]\n\n')
+            logger.success(`CLI请求使用账号[${req.account.email}]转发成功 (流式) - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI')
+            attributeCliUsage(req.account.email, cliUsage)
+            res.end()
         } else {
             // 处理JSON响应
             const cliUsage = response.data?.usage
@@ -437,6 +422,23 @@ const handleCliChatCompletion = async (req, res) => {
             accountManager.recordAccountError(req.account.email, error.response.status)
         } else {
             accountManager.recordAccountFailure(req.account.email, error?.code)
+        }
+
+        if (res.headersSent) {
+            if (!res.writableEnded) {
+                res.write(formatSSEFrame({
+                    data: JSON.stringify({
+                        error: {
+                            message: 'upstream stream transport failed',
+                            type: 'upstream_stream_error',
+                            code: error?.code || 'stream_error'
+                        }
+                    })
+                }))
+                res.write('data: [DONE]\n\n')
+                res.end()
+            }
+            return
         }
 
         // 如果是axios错误，提供更详细的错误信息

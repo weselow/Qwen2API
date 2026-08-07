@@ -52,7 +52,17 @@ const config = {
     cliEnabled: process.env.ENABLE_CLI === 'true',
     // chat 请求重试配置（运行时可被 web UI 覆盖，见 src/utils/data-persistence.js#loadSettings）
     chatRetryCount: Math.max(0, parseInt(process.env.CHAT_RETRY_COUNT, 10) || 1),
-    chatRetryBackoffMs: Math.max(0, parseInt(process.env.CHAT_RETRY_BACKOFF_MS, 10) || 400)
+    chatRetryBackoffMs: Math.max(0, parseInt(process.env.CHAT_RETRY_BACKOFF_MS, 10) || 400),
+    // chat.qwen.ai 的 WAF 会在 JSON 请求体接近 128 KiB 时返回 captcha。
+    // 提前把 Agent 全量历史外置成文本文档，给协议头和当前回合留出安全余量。
+    agentContextFileThresholdBytes: Math.max(
+        32 * 1024,
+        parseInt(process.env.AGENT_CONTEXT_FILE_THRESHOLD_BYTES, 10) || 90 * 1024
+    ),
+    agentContextLivePromptBytes: Math.max(
+        8 * 1024,
+        parseInt(process.env.AGENT_CONTEXT_LIVE_PROMPT_BYTES, 10) || 48 * 1024
+    )
 }
 
 module.exports = config

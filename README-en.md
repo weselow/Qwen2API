@@ -131,6 +131,8 @@ CACHE_MODE=default            # Image cache mode (default/file)
 | `LEGACY_REASONING_IN_CONTENT` | Reasoning output format. Default `false` = reasoning goes to a separate `reasoning_content` field; `true` = legacy behavior (`<think>` inside `content`) | `true` or `false` |
 | `SIMPLE_MODEL_MAP` | Simplify model mapping, return basic models without variants only | `true` or `false` |
 | `MODELS_CACHE_TTL` | Model list cache TTL in seconds; after expiry the next request refreshes it from upstream; `0` = never expires | `3600` |
+| `AGENT_CONTEXT_FILE_THRESHOLD_BYTES` | Externalize complete Agent tool definitions and history as a Qwen text document when the request body exceeds this size, avoiding the roughly 128 KiB WAF limit | `92160` (90 KiB) |
+| `AGENT_CONTEXT_LIVE_PROMPT_BYTES` | Maximum size of the tool protocol and current turn kept in the live request after context externalization | `49152` (48 KiB) |
 | `QWEN_CHAT_PROXY_URL` | Custom Chat API reverse proxy address | `https://your-proxy.com` |
 | `QWEN_CLI_PROXY_URL` | Custom CLI API reverse proxy address | `https://your-cli-proxy.com` |
 | `PROXY_URL` | Outbound request proxy address, supports HTTP/HTTPS/SOCKS5 | `http://127.0.0.1:7890` |
@@ -507,6 +509,12 @@ Authorization: Bearer sk-your-api-key
 - `assistant.tool_calls` and `role:"tool"` in historical messages automatically fold back in chain, `tool_call_id` precisely associated
 - `tool_choice` all four states: `"auto"` / `"required"` / `{type:"function",function:{name:"..."}}` / `"none"`
 - When `tool_choice="required"` or specifying function, if no tool call triggered initially, automatically appends strong constraint prompt for retry once
+- Automatically retries once when the upstream returns reasoning only, with no visible text or executable tool call, preventing an empty terminal Agent turn
+- Treats a clean HTTP EOF from Qwen Web as normal `stop` / `tool_calls`; only actual transport failures such as connection resets become stream errors
+- Externalizes complete tool definitions and history through Qwen's official file APIs once the Agent request reaches the safety threshold, while keeping the current turn live to avoid WAF/captcha failures during long tool loops
+- Surfaces HTTP-200 WAF/captcha business frames as `upstream_waf_challenge` instead of disguising them as an empty success or a generic 502
+
+> For long-running Agents such as Codex, Claude Code, and OpenClaw, keep the default 90 KiB / 48 KiB thresholds. Lower `AGENT_CONTEXT_FILE_THRESHOLD_BYTES` if your reverse proxy adds a substantial request body overhead.
 
 **Request Example:**
 

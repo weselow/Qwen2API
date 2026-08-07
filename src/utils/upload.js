@@ -59,6 +59,19 @@ const getSimpleFileType = (mimeType) => {
  */
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
+const createAuthorizedHeaders = (authToken) => ({
+    'Authorization': authToken.startsWith('Bearer ') ? authToken : `Bearer ${authToken}`,
+    'Content-Type': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+})
+
+const unwrapApiData = (response) => {
+    const payload = response?.data
+    return payload && payload.data && typeof payload.data === 'object'
+        ? payload.data
+        : payload
+}
+
 /**
  * 请求STS Token（带重试机制）
  * @param {string} filename - 文件名
@@ -115,7 +128,11 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
         const response = await axios.post(UPLOAD_CONFIG.stsTokenUrl, payload, requestConfig)
 
         if (response.status === 200 && response.data) {
-            const stsData = response.data
+            if (response.data.success === false) {
+                throw new Error(response.data?.data?.message || response.data?.message || 'STS Token 请求被上游拒绝')
+            }
+            // 同时兼容旧版直接字段与 FE 0.2.81 的 {success,data} 包装。
+            const stsData = unwrapApiData(response)
 
             // 验证响应数据完整性
             const credentials = {
@@ -290,8 +307,111 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, acco
     }
 }
 
+/**
+ * 通知 Qwen 网页端解析已上传的文本文档，并等待解析完成。
+ * Agent 长上下文必须通过这个步骤才能作为真正的文档上下文被模型读取。
+ * @param {string} fileId
+ * @param {string} authToken
+ * @param {Object} [account]
+ * @param {Object} [options]
+ */
+const parseUploadedTextFile = async (fileId, authToken, account, options = {}) => {
+    if (!fileId || !authToken) throw new Error('解析文档缺少 fileId 或认证 Token')
+
+    const baseUrl = getChatBaseUrl()
+    const requestConfig = applyProxyToAxiosConfig({
+        headers: createAuthorizedHeaders(authToken),
+        timeout: Math.max(1000, Number(options.timeoutMs) || 30000)
+    }, account)
+
+    await axios.post(`${baseUrl}/api/v2/files/parse`, { file_id: fileId }, requestConfig)
+
+    const maxAttempts = Math.max(1, Number(options.maxAttempts) || 30)
+    const intervalMs = Math.max(50, Number(options.intervalMs) || 500)
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const response = await axios.post(
+            `${baseUrl}/api/v2/files/parse/status`,
+            { file_id_list: [fileId] },
+            requestConfig
+        )
+        const payload = unwrapApiData(response)
+        const records = Array.isArray(payload) ? payload : (payload?.list || payload?.items || [])
+        const record = records.find(item => item?.file_id === fileId) || records[0]
+        const status = String(record?.status || payload?.status || '').toLowerCase()
+
+        if (status === 'success' || status === 'completed' || status === 'done') return true
+        if (status === 'failed' || status === 'error') {
+            throw new Error(record?.error_msg || record?.message || 'Qwen 文档解析失败')
+        }
+        if (attempt < maxAttempts) await delay(intervalMs)
+    }
+
+    throw new Error(`Qwen 文档解析超时: ${fileId}`)
+}
+
+/**
+ * 构造 Qwen Web 0.2.81 使用的 message.files 文档描述符。
+ */
+const buildChatFileDescriptor = ({ fileId, fileUrl, filename, size }) => {
+    const timestamp = Date.now()
+    return {
+        type: 'file',
+        file: {
+            created_at: timestamp,
+            data: {},
+            filename,
+            hash: null,
+            id: fileId,
+            meta: {
+                name: filename,
+                size,
+                content_type: 'text/plain',
+                parse_meta: { parse_status: 'success' }
+            },
+            update_at: timestamp,
+            name: filename,
+            size,
+            type: 'text/plain'
+        },
+        id: fileId,
+        url: fileUrl,
+        name: filename,
+        collection_name: '',
+        status: 'uploaded',
+        progress: 100,
+        greenNet: 'success',
+        size,
+        error: '',
+        itemId: fileId,
+        file_type: 'text/plain',
+        showType: 'file',
+        file_class: 'document',
+        context: 'full'
+    }
+}
+
+/**
+ * 上传并解析 Agent 长上下文，返回可直接放入 message.files 的描述符。
+ */
+const uploadAgentContextFile = async (text, authToken, account, options = {}) => {
+    const content = Buffer.from(String(text || ''), 'utf8')
+    if (content.length === 0) throw new Error('Agent 上下文为空')
+    const filename = options.filename || `QWEN2API_AGENT_CONTEXT_${Date.now()}.txt`
+    const uploaded = await uploadFileToQwenOss(content, filename, authToken, account)
+    await parseUploadedTextFile(uploaded.file_id, authToken, account, options)
+    return buildChatFileDescriptor({
+        fileId: uploaded.file_id,
+        fileUrl: uploaded.file_url,
+        filename,
+        size: content.length
+    })
+}
+
 
 
 module.exports = {
-    uploadFileToQwenOss
+    uploadFileToQwenOss,
+    parseUploadedTextFile,
+    buildChatFileDescriptor,
+    uploadAgentContextFile
 }

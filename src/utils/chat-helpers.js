@@ -287,7 +287,7 @@ const extractTextFromContent = (content) => {
 const formatSingleMessage = (message) => {
     const role = message.role
     const content = extractTextFromContent(message.content)
-    return content.trim() ? `${role}:${content}` : ''
+    return content.trim() ? JSON.stringify({ role, content }) : ''
 }
 
 /**
@@ -305,7 +305,7 @@ const formatHistoryMessages = (messages) => {
         }
     }
     
-    return formattedParts.length > 0 ? formattedParts.join(';') : ''
+    return formattedParts.length > 0 ? formattedParts.join('\n') : ''
 }
 
 /**
@@ -355,15 +355,19 @@ const parserMessages = async (messages, thinking_config, chat_type) => {
             }
         }
 
-        // 组合最终内容:历史文本 + 当前消息（带角色标注）
-        let combinedText = ''
+        // 网页上游只接受一个当前消息，因此用 JSONL 信封无损保留角色和换行。
+        // 旧版用分号拼接 role:content，内容自身含分号/冒号时会破坏消息边界。
+        const envelopeParts = []
         if (historyText) {
-            combinedText = historyText + ';'
+            envelopeParts.push('# Conversation history (JSONL)', historyText)
         }
-        // 添加最后一条消息，带角色标注
         if (lastMessageText.trim()) {
-            combinedText += `${lastMessageRole}:${lastMessageText}`
+            envelopeParts.push('# Current message', JSON.stringify({
+                role: lastMessageRole,
+                content: lastMessageText
+            }))
         }
+        const combinedText = envelopeParts.join('\n')
 
         // 如果有图片,创建包含文本和图片的content数组
         if (finalContent.length > 0) {
@@ -498,6 +502,7 @@ const processOriginalLogic = async (messages, thinking_config, chat_type, imgCac
  * @returns {boolean}
  */
 const isThinkPhase = (phase) => phase === 'think' || phase === 'thinking' || phase === 'thinking_summary'
+const ANSWER_PHASES = new Set(['answer', 'final', 'final_answer', 'response'])
 
 /**
  * 创建上游 delta 归一化器：将 thinking_summary 的 extra.summary_thought 增量转为 phase=think 的 content
@@ -509,9 +514,19 @@ const createUpstreamDeltaNormalizer = () => {
     return (delta) => {
         if (!delta) return null
         const rawPhase = delta.phase
-        if (!isThinkPhase(rawPhase) && rawPhase !== 'answer') return null
+        const hasReasoningContent = typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0
+        const hasContent = typeof delta.content === 'string' && delta.content.length > 0
+        const useReasoningContent = hasReasoningContent && !ANSWER_PHASES.has(rawPhase)
 
-        let content = typeof delta.content === 'string' ? delta.content : ''
+        // 部分模型或上游版本不会返回 phase。此时普通 content 按 answer 处理，
+        // reasoning_content 按 think 处理，避免把完整正文静默丢弃。
+        if (!isThinkPhase(rawPhase) && !ANSWER_PHASES.has(rawPhase) && !hasReasoningContent && !hasContent) {
+            return null
+        }
+
+        let content = useReasoningContent
+            ? delta.reasoning_content
+            : (hasContent ? delta.content : '')
         if (rawPhase === 'thinking_summary') {
             const thoughts = delta.extra && delta.extra.summary_thought && delta.extra.summary_thought.content
             if (Array.isArray(thoughts) && thoughts.length > summaryThoughtCount) {
@@ -524,7 +539,7 @@ const createUpstreamDeltaNormalizer = () => {
 
         if (!content) return null
         return {
-            phase: isThinkPhase(rawPhase) ? 'think' : 'answer',
+            phase: (isThinkPhase(rawPhase) || useReasoningContent) ? 'think' : 'answer',
             content
         }
     }
@@ -535,6 +550,7 @@ module.exports = {
     isThinkingEnabled,
     parserModel,
     parserMessages,
+    formatHistoryMessages,
     isThinkPhase,
     createUpstreamDeltaNormalizer
 }

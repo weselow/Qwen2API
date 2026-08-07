@@ -5,6 +5,7 @@ const { logger } = require('./logger')
 const { getSsxmodItna, getSsxmodItna2 } = require('./ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./proxy-helper')
 const { generateUUID, getTimezoneHeader } = require('./tools.js')
+const { uploadAgentContextFile } = require('./upload.js')
 
 // 传输层（非 HTTP）错误码 — 这些重试的, HTTP 响应不重试
 const RETRYABLE_ERROR_CODES = new Set([
@@ -25,6 +26,160 @@ const isRetryableNetworkError = (error) => {
 }
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+
+const HISTORY_MARKER = '# Conversation history (JSONL)'
+const CURRENT_MESSAGE_MARKER = '# Current message'
+
+const byteLength = (value) => Buffer.byteLength(String(value || ''), 'utf8')
+
+const truncateUtf8 = (value, maxBytes, fromEnd = false) => {
+    const buffer = Buffer.from(String(value || ''), 'utf8')
+    if (buffer.length <= maxBytes) return buffer.toString('utf8')
+    const slice = fromEnd
+        ? buffer.subarray(Math.max(0, buffer.length - maxBytes))
+        : buffer.subarray(0, maxBytes)
+    return slice.toString('utf8').replace(/^\uFFFD|\uFFFD$/g, '')
+}
+
+const getMessageTextContent = (message) => {
+    if (typeof message?.content === 'string') return message.content
+    if (!Array.isArray(message?.content)) return null
+    const textPart = message.content.find(item =>
+        item && typeof item.text === 'string' &&
+        (item.text.includes(HISTORY_MARKER) || item.text.includes(CURRENT_MESSAGE_MARKER))
+    ) || message.content.find(item => item && typeof item.text === 'string')
+    return textPart?.text ?? null
+}
+
+const replaceMessageTextContent = (message, text) => {
+    if (typeof message?.content === 'string') return { ...message, content: text }
+    if (!Array.isArray(message?.content)) return message
+
+    let replaced = false
+    const content = message.content.map(item => {
+        const isPreferred = item && typeof item.text === 'string' &&
+            (item.text.includes(HISTORY_MARKER) || item.text.includes(CURRENT_MESSAGE_MARKER))
+        if (!replaced && isPreferred) {
+            replaced = true
+            return { ...item, text }
+        }
+        return item
+    })
+    if (!replaced) {
+        const fallbackIndex = content.findIndex(item => item && typeof item.text === 'string')
+        if (fallbackIndex >= 0) {
+            content[fallbackIndex] = { ...content[fallbackIndex], text }
+        }
+    }
+    return { ...message, content }
+}
+
+/**
+ * 附件外置后仍留在 HTTP 请求体中的高优先级提示。
+ * 优先保留工具协议与当前回合；完整原文始终存在附件中。
+ */
+const buildAgentContextLivePrompt = (
+    original,
+    maxBytes = config.agentContextLivePromptBytes,
+    attachmentName = 'QWEN2API_AGENT_CONTEXT.txt'
+) => {
+    const text = String(original || '')
+    const historyIndex = text.indexOf(HISTORY_MARKER)
+    const currentIndex = text.lastIndexOf(CURRENT_MESSAGE_MARKER)
+    const prefix = historyIndex >= 0 ? text.slice(0, historyIndex).trim() : ''
+    const current = currentIndex >= 0 ? text.slice(currentIndex).trim() : ''
+    const notice = [
+        '# Agent context attachment',
+        `The complete system instructions, tool schemas, conversation history and current task are attached as ${attachmentName}.`,
+        'Read that attachment as authoritative context before acting. Continue from the latest state; do not restart the task or claim completion without verification.',
+        'When an available tool is needed, emit the real `<tool_call>` block immediately. Do not replace it with prose such as “I will run...” or “done”.'
+    ].join('\n')
+
+    let live = [notice, prefix, current].filter(Boolean).join('\n\n')
+    if (byteLength(live) <= maxBytes) return live
+
+    const reserved = byteLength(notice) + 4
+    const remaining = Math.max(1024, maxBytes - reserved)
+    const currentBudget = Math.max(1024, Math.floor(remaining * 0.45))
+    const prefixBudget = Math.max(1024, remaining - currentBudget)
+    live = [
+        notice,
+        prefix ? truncateUtf8(prefix, prefixBudget) : '',
+        current ? truncateUtf8(current, currentBudget, true) : ''
+    ].filter(Boolean).join('\n\n')
+    return live
+}
+
+const compactAgentContextFallback = (original, maxBytes = config.agentContextLivePromptBytes) => {
+    const text = String(original || '')
+    const notice = [
+        '# Agent context recovery',
+        'The upstream document attachment failed, so older context was compacted to stay below the Qwen Web request limit.',
+        'Continue the latest Agent task using the recent context below. Use a real tool call whenever more work is required; do not report completion before verification.'
+    ].join('\n')
+    const limit = Math.max(1024, Number(maxBytes) || config.agentContextLivePromptBytes)
+    const historyIndex = text.indexOf(HISTORY_MARKER)
+    const prefix = historyIndex >= 0 ? text.slice(0, historyIndex).trim() : ''
+    const recent = historyIndex >= 0 ? text.slice(historyIndex).trim() : text
+    const remaining = Math.max(256, limit - byteLength(notice) - 4)
+    const prefixBudget = prefix ? Math.floor(remaining * 0.55) : 0
+    const recentBudget = remaining - prefixBudget
+    return [
+        notice,
+        prefix ? truncateUtf8(prefix, prefixBudget) : '',
+        truncateUtf8(recent, recentBudget, true)
+    ].filter(Boolean).join('\n\n')
+}
+
+/**
+ * 超过安全阈值时把完整 Agent 上下文上传为 Qwen 文档。
+ * uploader 可注入，便于在无真实账号的测试环境验证整个变换。
+ */
+const externalizeOversizedAgentContext = async (
+    payload,
+    currentToken,
+    currentAccount,
+    options = {}
+) => {
+    const thresholdBytes = Math.max(1024, Number(options.thresholdBytes) || config.agentContextFileThresholdBytes)
+    const serializedBytes = byteLength(JSON.stringify(payload))
+    const message = payload?.messages?.[0]
+    const originalContent = getMessageTextContent(message)
+    if (serializedBytes <= thresholdBytes || !message || originalContent === null) {
+        return { payload, externalized: false, serializedBytes }
+    }
+
+    const uploader = options.uploader || uploadAgentContextFile
+    let file
+    try {
+        file = await uploader(originalContent, currentToken, currentAccount, options)
+    } catch (error) {
+        logger.error('Agent 长上下文附件上传/解析失败，回退到最近上下文', 'REQUEST', '', error)
+        const fallbackMessage = replaceMessageTextContent(
+            message,
+            compactAgentContextFallback(originalContent, options.livePromptBytes)
+        )
+        fallbackMessage.files = Array.isArray(message.files) ? [...message.files] : []
+        return {
+            payload: { ...payload, messages: [fallbackMessage, ...payload.messages.slice(1)] },
+            externalized: false,
+            compacted: true,
+            serializedBytes
+        }
+    }
+
+    const attachmentName = file?.name || file?.file?.filename || 'QWEN2API_AGENT_CONTEXT.txt'
+    const externalizedMessage = replaceMessageTextContent(
+        message,
+        buildAgentContextLivePrompt(originalContent, options.livePromptBytes, attachmentName)
+    )
+    externalizedMessage.files = [...(Array.isArray(message.files) ? message.files : []), file]
+    return {
+        payload: { ...payload, messages: [externalizedMessage, ...payload.messages.slice(1)] },
+        externalized: true,
+        serializedBytes
+    }
+}
 
 /**
  * 发送聊天请求
@@ -94,13 +249,24 @@ const sendChatRequest = async (body) => {
     requestConfig.headers.referer = `${chatBaseUrl}/c/${chat_id}`
     const url = `${chatBaseUrl}/api/v2/chat/completions?chat_id=` + chat_id
     // 对齐网页双写 chatId/parentId（FE 0.2.81）
-    const payload = {
+    const rawPayload = {
         ...body,
         stream: true,
         chat_id,
         chatId: chat_id,
         parent_id: body.parent_id ?? null,
         parentId: body.parentId ?? body.parent_id ?? null
+    }
+    const contextResult = await externalizeOversizedAgentContext(
+        rawPayload,
+        currentToken,
+        currentAccount
+    )
+    const payload = contextResult.payload
+    if (contextResult.externalized) {
+        logger.info(`Agent 上下文已外置为 Qwen 文档（原请求 ${contextResult.serializedBytes} bytes）`, 'REQUEST', '📎')
+    } else if (contextResult.compacted) {
+        logger.warn(`Agent 上下文附件失败，已保留最近上下文（原请求 ${contextResult.serializedBytes} bytes）`, 'REQUEST')
     }
 
     const maxRetries = Math.max(0, parseInt(config.chatRetryCount, 10) || 0)
@@ -242,5 +408,8 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
 
 module.exports = {
     sendChatRequest,
-    generateChatID
+    generateChatID,
+    buildAgentContextLivePrompt,
+    compactAgentContextFallback,
+    externalizeOversizedAgentContext
 }

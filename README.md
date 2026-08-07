@@ -131,6 +131,8 @@ CACHE_MODE=default            # 图片缓存模式 (default/file)
 | `LEGACY_REASONING_IN_CONTENT` | 推理输出格式。默认 `false`=推理走独立的 `reasoning_content` 字段；`true`=旧版行为（`<think>` 并入 `content`） | `true` 或 `false` |
 | `SIMPLE_MODEL_MAP` | 简化模型映射，只返回基础模型不包含变体 | `true` 或 `false` |
 | `MODELS_CACHE_TTL` | 模型列表缓存有效期（秒），过期后下次请求自动向上游刷新；`0` 表示永不过期 | `3600` |
+| `AGENT_CONTEXT_FILE_THRESHOLD_BYTES` | Agent 请求体超过此大小时，将完整工具定义和历史自动外置为 Qwen 文本文档，避免触发约 128 KiB 的 WAF 限制 | `92160`（90 KiB） |
+| `AGENT_CONTEXT_LIVE_PROMPT_BYTES` | 上下文外置后，实时请求中保留的工具协议和当前回合最大大小 | `49152`（48 KiB） |
 | `QWEN_CHAT_PROXY_URL` | 自定义 Chat API 反代地址 | `https://your-proxy.com` |
 | `QWEN_CLI_PROXY_URL` | 自定义 CLI API 反代地址 | `https://your-cli-proxy.com` |
 | `PROXY_URL` | 出站请求代理地址，支持 HTTP/HTTPS/SOCKS5 | `http://127.0.0.1:7890` |
@@ -507,6 +509,12 @@ Authorization: Bearer sk-your-api-key
 - 历史消息中的 `assistant.tool_calls` 与 `role:"tool"` 自动折叠回链，`tool_call_id` 精确关联
 - `tool_choice` 全四态：`"auto"` / `"required"` / `{type:"function",function:{name:"..."}}` / `"none"`
 - `tool_choice="required"` 或指定函数时，若首次未触发工具调用，自动追加强约束提示重试一次
+- 当上游只返回思考、没有正文或工具调用时自动补偿重试一次，避免 Agent 收到空结束态而提前停止
+- Qwen Web 以干净 HTTP EOF 正常结束时会正确映射为 `stop` / `tool_calls`；只有连接重置等真实传输异常才返回流错误
+- Agent 请求体超过安全阈值时，完整工具定义和历史会通过 Qwen 官方文件接口外置，当前回合仍留在实时提示中，避免长工具循环撞上 WAF/captcha
+- Qwen 返回 HTTP 200 的 WAF/captcha 业务帧时，会显式返回 `upstream_waf_challenge`，不再伪装为空成功或普通 502
+
+> 对 Codex、Claude Code、OpenClaw 等长时间运行的 Agent，建议保持默认的 90 KiB / 48 KiB 阈值。若反代还会附加较大的请求头或正文，可适当下调 `AGENT_CONTEXT_FILE_THRESHOLD_BYTES`。
 
 **请求示例：**
 
