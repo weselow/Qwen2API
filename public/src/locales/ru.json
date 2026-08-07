@@ -66,6 +66,7 @@
       "cliToday": "CLI (сегодня)",
       "calls": "запросов",
       "cliUnavailableShort": "Недоступно",
+      "cliDisabledShort": "Отключено",
       "cliPendingShort": "Инициализация",
       "cliSuccess": "успешно",
       "unitK": "к",
@@ -77,7 +78,8 @@
         "cooldown": "В охлаждении (осталось {until})",
         "tokenExpiring": "Токен скоро истекает",
         "cliUnsupported": "CLI-вызовы не поддерживаются",
-        "cliPending": "CLI инициализация",
+        "cliDisabled": "CLI отключён на сервере (ENABLE_CLI=false)",
+        "cliPending": "Инициализация CLI",
         "unitSec": "сек",
         "unitMin": "мин"
       }

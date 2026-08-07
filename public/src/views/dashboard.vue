@@ -224,7 +224,7 @@
                     out
                   </span>
                 </div>
-                <template v-if="getStatusKind(token.email) === 'cli_unsupported'">
+                <template v-if="isCliInactive(token.email)">
                   <div class="flex items-baseline justify-between gap-2 w-full text-left">
                     <span class="text-gray-400 border-b border-dotted border-gray-300 transition-colors"
                           :title="getStatusTooltip(token.email)">
@@ -232,7 +232,7 @@
                     </span>
                     <span class="font-medium text-gray-400 text-xs md:text-sm"
                           :title="getStatusTooltip(token.email)">
-                      {{ t('dash.acct.cliUnavailableShort') }}
+                      {{ getCliInactiveLabel(token.email) }}
                     </span>
                   </div>
                 </template>
@@ -260,7 +260,7 @@
                   </span>
                 </button>
                 <transition name="fade">
-                  <div v-if="cliExpanded && getStatusKind(token.email) !== 'cli_unsupported' && getStatusKind(token.email) !== 'cli_pending'" class="space-y-1 pt-1">
+                  <div v-if="cliExpanded && !isCliInactive(token.email) && getStatusKind(token.email) !== 'cli_pending'" class="space-y-1 pt-1">
                     <div class="text-xs text-gray-500 text-right">
                       {{ t('dash.acct.cliSuccess') }}: {{ getAccountStats(token.email).cli.calls }}
                     </div>
@@ -656,7 +656,14 @@ const STATUS_EMOJI = Object.freeze({
   cooldown: '🔴',
   token_expiring: '🪫',
   cli_unsupported: '⚪',
+  cli_disabled: '⚫',
   cli_pending: '🔵'
+})
+
+// CLI counters make no sense for these states — show a short label instead of 0 / quota.
+const CLI_INACTIVE_LABELS = Object.freeze({
+  cli_unsupported: 'dash.acct.cliUnavailableShort',
+  cli_disabled: 'dash.acct.cliDisabledShort'
 })
 const nowTick = ref(Date.now())
 let tickInterval = null
@@ -666,6 +673,8 @@ const cooldownRefetched = new Map()
 
 const getStatusKind = (email) => accountStats.value[email]?.status?.kind || 'active'
 const getStatusEmoji = (email) => STATUS_EMOJI[getStatusKind(email)] || STATUS_EMOJI.active
+const isCliInactive = (email) => Boolean(CLI_INACTIVE_LABELS[getStatusKind(email)])
+const getCliInactiveLabel = (email) => t(CLI_INACTIVE_LABELS[getStatusKind(email)])
 const isOnCooldown = (email) => {
   const s = accountStats.value[email]?.status
   return s?.kind === 'cooldown' && typeof s?.cooldownEndsAt === 'number'
@@ -708,6 +717,9 @@ const getStatusTooltip = (email) => {
   }
   if (kind === 'cli_unsupported') {
     return t('dash.acct.status.cliUnsupported')
+  }
+  if (kind === 'cli_disabled') {
+    return t('dash.acct.status.cliDisabled')
   }
   if (kind === 'cli_pending') {
     return t('dash.acct.status.cliPending')

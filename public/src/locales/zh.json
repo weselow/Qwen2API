@@ -66,6 +66,7 @@
       "cliToday": "今日 CLI",
       "calls": "次调用",
       "cliUnavailableShort": "不可用",
+      "cliDisabledShort": "已关闭",
       "cliPendingShort": "初始化中",
       "cliSuccess": "成功",
       "unitK": "k",
@@ -77,6 +78,7 @@
         "cooldown": "冷却中 (剩余 {until})",
         "tokenExpiring": "Token 即将过期",
         "cliUnsupported": "不支持 CLI 调用",
+        "cliDisabled": "服务端已关闭 CLI（ENABLE_CLI=false）",
         "cliPending": "CLI 初始化中",
         "unitSec": "秒",
         "unitMin": "分"
