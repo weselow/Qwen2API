@@ -102,6 +102,9 @@ OUTPUT_THINK=true             # 是否输出思考过程 (true/false)
 LEGACY_REASONING_IN_CONTENT=false # 推理输出格式，false=reasoning_content字段，true=旧版<think>并入content (true/false)
 SIMPLE_MODEL_MAP=false        # 简化模型映射 (true/false)
 MODELS_CACHE_TTL=3600         # 模型列表缓存有效期（秒），0=永不过期
+AGENT_TURN_MAX_ATTEMPTS=3     # 单个 Agent 回合生成有效工具调用/最终态的最大尝试数（2-6）
+AGENT_CONTEXT_FILE_THRESHOLD_BYTES=92160 # 超过阈值时外置完整 Agent 上下文
+AGENT_CONTEXT_LIVE_PROMPT_BYTES=49152     # 外置后仍内联保留的关键任务状态大小
 
 # 🌐 代理与反代配置
 QWEN_CHAT_PROXY_URL=          # 自定义 Chat API 反代URL (默认: https://chat.qwen.ai)
@@ -131,8 +134,9 @@ CACHE_MODE=default            # 图片缓存模式 (default/file)
 | `LEGACY_REASONING_IN_CONTENT` | 推理输出格式。默认 `false`=推理走独立的 `reasoning_content` 字段；`true`=旧版行为（`<think>` 并入 `content`） | `true` 或 `false` |
 | `SIMPLE_MODEL_MAP` | 简化模型映射，只返回基础模型不包含变体 | `true` 或 `false` |
 | `MODELS_CACHE_TTL` | 模型列表缓存有效期（秒），过期后下次请求自动向上游刷新；`0` 表示永不过期 | `3600` |
+| `AGENT_TURN_MAX_ATTEMPTS` | 工具请求在一次 HTTP 回合内生成有效 `tool_calls`、明确完成态或阻塞态的最大尝试数；范围 2–6，耗尽后非流式请求返回 HTTP 429/503，SSE 请求返回显式错误帧，绝不伪装成正常 `stop` | `3` |
 | `AGENT_CONTEXT_FILE_THRESHOLD_BYTES` | Agent 请求体超过此大小时，将完整工具定义和历史自动外置为 Qwen 文本文档，避免触发约 128 KiB 的 WAF 限制 | `92160`（90 KiB） |
-| `AGENT_CONTEXT_LIVE_PROMPT_BYTES` | 上下文外置后，实时请求中保留的工具协议和当前回合最大大小 | `49152`（48 KiB） |
+| `AGENT_CONTEXT_LIVE_PROMPT_BYTES` | 上下文外置后，实时请求中保留的工具协议、system/developer 指令、原始任务、最近工具进度和当前结果的最大大小 | `49152`（48 KiB） |
 | `QWEN_CHAT_PROXY_URL` | 自定义 Chat API 反代地址 | `https://your-proxy.com` |
 | `QWEN_CLI_PROXY_URL` | 自定义 CLI API 反代地址 | `https://your-cli-proxy.com` |
 | `PROXY_URL` | 出站请求代理地址，支持 HTTP/HTTPS/SOCKS5 | `http://127.0.0.1:7890` |
@@ -508,10 +512,14 @@ Authorization: Bearer sk-your-api-key
 - 流式输出按 OpenAI 规范分片：先发 `function.name + 空 arguments` 头块，随后多个 `arguments` 切片
 - 历史消息中的 `assistant.tool_calls` 与 `role:"tool"` 自动折叠回链，`tool_call_id` 精确关联
 - `tool_choice` 全四态：`"auto"` / `"required"` / `{type:"function",function:{name:"..."}}` / `"none"`
-- `tool_choice="required"` 或指定函数时，若首次未触发工具调用，自动追加强约束提示重试一次
-- 当上游只返回思考、没有正文或工具调用时自动补偿重试一次，避免 Agent 收到空结束态而提前停止
+- 携带工具的请求启用严格三态回合门禁：未完成必须返回真实 `tool_calls`；只有显式确认全部完成或确实阻塞时才能返回 `stop`
+- 每个上游生成尝试的裸正文、工具调用和结束状态保持门禁隔离；安全 thinking 与合法 `agent_final` / `agent_blocked` 包装体内的正式正文都会实时显示，但只有闭标签验证通过后才发送 `finish_reason=stop`
+- 默认最多执行 3 次协议纠正（可用 `AGENT_TURN_MAX_ATTEMPTS` 配置为 2–6）；耗尽后非流式请求返回真正的 HTTP 429/503，已经建立的 SSE 则发送标准错误帧和 `[DONE]`，两者都不会伪造 `finish_reason=stop`
+- 流式请求立即建立真正的 SSE，按上游节奏分别发送 `reasoning_content` 和正式 `content`，并用 SSE 注释帧保活；非流式门禁仍使用 HTTP `102 Processing` 保活，以保留最终真实状态码
+- 协议纠正会复用同一个 Qwen `chatId`，并使用主回答（`response_index=0`）的 `response_id` 作为下一次 `parentId`，避免一次回合制造多个 `New chat`
+- thinking 通道若只包含一个完整、合法的工具调用块，也会安全转换为标准 OpenAI `tool_calls`，不会因“只有思考”而中断 Agent
 - Qwen Web 以干净 HTTP EOF 正常结束时会正确映射为 `stop` / `tool_calls`；只有连接重置等真实传输异常才返回流错误
-- Agent 请求体超过安全阈值时，完整工具定义和历史会通过 Qwen 官方文件接口外置，当前回合仍留在实时提示中，避免长工具循环撞上 WAF/captcha
+- Agent 请求体超过安全阈值时，完整上下文会通过 Qwen 官方文件接口外置，同时内联保留 system/developer 指令、原始任务、最近工具链和当前结果；附件失败时也使用同样的关键状态压缩策略
 - Qwen 返回 HTTP 200 的 WAF/captcha 业务帧时，会显式返回 `upstream_waf_challenge`，不再伪装为空成功或普通 502
 
 > 对 Codex、Claude Code、OpenClaw 等长时间运行的 Agent，建议保持默认的 90 KiB / 48 KiB 阈值。若反代还会附加较大的请求头或正文，可适当下调 `AGENT_CONTEXT_FILE_THRESHOLD_BYTES`。

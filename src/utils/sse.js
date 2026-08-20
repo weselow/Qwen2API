@@ -167,19 +167,48 @@ const consumeSSEStream = async (stream, onFrame) => {
  * 上游偶尔会对同一次请求开启多路候选回答：先连续下发多个 response.created
  * （chat_id/parent_id 相同，response_index 为 "0"/"1"，各自 response_id 不同），
  * 随后两路增量帧交错到达。解析时不区分 response_id 就会把两路内容拼到一起，
- * 回答被复读（"巴黎巴黎"）。这里锁定第一个带 response_id 的帧，丢弃其余各路。
- * 上游未带 response_id 时（旧协议）一律放行。
+ * 回答被复读（"巴黎巴黎"）。新版协议优先锁定 response_index=0 的官方主回答；
+ * 只有旧协议缺少 response.created 元数据时，才退回锁定第一路正文。
+ * 上游完全不带 response_id 时一律放行。
  * @returns {(json: object) => boolean} true 表示该帧属于已锁定的那一路，应继续处理
  */
 const createUpstreamResponseFilter = () => {
     let acceptedId = null
+    let sawCreatedEvent = false
+    const responseIndexes = new Map()
     return (json) => {
+        const created = json?.['response.created'] || json?.response?.created
+        if (created && typeof created === 'object') {
+            sawCreatedEvent = true
+            const responseId = created.response_id || created.responseId || null
+            const responseIndex = Number(created.response_index ?? created.responseIndex)
+            if (responseId && Number.isFinite(responseIndex)) {
+                responseIndexes.set(responseId, responseIndex)
+            }
+            // 网页端定义 response_index=0 为主回答。不能按“谁先吐 delta”抢锁，
+            // 否则可能把备用候选当成主回答，并把错误 response_id 用作下一轮 parentId。
+            if (responseId && responseIndex === 0) {
+                acceptedId = responseId
+            } else if (responseId && acceptedId === null && !Number.isFinite(responseIndex)) {
+                acceptedId = responseId
+            }
+            return !responseId || acceptedId === null || responseId === acceptedId
+        }
+
         const responseId = json && json.response_id
         if (!responseId) return true
-        if (acceptedId === null) {
+        if (acceptedId !== null) return responseId === acceptedId
+
+        const responseIndex = responseIndexes.get(responseId)
+        if (responseIndex === 0) {
             acceptedId = responseId
+            return true
         }
-        return responseId === acceptedId
+        if (Number.isFinite(responseIndex) || sawCreatedEvent) return false
+
+        // 旧协议没有 response.created，只能锁定第一路带 response_id 的正文。
+        acceptedId = responseId
+        return true
     }
 }
 

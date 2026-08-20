@@ -53,6 +53,12 @@ const config = {
     // chat 请求重试配置（运行时可被 web UI 覆盖，见 src/utils/data-persistence.js#loadSettings）
     chatRetryCount: Math.max(0, parseInt(process.env.CHAT_RETRY_COUNT, 10) || 1),
     chatRetryBackoffMs: Math.max(0, parseInt(process.env.CHAT_RETRY_BACKOFF_MS, 10) || 400),
+    // Agent 回合协议纠正次数。这里是一次 HTTP 回合内的上游生成尝试总数，
+    // 与传输错误重试分开；耗尽后必须显式失败，绝不能伪装成 finish_reason=stop。
+    agentTurnMaxAttempts: Math.min(
+        6,
+        Math.max(2, parseInt(process.env.AGENT_TURN_MAX_ATTEMPTS, 10) || 3)
+    ),
     // chat.qwen.ai 的 WAF 会在 JSON 请求体接近 128 KiB 时返回 captcha。
     // 提前把 Agent 全量历史外置成文本文档，给协议头和当前回合留出安全余量。
     agentContextFileThresholdBytes: Math.max(

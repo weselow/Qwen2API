@@ -1,7 +1,41 @@
 const { generateUUID } = require('../utils/tools.js')
 const { isChatType, isThinkingEnabled, parserModel, parserMessages } = require('../utils/chat-helpers.js')
 const { buildToolSystemPrompt, foldToolMessages } = require('../utils/tool-prompt.js')
+const { buildAgentTurnDirective } = require('../utils/agent-turn.js')
 const { logger } = require('../utils/logger')
+
+const shouldEnableToolRuntime = (tools, chatType, toolChoice) => (
+  Array.isArray(tools) &&
+  tools.length > 0 &&
+  chatType === 't2t' &&
+  toolChoice !== 'none'
+)
+
+const AGENT_CURRENT_MESSAGE_MARKER = '# Current message'
+
+const ensureAgentCurrentEnvelope = (content, role = 'user') => {
+  const wrap = (text) => {
+    const value = String(text || '')
+    if (value.includes('# Conversation history (JSONL)') || value.includes(AGENT_CURRENT_MESSAGE_MARKER)) {
+      return value
+    }
+    return `${AGENT_CURRENT_MESSAGE_MARKER}\n${JSON.stringify({ role, content: value })}`
+  }
+
+  if (typeof content === 'string') return wrap(content)
+  if (!Array.isArray(content)) return content
+
+  let wrapped = false
+  const result = content.map(item => {
+    if (!wrapped && item?.type === 'text') {
+      wrapped = true
+      return { ...item, text: wrap(item.text) }
+    }
+    return item
+  })
+  if (!wrapped) result.unshift({ type: 'text', text: wrap('') })
+  return result
+}
 
 /**
  * 处理聊天请求体的中间件
@@ -74,7 +108,11 @@ const processRequestBody = async (req, res, next) => {
 
     // 处理 tools 参数 : 通过提示词为网页版模型注入工具调用能力
     const chatType = isChatType(model)
-    const hasTools = Array.isArray(tools) && tools.length > 0 && chatType === 't2t'
+    // OpenAI 允许请求同时携带 tools 和 tool_choice="none"。这种请求必须走普通
+    // 文本完成路径，不能注入工具协议或启用严格 Agent 回合门禁。
+    const hasTools = shouldEnableToolRuntime(tools, chatType, tool_choice)
+    const originalLastMessage = Array.isArray(messages) ? messages[messages.length - 1] : null
+    const afterToolResult = ['tool', 'function'].includes(String(originalLastMessage?.role || '').toLowerCase())
     let preparedMessages = messages
     let toolSystemPrompt = ''
     if (hasTools) {
@@ -104,6 +142,10 @@ const processRequestBody = async (req, res, next) => {
 
     // 工具提示词拼接到用户消息内容上
     if (hasTools && toolSystemPrompt) {
+      body.messages[0].content = ensureAgentCurrentEnvelope(
+        body.messages[0].content,
+        lastMessage.role || 'user'
+      )
       const msgContent = body.messages[0].content
       if (typeof msgContent === 'string') {
         body.messages[0].content = `${toolSystemPrompt}\n\n${msgContent}`
@@ -113,6 +155,19 @@ const processRequestBody = async (req, res, next) => {
           msgContent[textIdx].text = `${toolSystemPrompt}\n\n${msgContent[textIdx].text || ''}`
         } else {
           msgContent.unshift({ type: 'text', text: toolSystemPrompt })
+        }
+      }
+
+      const turnDirective = buildAgentTurnDirective({ afterToolResult })
+      const directedContent = body.messages[0].content
+      if (typeof directedContent === 'string') {
+        body.messages[0].content = `${directedContent}\n\n${turnDirective}`
+      } else if (Array.isArray(directedContent)) {
+        const textIdx = directedContent.findIndex(c => c?.type === 'text')
+        if (textIdx >= 0) {
+          directedContent[textIdx].text = `${directedContent[textIdx].text || ''}\n\n${turnDirective}`
+        } else {
+          directedContent.unshift({ type: 'text', text: turnDirective })
         }
       }
     }
@@ -145,5 +200,7 @@ const processRequestBody = async (req, res, next) => {
 }
 
 module.exports = {
-  processRequestBody
+  processRequestBody,
+  shouldEnableToolRuntime,
+  ensureAgentCurrentEnvelope
 }

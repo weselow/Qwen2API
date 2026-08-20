@@ -102,6 +102,17 @@ test('createUpstreamResponseFilter keeps a single response when upstream opens s
   // 不过滤时两路内容被拼在一起 —— 这正是 #149 的复读现象
   assert.equal(collectAnswer(DUAL_RESPONSE_FRAMES, null), '巴巴黎黎')
   assert.equal(collectAnswer(DUAL_RESPONSE_FRAMES, createUpstreamResponseFilter()), '巴黎')
+
+  const primaryAndFallbackDiffer = [
+    '{"response.created":{"response_id":"primary","response_index":"0"}}',
+    '{"response.created":{"response_id":"fallback","response_index":"1"}}',
+    '{"choices":[{"delta":{"content":"wrong","phase":"answer"}}],"response_id":"fallback"}',
+    '{"choices":[{"delta":{"content":"right","phase":"answer"}}],"response_id":"primary"}'
+  ]
+  assert.equal(
+    collectAnswer(primaryAndFallbackDiffer, createUpstreamResponseFilter()),
+    'right'
+  )
 })
 
 test('createUpstreamResponseFilter passes frames through when upstream sends no response_id', () => {

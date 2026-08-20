@@ -39,6 +39,19 @@ test('empty tool results remain visible in Agent history', () => {
   assert.match(folded[1].content, />\nnull\n<\/tool_response>/)
 })
 
+test('legacy function_call and function result messages remain executable history', () => {
+  const folded = foldToolMessages([
+    { role: 'assistant', content: null, function_call: { name: 'read_file', arguments: '{"path":"README.md"}' } },
+    { role: 'function', name: 'read_file', content: 'file body' }
+  ])
+  assert.equal(folded[0].role, 'assistant')
+  assert.match(folded[0].content, /<tool_call>/)
+  assert.match(folded[0].content, /"name":"read_file"/)
+  assert.equal(folded[1].role, 'user')
+  assert.match(folded[1].content, /<tool_response name="read_file">/)
+  assert.match(folded[1].content, /file body/)
+})
+
 test('stream parser accepts split valid calls and preserves JSON string arguments', () => {
   const parser = createToolCallStreamParser({ allowedToolNames: ['read_file'] })
   const first = parser.push('before<tool_')

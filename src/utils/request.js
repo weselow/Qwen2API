@@ -41,6 +41,180 @@ const truncateUtf8 = (value, maxBytes, fromEnd = false) => {
     return slice.toString('utf8').replace(/^\uFFFD|\uFFFD$/g, '')
 }
 
+const truncateUtf8HeadTail = (
+    value,
+    maxBytes,
+    headRatio = 0.55,
+    separator = '\n...[inline context compacted; complete copy is in the attachment]...\n'
+) => {
+    const text = String(value || '')
+    const buffer = Buffer.from(text, 'utf8')
+    const limit = Math.max(0, Number(maxBytes) || 0)
+    if (buffer.length <= limit) return text
+    if (limit === 0) return ''
+
+    const separatorBytes = byteLength(separator)
+    if (limit <= separatorBytes + 2) return truncateUtf8(text, limit)
+
+    const contentBudget = limit - separatorBytes
+    const headBytes = Math.max(1, Math.floor(contentBudget * headRatio))
+    const tailBytes = Math.max(1, contentBudget - headBytes)
+    return `${truncateUtf8(text, headBytes)}${separator}${truncateUtf8(text, tailBytes, true)}`
+}
+
+const parseAgentEnvelope = (value) => {
+    const text = String(value || '')
+    const historyIndex = text.indexOf(HISTORY_MARKER)
+    const currentIndex = text.lastIndexOf(CURRENT_MESSAGE_MARKER)
+    if (historyIndex < 0) {
+        if (currentIndex >= 0) {
+            return {
+                prefix: text.slice(0, currentIndex).trim(),
+                history: '',
+                current: text.slice(currentIndex).trim(),
+                entries: []
+            }
+        }
+        return { prefix: text, history: '', current: '', entries: [] }
+    }
+
+    const historyStart = historyIndex + HISTORY_MARKER.length
+    const hasCurrent = currentIndex > historyStart
+    const history = text.slice(historyStart, hasCurrent ? currentIndex : text.length).trim()
+    const entries = []
+    for (const line of history.split('\n')) {
+        const raw = line.trim()
+        if (!raw) continue
+        try {
+            const parsed = JSON.parse(raw)
+            if (parsed && typeof parsed === 'object') {
+                entries.push({
+                    raw,
+                    role: String(parsed.role || '').toLowerCase(),
+                    content: typeof parsed.content === 'string'
+                        ? parsed.content
+                        : JSON.stringify(parsed.content ?? '')
+                })
+            }
+        } catch (_) {
+            // 历史中可能包含旧版非 JSONL 内容；recent history 仍会按原文保留。
+        }
+    }
+    return {
+        prefix: text.slice(0, historyIndex).trim(),
+        history,
+        current: hasCurrent ? text.slice(currentIndex).trim() : '',
+        entries
+    }
+}
+
+const buildEssentialAgentHistory = (entries) => {
+    if (!Array.isArray(entries) || entries.length === 0) return ''
+    const systemEntries = entries.filter(entry => ['system', 'developer'].includes(entry.role))
+    const activeTask = [...entries].reverse().find(entry =>
+        entry.role === 'user' &&
+        !/^\s*<tool_response\b/i.test(entry.content) &&
+        !/^\s*\[tool[_ ]result/i.test(entry.content)
+    )
+
+    const sections = []
+    if (systemEntries.length > 0) {
+        sections.push('## System/developer instructions', systemEntries.map(entry => entry.raw).join('\n'))
+    }
+    if (activeTask) {
+        sections.push('## Active user task', activeTask.raw)
+    }
+    return sections.join('\n')
+}
+
+const buildRecentAgentHistory = (
+    envelope,
+    maxBytes,
+    compactionSeparator = '\n...[inline context compacted; complete copy is in the attachment]...\n'
+) => {
+    const limit = Math.max(0, Number(maxBytes) || 0)
+    if (limit === 0) return ''
+    const entries = envelope?.entries || []
+    if (entries.length === 0) {
+        return truncateUtf8HeadTail(envelope?.history || '', limit, 0.35, compactionSeparator)
+    }
+
+    const latest = entries[entries.length - 1].raw
+    const previous = entries.slice(Math.max(0, entries.length - 4), -1)
+        .map(entry => entry.raw)
+        .join('\n')
+    if (!previous) return truncateUtf8HeadTail(latest, limit, 0.4, compactionSeparator)
+
+    const previousBudget = Math.floor(limit * 0.32)
+    const latestBudget = Math.max(0, limit - previousBudget - 1)
+    return [
+        truncateUtf8HeadTail(previous, previousBudget, 0.45, compactionSeparator),
+        truncateUtf8HeadTail(latest, latestBudget, 0.4, compactionSeparator)
+    ].filter(Boolean).join('\n')
+}
+
+const buildBudgetedAgentPrompt = (
+    original,
+    maxBytes,
+    notice,
+    { attachmentAvailable = true } = {}
+) => {
+    const envelope = parseAgentEnvelope(original)
+    const essential = buildEssentialAgentHistory(envelope.entries)
+    const sections = [
+        { header: '', value: envelope.prefix, weight: 34, headRatio: 0.55, kind: 'text' },
+        {
+            header: '# Essential Agent state retained inline',
+            value: essential,
+            weight: 24,
+            headRatio: 0.65,
+            kind: 'text'
+        },
+        {
+            header: '# Recent Agent history retained inline',
+            value: envelope.history,
+            weight: 18,
+            headRatio: 0.4,
+            kind: 'recent'
+        },
+        { header: '', value: envelope.current, weight: 24, headRatio: 0.45, kind: 'text' }
+    ].filter(section => String(section.value || '').trim())
+
+    const max = Math.max(1024, Number(maxBytes) || config.agentContextLivePromptBytes)
+    const joinSeparator = '\n\n'
+    const fixedBytes = byteLength(notice) +
+        (sections.length * byteLength(joinSeparator)) +
+        sections.reduce((sum, section) => (
+            sum + (section.header ? byteLength(`${section.header}\n`) : 0)
+        ), 0)
+    if (fixedBytes >= max) return truncateUtf8(notice, max)
+
+    let remainingBytes = max - fixedBytes
+    let remainingWeight = sections.reduce((sum, section) => sum + section.weight, 0)
+    const compactionSeparator = attachmentAvailable
+        ? '\n...[inline context compacted; complete copy is in the attachment]...\n'
+        : '\n...[older inline context compacted after attachment recovery failed]...\n'
+    const rendered = sections.map((section, index) => {
+        const isLast = index === sections.length - 1
+        const budget = isLast
+            ? remainingBytes
+            : Math.floor(remainingBytes * section.weight / remainingWeight)
+        remainingBytes -= budget
+        remainingWeight -= section.weight
+        const content = section.kind === 'recent'
+            ? buildRecentAgentHistory(envelope, budget, compactionSeparator)
+            : truncateUtf8HeadTail(
+                section.value,
+                budget,
+                section.headRatio,
+                compactionSeparator
+            )
+        return section.header ? `${section.header}\n${content}` : content
+    })
+
+    return [notice, ...rendered].join(joinSeparator)
+}
+
 const getMessageTextContent = (message) => {
     if (typeof message?.content === 'string') return message.content
     if (!Array.isArray(message?.content)) return null
@@ -83,52 +257,24 @@ const buildAgentContextLivePrompt = (
     maxBytes = config.agentContextLivePromptBytes,
     attachmentName = 'QWEN2API_AGENT_CONTEXT.txt'
 ) => {
-    const text = String(original || '')
-    const historyIndex = text.indexOf(HISTORY_MARKER)
-    const currentIndex = text.lastIndexOf(CURRENT_MESSAGE_MARKER)
-    const prefix = historyIndex >= 0 ? text.slice(0, historyIndex).trim() : ''
-    const current = currentIndex >= 0 ? text.slice(currentIndex).trim() : ''
     const notice = [
         '# Agent context attachment',
         `The complete system instructions, tool schemas, conversation history and current task are attached as ${attachmentName}.`,
-        'Read that attachment as authoritative context before acting. Continue from the latest state; do not restart the task or claim completion without verification.',
+        'Read that attachment as authoritative context before acting. The essential task state and recent tool progress are also retained inline below so the Agent loop must not reset if attachment parsing is delayed.',
+        'Continue from the latest state; do not restart the task, stop after one intermediate action, or claim completion without tool-result verification.',
         'When an available tool is needed, emit the real `<tool_call>` block immediately. Do not replace it with prose such as “I will run...” or “done”.'
     ].join('\n')
-
-    let live = [notice, prefix, current].filter(Boolean).join('\n\n')
-    if (byteLength(live) <= maxBytes) return live
-
-    const reserved = byteLength(notice) + 4
-    const remaining = Math.max(1024, maxBytes - reserved)
-    const currentBudget = Math.max(1024, Math.floor(remaining * 0.45))
-    const prefixBudget = Math.max(1024, remaining - currentBudget)
-    live = [
-        notice,
-        prefix ? truncateUtf8(prefix, prefixBudget) : '',
-        current ? truncateUtf8(current, currentBudget, true) : ''
-    ].filter(Boolean).join('\n\n')
-    return live
+    return buildBudgetedAgentPrompt(original, maxBytes, notice, { attachmentAvailable: true })
 }
 
 const compactAgentContextFallback = (original, maxBytes = config.agentContextLivePromptBytes) => {
-    const text = String(original || '')
     const notice = [
         '# Agent context recovery',
         'The upstream document attachment failed, so older context was compacted to stay below the Qwen Web request limit.',
-        'Continue the latest Agent task using the recent context below. Use a real tool call whenever more work is required; do not report completion before verification.'
+        'The system/developer rules, active user task, recent tool progress, and current tool result retained below remain authoritative.',
+        'Continue the latest Agent task using that state. Use a real tool call whenever more work is required; do not report completion before verification.'
     ].join('\n')
-    const limit = Math.max(1024, Number(maxBytes) || config.agentContextLivePromptBytes)
-    const historyIndex = text.indexOf(HISTORY_MARKER)
-    const prefix = historyIndex >= 0 ? text.slice(0, historyIndex).trim() : ''
-    const recent = historyIndex >= 0 ? text.slice(historyIndex).trim() : text
-    const remaining = Math.max(256, limit - byteLength(notice) - 4)
-    const prefixBudget = prefix ? Math.floor(remaining * 0.55) : 0
-    const recentBudget = remaining - prefixBudget
-    return [
-        notice,
-        prefix ? truncateUtf8(prefix, prefixBudget) : '',
-        truncateUtf8(recent, recentBudget, true)
-    ].filter(Boolean).join('\n\n')
+    return buildBudgetedAgentPrompt(original, maxBytes, notice, { attachmentAvailable: false })
 }
 
 /**
@@ -186,9 +332,11 @@ const externalizeOversizedAgentContext = async (
  * @param {Object} body - 请求体
  * @returns {Promise<Object>} 响应结果
  */
-const sendChatRequest = async (body) => {
+const sendChatRequest = async (body, options = {}) => {
     // 获取可用的账户（包含 proxy 等完整字段）
-    const currentAccount = accountManager.getAccount()
+    const currentAccount = options.currentAccount?.token
+        ? options.currentAccount
+        : accountManager.getAccount()
     const currentToken = currentAccount ? currentAccount.token : null
 
     if (!currentToken) {
@@ -244,18 +392,34 @@ const sendChatRequest = async (body) => {
     }
 
     const chatType = body.chat_type || body.messages?.[0]?.chat_type || 't2t'
-    const chat_id = await generateChatID(currentToken, body.model, currentAccount, chatType)
+    const chat_id = options.chatId || await generateChatID(currentToken, body.model, currentAccount, chatType)
+    if (!chat_id) {
+        return {
+            status: false,
+            response: null,
+            message: '无法创建或续接 Qwen 会话'
+        }
+    }
     // 浏览器 referer 为 /c/<chat_id>（在 chat_id 生成后动态设置）
     requestConfig.headers.referer = `${chatBaseUrl}/c/${chat_id}`
     const url = `${chatBaseUrl}/api/v2/chat/completions?chat_id=` + chat_id
     // 对齐网页双写 chatId/parentId（FE 0.2.81）
+    const parentId = options.parentId ?? body.parentId ?? body.parent_id ?? null
+    const messages = Array.isArray(body.messages)
+        ? body.messages.map(message => ({
+            ...message,
+            parent_id: parentId,
+            parentId
+        }))
+        : body.messages
     const rawPayload = {
         ...body,
         stream: true,
         chat_id,
         chatId: chat_id,
-        parent_id: body.parent_id ?? null,
-        parentId: body.parentId ?? body.parent_id ?? null
+        parent_id: parentId,
+        parentId,
+        messages
     }
     const contextResult = await externalizeOversizedAgentContext(
         rawPayload,
@@ -287,6 +451,11 @@ const sendChatRequest = async (body) => {
                 return {
                     currentToken,
                     currentAccount,
+                    chatId: chat_id,
+                    parentId,
+                    // 返回真正提交给 Qwen 的请求体。严格 Agent 回合纠正可直接复用
+                    // 已外置的上下文附件，避免每次纠正都重新上传同一份长历史。
+                    requestBody: payload,
                     status: true,
                     response: response.data
                 }

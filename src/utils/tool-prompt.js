@@ -1,5 +1,11 @@
 const { generateUUID } = require('./tools.js');
 const { logger } = require('./logger');
+const {
+  AGENT_FINAL_OPEN,
+  AGENT_FINAL_CLOSE,
+  AGENT_BLOCKED_OPEN,
+  AGENT_BLOCKED_CLOSE
+} = require('./agent-turn.js');
 
 /**
  * 工具调用 XML 起始标签
@@ -164,7 +170,11 @@ const buildToolSystemPrompt = (tools, options = {}) => {
     '- You may emit multiple `<tool_call>` blocks back-to-back when more than one tool is needed.',
     '- After every tool result, evaluate the actual task state. If work remains, emit the next tool call. Only return a normal-language final answer after the requested task is genuinely complete or you are blocked on user input.',
     '- Never claim that a file was changed, a command succeeded, or a result was verified unless the corresponding tool result proves it.',
-    '- Do not call nonexistent tools, fabricate tool results, wrap `<tool_call>` in code fences, or mix extra commentary into a tool-call turn.'
+    '- Do not call nonexistent tools, fabricate tool results, wrap `<tool_call>` in code fences, or mix extra commentary into a tool-call turn.',
+    '- A non-tool response is valid only when it explicitly declares its state: use the completion or blocked wrapper below. Bare prose is invalid.',
+    `- Verified completion: ${AGENT_FINAL_OPEN}final report${AGENT_FINAL_CLOSE}`,
+    `- Requires user input/authority: ${AGENT_BLOCKED_OPEN}exact blocker${AGENT_BLOCKED_CLOSE}`,
+    '- Never emit the completion wrapper after merely finishing one intermediate tool action; continue with another tool call until every requested outcome is verified.'
   ];
 
   const choice = options.tool_choice;
@@ -194,9 +204,15 @@ const foldToolMessages = (messages) => {
   return messages.map((message) => {
     if (!message || typeof message !== 'object') return message;
 
-    if (message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-      const blocks = message.tool_calls.map((call) => {
-        let args = call?.function?.arguments;
+    const assistantCalls = message.role === 'assistant'
+      ? (Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+        ? message.tool_calls
+        : (message.function_call?.name ? [message.function_call] : []))
+      : [];
+    if (assistantCalls.length > 0) {
+      const blocks = assistantCalls.map((call) => {
+        const fn = call?.function || call;
+        let args = fn?.arguments;
         if (typeof args === 'string') {
           try {
             args = JSON.parse(args);
@@ -204,7 +220,7 @@ const foldToolMessages = (messages) => {
             // 保留原始字符串形式
           }
         }
-        const name = call?.function?.name || 'unknown';
+        const name = fn?.name || 'unknown';
         const id = call?.id || `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`;
         callIdToName.set(id, name);
         const payload = { id, name, arguments: args ?? {} };
@@ -217,9 +233,9 @@ const foldToolMessages = (messages) => {
       };
     }
 
-    if (message.role === 'tool') {
+    if (message.role === 'tool' || message.role === 'function') {
       const callId = message.tool_call_id || '';
-      const name = message.name || callIdToName.get(callId) || 'tool';
+      const name = message.name || callIdToName.get(callId) || (message.role === 'function' ? 'function' : 'tool');
       const content = typeof message.content === 'string'
         ? (message.content || 'null')
         : JSON.stringify(message.content ?? null);
