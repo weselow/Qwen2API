@@ -39,7 +39,7 @@ test('pollForToken stops after 3 unsuccessful attempts', async () => {
   }
 });
 
-test('getAccountCliState marks unsupported CLI accounts with zero quota', () => {
+test('getAccountCliState reports unsupported CLI without touching account health', () => {
   const state = cliSupport.getAccountCliState({
     cli_info: null,
     cli_unavailable_reason: 'unsupported',
@@ -47,7 +47,8 @@ test('getAccountCliState marks unsupported CLI accounts with zero quota', () => 
     stats: { chat: { input: 0, output: 0 }, cli: { calls: 0, input: 0, output: 0 } }
   }, {}, Date.now());
 
-  assert.equal(state.status.kind, 'cli_unsupported');
+  assert.equal(state.status.cli, 'unsupported');
+  assert.equal(state.status.kind, 'active');
   assert.equal(state.cliQuotaLimit, 0);
   assert.equal(state.cliRequestNumber, 0);
 });
@@ -60,11 +61,12 @@ test('getAccountCliState keeps normal accounts on default CLI quota', () => {
   }, {}, Date.now());
 
   assert.equal(state.status.kind, 'active');
+  assert.equal(state.status.cli, 'available');
   assert.equal(state.cliQuotaLimit, 2000);
   assert.equal(state.cliRequestNumber, 12);
 });
 
-test('getAccountCliState marks uninitialized accounts as cli_pending', () => {
+test('getAccountCliState marks uninitialized accounts as CLI pending', () => {
   const state = cliSupport.getAccountCliState({
     cli_info: null,
     cli_unavailable_reason: null,
@@ -72,7 +74,42 @@ test('getAccountCliState marks uninitialized accounts as cli_pending', () => {
     stats: { chat: { input: 0, output: 0 }, cli: { calls: 0, input: 0, output: 0 } }
   }, {}, Date.now());
 
-  assert.equal(state.status.kind, 'cli_pending');
-  assert.equal(state.cliQuotaLimit, 2000);
+  assert.equal(state.status.cli, 'pending');
+  assert.equal(state.status.kind, 'active');
+  assert.equal(state.cliQuotaLimit, 0);
   assert.equal(state.cliRequestNumber, 0);
+});
+
+// The whole point of splitting kind and cli: with a single field the disabled CLI
+// shadowed every health state, so a cooling-down account looked perfectly normal.
+test('CLI availability never shadows account health', () => {
+  const now = Date.now();
+
+  const cooling = cliSupport.getAccountCliState({
+    cli_info: null,
+    cli_unavailable_reason: 'disabled',
+    expires: Math.floor(now / 1000) + 24 * 60 * 60,
+    stats: { chat: { input: 0, output: 0 }, cli: { calls: 0, input: 0, output: 0 } }
+  }, { cooldownEndsAt: now + 60 * 1000 }, now);
+
+  assert.equal(cooling.status.kind, 'cooldown');
+  assert.equal(cooling.status.cli, 'disabled');
+  assert.equal(cooling.status.cooldownEndsAt, now + 60 * 1000);
+
+  const expiring = cliSupport.getAccountCliState({
+    cli_info: null,
+    cli_unavailable_reason: 'disabled',
+    expires: Math.floor(now / 1000) + 60 * 60,
+    stats: { chat: { input: 0, output: 0 }, cli: { calls: 0, input: 0, output: 0 } }
+  }, {}, now);
+
+  assert.equal(expiring.status.kind, 'token_expiring');
+  assert.equal(expiring.status.cli, 'disabled');
+});
+
+test('getCliAvailability maps every unavailability reason', () => {
+  assert.equal(cliSupport.getCliAvailability({ cli_unavailable_reason: 'disabled' }), 'disabled');
+  assert.equal(cliSupport.getCliAvailability({ cli_unavailable_reason: 'unsupported' }), 'unsupported');
+  assert.equal(cliSupport.getCliAvailability({ cli_info: null }), 'pending');
+  assert.equal(cliSupport.getCliAvailability({ cli_info: { request_number: 1 } }), 'available');
 });

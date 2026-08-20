@@ -227,23 +227,23 @@
                 <template v-if="isCliInactive(token.email)">
                   <div class="flex items-baseline justify-between gap-2 w-full text-left">
                     <span class="text-gray-400 border-b border-dotted border-gray-300 transition-colors"
-                          :title="getStatusTooltip(token.email)">
+                          :title="getCliTooltip(token.email)">
                       {{ t('dash.acct.cliToday') }}:
                     </span>
                     <span class="font-medium text-gray-400 text-xs md:text-sm"
-                          :title="getStatusTooltip(token.email)">
+                          :title="getCliTooltip(token.email)">
                       {{ getCliInactiveLabel(token.email) }}
                     </span>
                   </div>
                 </template>
-                <template v-else-if="getStatusKind(token.email) === 'cli_pending'">
+                <template v-else-if="getCliState(token.email) === 'pending'">
                   <div class="flex items-baseline justify-between gap-2 w-full text-left">
                     <span class="text-blue-400 border-b border-dotted border-blue-300 transition-colors"
-                          :title="getStatusTooltip(token.email)">
+                          :title="getCliTooltip(token.email)">
                       {{ t('dash.acct.cliToday') }}:
                     </span>
                     <span class="font-medium text-blue-400 text-xs md:text-sm"
-                          :title="getStatusTooltip(token.email)">
+                          :title="getCliTooltip(token.email)">
                       {{ t('dash.acct.cliPendingShort') }}
                     </span>
                   </div>
@@ -260,7 +260,7 @@
                   </span>
                 </button>
                 <transition name="fade">
-                  <div v-if="cliExpanded && !isCliInactive(token.email) && getStatusKind(token.email) !== 'cli_pending'" class="space-y-1 pt-1">
+                  <div v-if="cliExpanded && getCliState(token.email) === 'available'" class="space-y-1 pt-1">
                     <div class="text-xs text-gray-500 text-right">
                       {{ t('dash.acct.cliSuccess') }}: {{ getAccountStats(token.email).cli.calls }}
                     </div>
@@ -649,21 +649,20 @@ const toggleCliExpanded = () => {
   localStorage.setItem('cliExpanded', cliExpanded.value ? '1' : '0')
 }
 
-// Per-account status indicator (Qwen2API-3wg.3)
+// Per-account health indicator (Qwen2API-3wg.3, split in Qwen2API-jev).
+// Only account health lives here — CLI availability is a separate axis (status.cli)
+// shown in the CLI row, so a disabled CLI can no longer hide a cooldown.
 const STATUS_EMOJI = Object.freeze({
   active: '🟢',
   warn: '🟡',
   cooldown: '🔴',
-  token_expiring: '🪫',
-  cli_unsupported: '⚪',
-  cli_disabled: '⚫',
-  cli_pending: '🔵'
+  token_expiring: '🪫'
 })
 
 // CLI counters make no sense for these states — show a short label instead of 0 / quota.
 const CLI_INACTIVE_LABELS = Object.freeze({
-  cli_unsupported: 'dash.acct.cliUnavailableShort',
-  cli_disabled: 'dash.acct.cliDisabledShort'
+  unsupported: 'dash.acct.cliUnavailableShort',
+  disabled: 'dash.acct.cliDisabledShort'
 })
 const nowTick = ref(Date.now())
 let tickInterval = null
@@ -673,8 +672,9 @@ const cooldownRefetched = new Map()
 
 const getStatusKind = (email) => accountStats.value[email]?.status?.kind || 'active'
 const getStatusEmoji = (email) => STATUS_EMOJI[getStatusKind(email)] || STATUS_EMOJI.active
-const isCliInactive = (email) => Boolean(CLI_INACTIVE_LABELS[getStatusKind(email)])
-const getCliInactiveLabel = (email) => t(CLI_INACTIVE_LABELS[getStatusKind(email)])
+const getCliState = (email) => accountStats.value[email]?.status?.cli || 'available'
+const isCliInactive = (email) => Boolean(CLI_INACTIVE_LABELS[getCliState(email)])
+const getCliInactiveLabel = (email) => t(CLI_INACTIVE_LABELS[getCliState(email)])
 const isOnCooldown = (email) => {
   const s = accountStats.value[email]?.status
   return s?.kind === 'cooldown' && typeof s?.cooldownEndsAt === 'number'
@@ -715,16 +715,22 @@ const getStatusTooltip = (email) => {
   if (kind === 'token_expiring') {
     return t('dash.acct.status.tokenExpiring')
   }
-  if (kind === 'cli_unsupported') {
+  return t('dash.acct.status.active')
+}
+
+// CLI row hint — independent of the health badge above.
+const getCliTooltip = (email) => {
+  const cli = getCliState(email)
+  if (cli === 'unsupported') {
     return t('dash.acct.status.cliUnsupported')
   }
-  if (kind === 'cli_disabled') {
+  if (cli === 'disabled') {
     return t('dash.acct.status.cliDisabled')
   }
-  if (kind === 'cli_pending') {
+  if (cli === 'pending') {
     return t('dash.acct.status.cliPending')
   }
-  return t('dash.acct.status.active')
+  return ''
 }
 
 const fetchAccountStats = async () => {

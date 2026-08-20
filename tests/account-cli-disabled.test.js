@@ -35,7 +35,7 @@ test('loadAccountTokens marks every account as cli_disabled when CLI is off', as
     for (const account of accountManager.accountTokens) {
       assert.equal(account.cli_unavailable_reason, 'disabled')
       assert.equal(account.cli_info, null)
-      assert.equal(getAccountCliState(account).status.kind, 'cli_disabled')
+      assert.equal(getAccountCliState(account).status.cli, 'disabled')
     }
   } finally {
     config.cliEnabled = originalCliEnabled
