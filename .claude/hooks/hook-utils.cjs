@@ -3,6 +3,17 @@
  *
  * Replaces bash+jq patterns with cross-platform Node.js equivalents.
  * No external dependencies — only Node.js built-ins.
+ *
+ * Why .claude/settings.json invokes these hooks through a long `node -e` resolver
+ * instead of a short `node .claude/hooks/<name>.cjs`:
+ * a hook process inherits the working directory of the last Bash tool call, not the
+ * project root. As soon as the agent works from a subdirectory or a git worktree,
+ * a relative path resolves against that directory and Node throws
+ * "Cannot find module" (cjs/loader). The failure is non-blocking, so the hook is
+ * silently skipped — every check it performs simply disappears with no signal.
+ * The resolver tries CLAUDE_PROJECT_DIR, then `git rev-parse --show-toplevel`,
+ * then the main worktree root (parent of --git-common-dir), then cwd, and exits 0
+ * quietly when the hook file is genuinely absent.
  */
 
 'use strict';
