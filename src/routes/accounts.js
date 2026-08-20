@@ -623,14 +623,15 @@ router.post('/forceRefreshAllAccounts', adminKeyVerify, async (req, res) => {
 /**
  * GET /accountStats
  * 返回 dashboard 用 daily stats + per-account status
- * Status priority: cooldown > warn > token_expiring > active
+ * status.kind —— 账户健康，优先级 cooldown > warn > token_expiring > active
+ * status.cli  —— CLI 可用性，与健康互不遮挡：disabled / unsupported / pending / available
  *
  * @returns {{
  *   accounts: Array<{
  *     email: string,
  *     stats: { chat: {input,output}, cli: {calls,input,output} },
  *     cliRequestNumber: number,
- *     status: { kind: string, cooldownEndsAt: number|null, lastErrorAt: number|null, lastErrorCode: string|number|null }
+ *     status: { kind: string, cli: string, cooldownEndsAt: number|null, lastErrorAt: number|null, lastErrorCode: string|number|null }
  *   }>,
  *   cliQuotaLimit: number
  * }}
