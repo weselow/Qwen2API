@@ -169,15 +169,23 @@ class Account {
 
             // 初始化 CLI 账户（后台执行，不阻塞 chat-flow init）
             // 为所有账户启动 CLI 初始化，确保没有 CLI 额度的账号被正确标记为 unsupported
-            if (this.accountTokens.length > 0 && config.cliEnabled) {
-                logger.info(`后台初始化所有 ${this.accountTokens.length} 个账户的 CLI`, 'ACCOUNT')
-                Promise.allSettled(
-                    this.accountTokens.map(account => this._initializeCliAccount(account))
-                ).then(() => {
-                    const cliReady = this.accountTokens.filter(a => a.cli_info).length
-                    const cliUnsupported = this.accountTokens.filter(a => a.cli_unavailable_reason === 'unsupported').length
-                    logger.success(`CLI 初始化完成: ${cliReady} 个可用, ${cliUnsupported} 个不支持`, 'CLI')
-                })
+            if (this.accountTokens.length > 0) {
+                if (config.cliEnabled) {
+                    logger.info(`后台初始化所有 ${this.accountTokens.length} 个账户的 CLI`, 'ACCOUNT')
+                    Promise.allSettled(
+                        this.accountTokens.map(account => this._initializeCliAccount(account))
+                    ).then(() => {
+                        const cliReady = this.accountTokens.filter(a => a.cli_info).length
+                        const cliUnsupported = this.accountTokens.filter(a => a.cli_unavailable_reason === 'unsupported').length
+                        logger.success(`CLI 初始化完成: ${cliReady} 个可用, ${cliUnsupported} 个不支持`, 'CLI')
+                    })
+                } else {
+                    // CLI 关闭时也要标记账户：cli_unavailable_reason 为空的账户会被
+                    // cli-support.js 判定为 cli_pending，管理面板会一直显示「CLI 初始化中」。
+                    // 该字段不落盘（见 data-persistence 的字段白名单），所以每次启动都要重新标记。
+                    this.accountTokens.forEach(account => this._markCliDisabled(account))
+                    logger.info(`CLI 已关闭，${this.accountTokens.length} 个账户标记为 disabled`, 'CLI')
+                }
             }
 
             // 设置cli定时器 每天00:00:00刷新请求次数
@@ -215,14 +223,23 @@ class Account {
     }
 
     /**
+     * 标记账户的 CLI 不可用——因为 CLI 功能已关闭
+     * @param {Object} account - 账户对象
+     * @private
+     */
+    _markCliDisabled(account) {
+        account.cli_info = null
+        account.cli_unavailable_reason = 'disabled'
+    }
+
+    /**
      * 初始化CLI账户
      * @param {Object} account - 账户对象
      * @private
      */
     async _initializeCliAccount(account) {
         if (!config.cliEnabled) {
-            account.cli_info = null
-            account.cli_unavailable_reason = 'disabled'
+            this._markCliDisabled(account)
             return null
         }
         try {
