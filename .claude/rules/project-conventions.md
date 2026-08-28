@@ -2,7 +2,7 @@
 
 ## Tech Stack
 
-### Backend (DO NOT MODIFY)
+### Backend
 - Node.js 18+ (CommonJS — `require`/`module.exports`)
 - Express 4.21
 - PM2 6.x (cluster mode)
@@ -34,7 +34,7 @@
 ## Structure
 
 ```
-src/                          # Backend (Express) — DO NOT MODIFY
+src/                          # Backend (Express)
   config/index.js             # Env config parsing
   controllers/                # Route handlers (chat, models, CLI)
   middlewares/                 # Auth, chat middleware
@@ -90,5 +90,5 @@ data/                         # Runtime data (gitignored)
 - Pinia/Vuex — state is local per component
 - Component libraries (Element Plus, Vuetify, etc.) — UI is hand-crafted Tailwind
 - i18n libraries — strings are hardcoded (our goal is to translate them to Russian)
-- Backend modifications — `src/` is upstream territory
+- Large or cosmetic rewrites of `src/` — keep backend edits minimal and close to upstream to limit merge conflicts
 - Semicolons inconsistently used — follow existing file's style

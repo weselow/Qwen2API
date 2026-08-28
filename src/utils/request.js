@@ -3,7 +3,14 @@ const accountManager = require('./account.js')
 const config = require('../config/index.js')
 const { logger } = require('./logger')
 const { getSsxmodItna, getSsxmodItna2 } = require('./ssxmod-manager')
-const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./proxy-helper')
+const {
+    getProxyAgent,
+    getChatBaseUrl,
+    applyProxyToAxiosConfig,
+    getActiveEndpointIp,
+    getEndpointIpCount,
+    rotateEndpointIp
+} = require('./proxy-helper')
 const { generateUUID, getTimezoneHeader } = require('./tools.js')
 const { uploadAgentContextFile } = require('./upload.js')
 
@@ -26,6 +33,22 @@ const isRetryableNetworkError = (error) => {
 }
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+
+/**
+ * 传输失败后换一个入口 IP，并把新 agent 装回请求配置
+ * 未配置固定入口（或只配了一个 IP）时什么都不做
+ * @param {Object} requestConfig - axios 请求配置，就地修改
+ * @param {Object} [account]
+ * @param {string} baseUrl
+ * @param {string|null} usedIp - 本次失败时用的入口 IP
+ * @returns {string|null} 切换后的入口 IP；没切换返回 null
+ */
+const switchEndpointAfterFailure = (requestConfig, account, baseUrl, usedIp) => {
+    const nextIp = rotateEndpointIp(baseUrl, usedIp)
+    if (!nextIp) return null
+    applyProxyToAxiosConfig(requestConfig, account, baseUrl)
+    return nextIp
+}
 
 const HISTORY_MARKER = '# Conversation history (JSONL)'
 const CURRENT_MESSAGE_MARKER = '# Current message'
@@ -438,6 +461,7 @@ const sendChatRequest = async (body, options = {}) => {
     const totalAttempts = maxRetries + 1
 
     let lastError = null
+    let usedEndpointIp = getActiveEndpointIp(chatBaseUrl)
     for (let attempt = 1; attempt <= totalAttempts; attempt++) {
         try {
             if (attempt === 1) {
@@ -471,6 +495,9 @@ const sendChatRequest = async (body, options = {}) => {
                     `聊天请求传输错误 (尝试 ${attempt}/${totalAttempts}, code=${error.code || 'unknown'}): ${error.message}`,
                     'REQUEST'
                 )
+                // 固定入口时，传输失败很可能是这个入口本身不通 —— 换下一个再重试
+                const nextIp = switchEndpointAfterFailure(requestConfig, currentAccount, chatBaseUrl, usedEndpointIp)
+                if (nextIp) usedEndpointIp = nextIp
                 if (backoffMs > 0) {
                     await delay(backoffMs)
                 }
@@ -557,17 +584,37 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
             requestConfig.proxy = false
         }
 
-        // 对齐 chat.qwen.ai FE 0.2.81：chatId/project_id + normal 模式
-        const response_data = await axios.post(`${chatBaseUrl}/api/v2/chats/new`, {
-            chatId: '',
-            models: [model],
-            project_id: '',
-            timestamp: Date.now(),
-            chat_type: chatType || 't2t',
-            chat_mode: 'normal'
-        }, requestConfig)
+        // 建会话失败会被上层报成「无法创建或续接 Qwen 会话」，看不出是入口不通。
+        // 固定入口时多给一次机会：换一个入口再试。上限 2 次，别让建会话等太久
+        const endpointAttempts = Math.max(1, Math.min(2, getEndpointIpCount(chatBaseUrl)))
+        let usedEndpointIp = getActiveEndpointIp(chatBaseUrl)
 
-        return response_data.data?.data?.id || null
+        for (let attempt = 1; attempt <= endpointAttempts; attempt++) {
+            try {
+                // 对齐 chat.qwen.ai FE 0.2.81：chatId/project_id + normal 模式
+                const response_data = await axios.post(`${chatBaseUrl}/api/v2/chats/new`, {
+                    chatId: '',
+                    models: [model],
+                    project_id: '',
+                    timestamp: Date.now(),
+                    chat_type: chatType || 't2t',
+                    chat_mode: 'normal'
+                }, requestConfig)
+
+                return response_data.data?.data?.id || null
+            } catch (error) {
+                const nextIp = attempt < endpointAttempts && isRetryableNetworkError(error)
+                    ? switchEndpointAfterFailure(requestConfig, account, chatBaseUrl, usedEndpointIp)
+                    : null
+                if (!nextIp) {
+                    logger.error('生成chat_id失败', 'CHAT', '', error.message)
+                    return null
+                }
+                usedEndpointIp = nextIp
+            }
+        }
+
+        return null
 
     } catch (error) {
         logger.error('生成chat_id失败', 'CHAT', '', error.message)

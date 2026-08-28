@@ -110,6 +110,8 @@ AGENT_CONTEXT_LIVE_PROMPT_BYTES=49152     # 外置后仍内联保留的关键任
 QWEN_CHAT_PROXY_URL=          # 自定义 Chat API 反代URL (默认: https://chat.qwen.ai)
 QWEN_CLI_PROXY_URL=           # 自定义 CLI API 反代URL (默认: https://portal.qwen.ai)
 PROXY_URL=                    # HTTP/HTTPS/SOCKS5 代理地址 (例如: http://127.0.0.1:7890)
+QWEN_CHAT_ENDPOINT_IPS=       # 固定 chat.qwen.ai 的入口 IP，逗号分隔 (例如: 47.254.175.31,47.91.78.155)
+QWEN_CLI_ENDPOINT_IPS=        # 固定 portal.qwen.ai 的入口 IP，逗号分隔
 
 # 🗄️ 数据存储
 DATA_SAVE_MODE=none           # 数据保存模式 (none/file/redis)
@@ -140,6 +142,8 @@ CACHE_MODE=default            # 图片缓存模式 (default/file)
 | `QWEN_CHAT_PROXY_URL` | 自定义 Chat API 反代地址 | `https://your-proxy.com` |
 | `QWEN_CLI_PROXY_URL` | 自定义 CLI API 反代地址 | `https://your-cli-proxy.com` |
 | `PROXY_URL` | 出站请求代理地址，支持 HTTP/HTTPS/SOCKS5 | `http://127.0.0.1:7890` |
+| `QWEN_CHAT_ENDPOINT_IPS` | 固定 `chat.qwen.ai` 的入口 IP（逗号分隔）。阿里云按来源地区调度，部分地区拿到的入口能完成 TLS 握手却传不动数据；走代理时域名由代理解析，改 hosts 无效。配置后 TCP 连到这些 IP，域名仍用于 SNI、证书校验和 Host（等价于 `curl --connect-to`），证书校验不关闭；某个 IP 不通时自动切到下一个。留空 = 保持原行为 | `47.254.175.31,47.91.78.155` |
+| `QWEN_CLI_ENDPOINT_IPS` | 同上，用于 `portal.qwen.ai`（CLI 通道） | `47.254.175.31` |
 | `DATA_SAVE_MODE` | 数据持久化方式 | `none`/`file`/`redis` |
 | `REDIS_URL` | Redis 数据库连接地址，使用TLS加密时需使用 `rediss://` 协议 | `redis://localhost:6379` 或 `rediss://xxx.upstash.io` |
 | `BATCH_LOGIN_CONCURRENCY` | 批量添加账号时的登录并发数，可在前端系统设置中动态调整 | `5` |

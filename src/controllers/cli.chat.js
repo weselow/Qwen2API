@@ -295,7 +295,8 @@ const handleCliChatCompletion = async (req, res) => {
         req.account.cli_info.request_number++
 
         const cliBaseUrl = getCliBaseUrl()
-        const proxyAgent = getProxyAgent(req.account)
+        // 目标是 portal.qwen.ai —— 必须显式传入，否则会套用 Chat 的入口 IP
+        const proxyAgent = getProxyAgent(req.account, cliBaseUrl)
 
         // 设置请求配置
         const axiosConfig = {

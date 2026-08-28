@@ -1,5 +1,21 @@
 const dotenv = require('dotenv')
+const net = require('net')
 dotenv.config()
+
+/**
+ * 解析入口 IP 列表环境变量（逗号分隔），丢弃非法项
+ * 用于绕过按地理位置调度的 DNS：域名仍然用于 SNI / 证书校验 / Host，
+ * 只有 TCP 连接的目标地址被替换成这里给出的 IP
+ * @param {string|undefined} raw
+ * @returns {string[]}
+ */
+const parseEndpointIps = (raw) => {
+    if (!raw) return []
+    return raw
+        .split(',')
+        .map(ip => ip.trim())
+        .filter(ip => ip.length > 0 && net.isIP(ip) !== 0)
+}
 
 /**
  * 解析API_KEY环境变量，支持逗号分隔的多个key
@@ -46,6 +62,10 @@ const config = {
     // 自定义反代URL配置
     qwenChatProxyUrl: process.env.QWEN_CHAT_PROXY_URL || "https://chat.qwen.ai",
     qwenCliProxyUrl: process.env.QWEN_CLI_PROXY_URL || "https://portal.qwen.ai",
+    // 入口 IP 固定：阿里云按来源地区返回不同的入口，俄罗斯方向拿到的 8.209.x
+    // 能握手但传不动数据。留空 = 保持原行为（按 DNS 结果连接）
+    qwenChatEndpointIps: parseEndpointIps(process.env.QWEN_CHAT_ENDPOINT_IPS),
+    qwenCliEndpointIps: parseEndpointIps(process.env.QWEN_CLI_ENDPOINT_IPS),
     // 代理配置
     proxyUrl: process.env.PROXY_URL || null,
     // CLI 账户初始化开关（OAuth 设备授权流程需要人工确认，默认关闭避免初始化失败刷屏）

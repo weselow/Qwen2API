@@ -53,3 +53,13 @@ services:
       # 图片缓存
       # Image cache mode (default: memory / file: disk)
       - CACHE_MODE=default
+      # 入口 IP 固定（逗号分隔，留空 = 保持原行为）
+      # 某些地区的 DNS 会返回能握手但传不动数据的入口。配置后 TCP 连到这些 IP，
+      # 域名仍用于 SNI / 证书校验 / Host（等价于 curl --connect-to），证书校验不关闭
+      # Pin the entry-point IP (comma-separated; empty = unchanged behaviour).
+      # Some regions get an entry point that completes the TLS handshake but then
+      # stalls. When set, the TCP connection goes to these IPs while the hostname
+      # is still used for SNI, certificate verification and Host.
+      # 示例 / Example: QWEN_CHAT_ENDPOINT_IPS=47.254.175.31,47.91.78.155
+      - QWEN_CHAT_ENDPOINT_IPS=
+      - QWEN_CLI_ENDPOINT_IPS=

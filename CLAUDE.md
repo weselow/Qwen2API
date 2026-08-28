@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Форк [Qwen2API](https://github.com/Rfym21/Qwen2API) — прокси-сервис, преобразующий chat.qwen.ai и Qwen Code CLI в OpenAI-совместимый API. Наша цель — русификация dashboard UI. Backend не трогаем.
+Форк [Qwen2API](https://github.com/Rfym21/Qwen2API) — прокси-сервис, преобразующий chat.qwen.ai и Qwen Code CLI в OpenAI-совместимый API. Начинали с русификации dashboard UI, сейчас правим и backend.
 
 ## Tech Stack
 
@@ -14,7 +14,7 @@
 ## Структура
 
 ```
-src/                     # Backend (Express) — НЕ ТРОГАТЬ
+src/                     # Backend (Express)
 public/                  # Frontend (Vue 3 SPA)
   src/
     App.vue              # Корневой компонент (видео-фон)
@@ -46,6 +46,6 @@ git merge upstream/main
 
 ## Правила
 
-- Не менять backend-логику (`src/`) — только frontend (`public/src/`)
+- Правки в `src/` держать минимальными: чем ближе к upstream, тем меньше конфликтов при слиянии
 - При обновлении upstream — проверить новые строки в views
 - Отвечать пользователю на русском языке

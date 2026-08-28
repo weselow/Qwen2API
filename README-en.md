@@ -107,6 +107,8 @@ MODELS_CACHE_TTL=3600         # Model list cache TTL in seconds, 0=never expires
 QWEN_CHAT_PROXY_URL=          # Custom Chat API reverse proxy URL (default: https://chat.qwen.ai)
 QWEN_CLI_PROXY_URL=           # Custom CLI API reverse proxy URL (default: https://portal.qwen.ai)
 PROXY_URL=                    # HTTP/HTTPS/SOCKS5 proxy address (example: http://127.0.0.1:7890)
+QWEN_CHAT_ENDPOINT_IPS=       # Pin the chat.qwen.ai entry-point IPs, comma-separated (example: 47.254.175.31,47.91.78.155)
+QWEN_CLI_ENDPOINT_IPS=        # Same for portal.qwen.ai
 
 # 🗄️ Data Storage
 DATA_SAVE_MODE=none           # Data save mode (none/file/redis)
@@ -136,6 +138,8 @@ CACHE_MODE=default            # Image cache mode (default/file)
 | `QWEN_CHAT_PROXY_URL` | Custom Chat API reverse proxy address | `https://your-proxy.com` |
 | `QWEN_CLI_PROXY_URL` | Custom CLI API reverse proxy address | `https://your-cli-proxy.com` |
 | `PROXY_URL` | Outbound request proxy address, supports HTTP/HTTPS/SOCKS5 | `http://127.0.0.1:7890` |
+| `QWEN_CHAT_ENDPOINT_IPS` | Pinned entry-point IPs for `chat.qwen.ai`, comma-separated. Alibaba resolves the name by the caller's region, and some regions get an entry point that completes the TLS handshake but never delivers data. Over an HTTP proxy the name is resolved by the proxy itself, so a `hosts` entry does not help. When set, the TCP connection goes to these addresses while the hostname is still used for SNI, certificate verification and the `Host` header (same as `curl --connect-to`); certificate verification stays on, and an unreachable address is replaced by the next one in the list. Empty = unchanged behaviour | `47.254.175.31,47.91.78.155` |
+| `QWEN_CLI_ENDPOINT_IPS` | Same for `portal.qwen.ai` (the CLI channel) | `47.254.175.31` |
 | `DATA_SAVE_MODE` | Data persistence method | `none`/`file`/[redis](file://d:\Code\Qwen2API\src\utils\logger.js#L294-L296) |
 | `REDIS_URL` | Redis database connection address, use `rediss://` protocol when using TLS encryption | `redis://localhost:6379` or `rediss://xxx.upstash.io` |
 | `BATCH_LOGIN_CONCURRENCY` | Login concurrency during batch account addition, can be adjusted dynamically in frontend system settings | `5` |
