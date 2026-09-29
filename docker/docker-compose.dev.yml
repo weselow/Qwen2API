@@ -18,10 +18,6 @@ services:
       - API_KEY=sk-123456
       # Listen address (optional)
       - LISTEN_ADDRESS=
-      # PM2 multi-process: max (all cores), number, or 1 (single)
-      - PM2_INSTANCES=1
-      # PM2 memory limit — process restarts when exceeded
-      - PM2_MAX_MEMORY=1G
       # Search info display mode (table / text)
       - SEARCH_INFO_MODE=table
       # Whether to output the thinking process
