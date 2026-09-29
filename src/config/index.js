@@ -1,36 +1,30 @@
 const dotenv = require('dotenv')
-const net = require('net')
 dotenv.config()
-
-/**
- * 解析入口 IP 列表环境变量（逗号分隔），丢弃非法项
- * 用于绕过按地理位置调度的 DNS：域名仍然用于 SNI / 证书校验 / Host，
- * 只有 TCP 连接的目标地址被替换成这里给出的 IP
- * @param {string|undefined} raw
- * @returns {string[]}
- */
-const parseEndpointIps = (raw) => {
-    if (!raw) return []
-    return raw
-        .split(',')
-        .map(ip => ip.trim())
-        .filter(ip => ip.length > 0 && net.isIP(ip) !== 0)
-}
 
 /**
  * 解析API_KEY环境变量，支持逗号分隔的多个key
  * @returns {Object} 包含apiKeys数组和adminKey的对象
  */
-const parseApiKeys = () => {
-    const apiKeyEnv = process.env.API_KEY
+const parseApiKeys = (apiKeyEnv = process.env.API_KEY) => {
     if (!apiKeyEnv) {
         return { apiKeys: [], adminKey: null }
     }
 
-    const keys = apiKeyEnv.split(',').map(key => key.trim()).filter(key => key.length > 0)
+    const slots = apiKeyEnv.split(',').map(key => key.trim())
+    // 空槽位 = 变量没展开（`API_KEY=${A},${B}` 里 A 未定义就变成 `,B`）。旧代码把空槽
+    // 过滤掉照常启动：admin key 静默变成了后面那个客户端 key，dashboard 用真正的 admin
+    // key 反而报 "invalid"。2026-09-16 qwen-next 就是这样丢掉后台访问的。没人会故意写
+    // 出空槽，所以这里直接拒绝启动，而不是带着残缺的密钥表跑下去。
+    const emptyAt = slots.map((key, index) => (key.length === 0 ? index + 1 : 0)).filter(Boolean)
+    if (emptyAt.length > 0) {
+        throw new Error(
+            `API_KEY 有 ${emptyAt.length} 个空槽位（第 ${emptyAt.join('、')} 位，共 ${slots.length} 位）——` +
+            '多半是环境变量没有展开。请检查部署时是否注入了全部密钥（例如 compose 的 ${...} 是否有值）。'
+        )
+    }
     return {
-        apiKeys: keys,
-        adminKey: keys.length > 0 ? keys[0] : null
+        apiKeys: slots,
+        adminKey: slots.length > 0 ? slots[0] : null
     }
 }
 
@@ -42,6 +36,8 @@ const config = {
     adminKey: adminKey,
     batchLoginConcurrency: Math.max(1, parseInt(process.env.BATCH_LOGIN_CONCURRENCY) || 5),
     simpleModelMap: process.env.SIMPLE_MODEL_MAP === 'true' ? true : false,
+    // 入站模型名映射原文：alias=target,...,*=fallback（见 src/utils/model-map.js，每次请求重新解析）
+    modelMap: process.env.MODEL_MAP || '',
     // 模型列表缓存有效期（秒），过期后下次请求自动刷新；0 = 永不过期（旧版行为）
     modelsCacheTtl: process.env.MODELS_CACHE_TTL !== undefined ? Math.max(0, parseInt(process.env.MODELS_CACHE_TTL, 10) || 0) : 3600,
     listenAddress: process.env.LISTEN_ADDRESS || null,
@@ -62,10 +58,6 @@ const config = {
     // 自定义反代URL配置
     qwenChatProxyUrl: process.env.QWEN_CHAT_PROXY_URL || "https://chat.qwen.ai",
     qwenCliProxyUrl: process.env.QWEN_CLI_PROXY_URL || "https://portal.qwen.ai",
-    // 入口 IP 固定：阿里云按来源地区返回不同的入口，俄罗斯方向拿到的 8.209.x
-    // 能握手但传不动数据。留空 = 保持原行为（按 DNS 结果连接）
-    qwenChatEndpointIps: parseEndpointIps(process.env.QWEN_CHAT_ENDPOINT_IPS),
-    qwenCliEndpointIps: parseEndpointIps(process.env.QWEN_CLI_ENDPOINT_IPS),
     // 代理配置
     proxyUrl: process.env.PROXY_URL || null,
     // CLI 账户初始化开关（OAuth 设备授权流程需要人工确认，默认关闭避免初始化失败刷屏）
@@ -79,6 +71,19 @@ const config = {
         6,
         Math.max(2, parseInt(process.env.AGENT_TURN_MAX_ATTEMPTS, 10) || 3)
     ),
+    // Anthropic 与 OpenAI 两条路径共用：一轮 attempt 里文本通道工具调用的上限（默认 24，钳在 4..256）。
+    // 模型在叙述的 [TOOL CALL] 之后失控（同一调用重复上百次 / 幻想整段 agent 会话）时，
+    // 第 N 个已放行的调用之后立刻终止上游；非数字按默认处理，越界钳位而非回退默认。
+    agentTurnMaxToolCalls: (() => {
+        const raw = parseInt(process.env.AGENT_TURN_MAX_TOOL_CALLS, 10)
+        return Number.isFinite(raw) ? Math.min(256, Math.max(4, raw)) : 24
+    })(),
+    // 面向 Anthropic 风格客户端的回合门禁放宽开关，默认关闭，严格模式行为不变。
+    // Anthropic Messages API 允许同一条 assistant 消息同时携带 text 与 tool_use，
+    // 所以一个完全合规的 Anthropic 客户端在严格模式下反而会被判为无效回合。
+    agentTurnAllowProseWithTools: process.env.AGENT_TURN_ALLOW_PROSE_WITH_TOOLS === 'true',
+    // 把没有 <agent_final> 包装但确有可见正文的回合视为正常结束，而不是 bare。
+    agentTurnAcceptBareFinal: process.env.AGENT_TURN_ACCEPT_BARE_FINAL === 'true',
     // chat.qwen.ai 的 WAF 会在 JSON 请求体接近 128 KiB 时返回 captcha。
     // 提前把 Agent 全量历史外置成文本文档，给协议头和当前回合留出安全余量。
     agentContextFileThresholdBytes: Math.max(
@@ -88,7 +93,68 @@ const config = {
     agentContextLivePromptBytes: Math.max(
         8 * 1024,
         parseInt(process.env.AGENT_CONTEXT_LIVE_PROMPT_BYTES, 10) || 48 * 1024
+    ),
+    // Presupuesto del fallback cuando el adjunto falla y la peticion NO lleva tools
+    // (con tools no se compacta: se responde 529/503 reintentable). Mas holgado que el
+    // live prompt porque aqui no hay adjunto que complete el resto.
+    agentContextFallbackPromptBytes: Math.max(
+        8 * 1024,
+        parseInt(process.env.AGENT_CONTEXT_FALLBACK_PROMPT_BYTES, 10) || 84 * 1024
+    ),
+    // Cortacircuitos del parse de adjuntos (src/utils/upload.js): tras 3 desafios WAF
+    // seguidos no se sube nada durante estos segundos y el 529 lleva ese Retry-After.
+    // 0 lo desactiva.
+    agentParseBreakerSeconds: (() => {
+        const raw = parseInt(process.env.AGENT_PARSE_BREAKER_SECONDS, 10)
+        return Number.isFinite(raw) && raw >= 0 ? raw : 300
+    })(),
+    // Cortacircuitos del chat challenge (src/utils/upstream-error.js): tras 3 desafios
+    // seguidos a la generacion no se envia nada durante estos segundos; luego sale una
+    // sola sonda. 0 lo desactiva.
+    chatChallengeBreakerSeconds: (() => {
+        const raw = parseInt(process.env.CHAT_CHALLENGE_BREAKER_SECONDS, 10)
+        return Number.isFinite(raw) && raw >= 0 ? raw : 60
+    })(),
+    // Limitador de ritmo del parse (src/utils/upload.js): como maximo MAX upload+parse por
+    // ventana de WINDOW segundos por proceso; el resto recibe 529 con Retry-After corto
+    // ANTES de que el WAF (que cuenta por IP) empiece a desafiar. Medido 2026-09-10:
+    // 10 en 150 s disparan el desafio. MAX = 0 lo desactiva.
+    agentParseMaxPerWindow: (() => {
+        const raw = parseInt(process.env.AGENT_PARSE_MAX_PER_WINDOW, 10)
+        return Number.isFinite(raw) && raw >= 0 ? raw : 6
+    })(),
+    agentParseWindowSeconds: (() => {
+        const raw = parseInt(process.env.AGENT_PARSE_WINDOW_SECONDS, 10)
+        return Number.isFinite(raw) && raw > 0 ? raw : 120
+    })(),
+    // Reutilizacion del prefijo de historial entre turnos (src/utils/context-prefix-cache.js):
+    // el historial ya subido y parseado viaja como el mismo adjunto y solo la cola nueva va
+    // inline — un parse cada 3-10 turnos en vez de uno por turno. 'false' lo apaga.
+    agentContextPrefixReuse: process.env.AGENT_CONTEXT_PREFIX_REUSE !== 'false',
+    // Vida ABSOLUTA de una entrada (desde que se subio). Un file_id caducado en Qwen no da
+    // error: el modelo contesta sin el adjunto (medido 2026-09-10), asi que el TTL es la
+    // unica cota contra un historial fantasma.
+    agentContextPrefixTtlSeconds: (() => {
+        const raw = parseInt(process.env.AGENT_CONTEXT_PREFIX_TTL_SECONDS, 10)
+        return Number.isFinite(raw) && raw > 0 ? raw : 1800
+    })(),
+    agentContextPrefixMaxEntries: (() => {
+        const raw = parseInt(process.env.AGENT_CONTEXT_PREFIX_MAX_ENTRIES, 10)
+        return Number.isFinite(raw) && raw > 0 ? raw : 200
+    })(),
+    // Antidetect Tier 1: per-account fingerprint & header diversity.
+    // Set to 'false' to instantly roll back to legacy static headers.
+    antidetectTier1Enabled: process.env.ANTIDETECT_TIER1_ENABLED !== 'false',
+    // Anthropic SSE `ping` cadence during upstream silence. Lower it if a client
+    // or reverse proxy gives up sooner than this; the compensation retry can hold
+    // the stream for tens of seconds with nothing else to send.
+    anthropicPingIntervalMs: Math.max(
+        1000,
+        parseInt(process.env.ANTHROPIC_PING_INTERVAL_MS, 10) || 15000
     )
 }
+
+// 暴露解析器本身以便测试空槽位的拒绝逻辑（config 对象是模块级单例，无法重复解析）。
+config.parseApiKeys = parseApiKeys
 
 module.exports = config

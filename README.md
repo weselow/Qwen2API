@@ -4,8 +4,8 @@
 
 # 🚀 Qwen-Proxy
 
-[![Version](https://img.shields.io/badge/version-2026.04.29.23.45-blue.svg)](https://github.com/Rfym21/Qwen2API)
-[![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
+[![Version](https://img.shields.io/badge/version-26.09.11.16.00-blue.svg)](https://github.com/Rfym21/Qwen2API)
+[![Bun](https://img.shields.io/badge/Bun-1.3.14+-green.svg)](https://bun.sh/)
 [![Docker](https://img.shields.io/badge/Docker-supported-blue.svg)](https://hub.docker.com/r/rfym21/qwen2api)
 
 [🔗 加入交流群](https://t.me/nodejs_project) | [📖 文档](#api-文档) | [🐳 Docker 部署](#docker-部署)
@@ -37,7 +37,7 @@ Qwen-Proxy 是一个将 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli` 转换
 
 **优先级：** `account.proxy` > 全局 `PROXY_URL` > 不使用代理
 
-**支持的代理协议：** HTTP / HTTPS / SOCKS5（与 `PROXY_URL` 一致）
+**支持的代理协议：** HTTP / HTTPS / SOCKS5 / SOCKS5H（与 `PROXY_URL` 一致）
 
 **前端配置（推荐）：**
 打开管理面板 → 添加账号时填写 "代理地址" 字段，或在已有账号卡片上点击 "修改代理" 按钮。
@@ -74,7 +74,8 @@ ACCOUNTS=user1@mail.com:pass1|http://10.0.0.1:8080,user2@mail.com:pass2|socks5:/
 
 ### 环境要求
 
-- Node.js 18+ (源码部署时需要)
+- Bun 1.3.14+ (源码部署时需要，Docker 固定使用 1.3.14)
+- Node.js 24+ (仅开发时运行现有回归测试及 lint，生产镜像不需要)
 - Docker (可选)
 - Redis (可选，用于数据持久化)
 
@@ -91,11 +92,6 @@ SERVICE_PORT=3000             # 服务端口
 API_KEY=sk-123456,sk-456789   # API 密钥 (必填，支持多密钥)
 ACCOUNTS=                     # 账户配置 (格式: user1:pass1[|proxy_url],user2:pass2[|proxy_url])
 
-# 🚀 PM2 多进程配置
-PM2_INSTANCES=1               # PM2进程数量 (1/数字/max)
-PM2_MAX_MEMORY=1G             # PM2内存限制 (100M/1G/2G等)
-                              # 注意: PM2集群模式下所有进程共用同一个端口
-
 # 🔍 功能配置
 SEARCH_INFO_MODE=table        # 搜索信息展示模式 (table/text)
 OUTPUT_THINK=true             # 是否输出思考过程 (true/false)
@@ -103,15 +99,16 @@ LEGACY_REASONING_IN_CONTENT=false # 推理输出格式，false=reasoning_content
 SIMPLE_MODEL_MAP=false        # 简化模型映射 (true/false)
 MODELS_CACHE_TTL=3600         # 模型列表缓存有效期（秒），0=永不过期
 AGENT_TURN_MAX_ATTEMPTS=3     # 单个 Agent 回合生成有效工具调用/最终态的最大尝试数（2-6）
+AGENT_TURN_MAX_TOOL_CALLS=24  # Anthropic 路径单轮文本通道 tool_use 上限（4-256），到数即截断上游
+AGENT_TURN_ALLOW_PROSE_WITH_TOOLS=false  # 允许工具调用回合同时带可见正文（Anthropic 客户端）
+AGENT_TURN_ACCEPT_BARE_FINAL=false       # 允许没有 <agent_final> 包装的可见正文作为正常结束
 AGENT_CONTEXT_FILE_THRESHOLD_BYTES=92160 # 超过阈值时外置完整 Agent 上下文
 AGENT_CONTEXT_LIVE_PROMPT_BYTES=49152     # 外置后仍内联保留的关键任务状态大小
 
 # 🌐 代理与反代配置
 QWEN_CHAT_PROXY_URL=          # 自定义 Chat API 反代URL (默认: https://chat.qwen.ai)
 QWEN_CLI_PROXY_URL=           # 自定义 CLI API 反代URL (默认: https://portal.qwen.ai)
-PROXY_URL=                    # HTTP/HTTPS/SOCKS5 代理地址 (例如: http://127.0.0.1:7890)
-QWEN_CHAT_ENDPOINT_IPS=       # 固定 chat.qwen.ai 的入口 IP，逗号分隔 (例如: 47.254.175.31,47.91.78.155)
-QWEN_CLI_ENDPOINT_IPS=        # 固定 portal.qwen.ai 的入口 IP，逗号分隔
+PROXY_URL=                    # HTTP/HTTPS/SOCKS5/SOCKS5H 代理地址 (例如: http://127.0.0.1:7890)
 
 # 🗄️ 数据存储
 DATA_SAVE_MODE=none           # 数据保存模式 (none/file/redis)
@@ -129,21 +126,21 @@ CACHE_MODE=default            # 图片缓存模式 (default/file)
 | `LISTEN_ADDRESS` | 服务监听地址 | `localhost` 或 `0.0.0.0` |
 | `SERVICE_PORT` | 服务运行端口 | `3000` |
 | `API_KEY` | API 访问密钥，支持多密钥配置。第一个为管理员密钥（可访问前端管理页面），其他为普通密钥（仅可调用API）。多个密钥用逗号分隔 | `sk-admin123,sk-user456,sk-user789` |
-| `PM2_INSTANCES` | PM2进程数量 | `1`/`4`/`max` |
-| `PM2_MAX_MEMORY` | PM2内存限制 | `100M`/`1G`/`2G` |
 | `SEARCH_INFO_MODE` | 搜索结果展示格式 | `table` 或 `text` |
 | `OUTPUT_THINK` | 是否显示 AI 思考过程 | `true` 或 `false` |
 | `LEGACY_REASONING_IN_CONTENT` | 推理输出格式。默认 `false`=推理走独立的 `reasoning_content` 字段；`true`=旧版行为（`<think>` 并入 `content`） | `true` 或 `false` |
 | `SIMPLE_MODEL_MAP` | 简化模型映射，只返回基础模型不包含变体 | `true` 或 `false` |
+| `MODEL_MAP` | 入站模型名映射：`alias=qwen-id,...,*=fallback`。精确匹配优先（末尾 `[..]` 先去掉、不区分大小写），上游已有的 Qwen id 原样透传，其余走 `*`；只作用于 `/v1/chat/completions` 与 `/v1/messages`。也可在管理面板「系统设置 → 模型映射」里在线编辑，面板保存的映射优先于本变量；详见 `.env.example` | `*=qwen3.8-max-thinking` |
 | `MODELS_CACHE_TTL` | 模型列表缓存有效期（秒），过期后下次请求自动向上游刷新；`0` 表示永不过期 | `3600` |
+| `AGENT_TURN_ALLOW_PROSE_WITH_TOOLS` | 放宽回合门禁：允许同一回合既有有效工具调用又有可见正文。Anthropic Messages API 允许 `text` 与 `tool_use` 共存，Claude Code 等客户端因此会被严格模式反复判为 `invalid_tool_call` | `false` |
+| `AGENT_TURN_ACCEPT_BARE_FINAL` | 放宽回合门禁：把有可见正文但缺少 `<agent_final>` 包装的回合按 `finish_reason=stop` 接受，而不是判为 `bare` 并重试 | `false` |
 | `AGENT_TURN_MAX_ATTEMPTS` | 工具请求在一次 HTTP 回合内生成有效 `tool_calls`、明确完成态或阻塞态的最大尝试数；范围 2–6，耗尽后非流式请求返回 HTTP 429/503，SSE 请求返回显式错误帧，绝不伪装成正常 `stop` | `3` |
+| `AGENT_TURN_MAX_TOOL_CALLS` | Anthropic 路径：一轮 Agent 回合里文本通道 `tool_use` 的上限（4–256）。模型在叙述的 `[TOOL CALL]` 之后失控（同一调用重复上百次、幻想整段会话）时，第 N 个已放行的调用之后立刻终止上游，已放行的调用以 `stop_reason=tool_use` 交付；更早的 delta 里已放行过调用之后再出现重复、被拒绝的调用或正文/思考同样截断 | `24` |
 | `AGENT_CONTEXT_FILE_THRESHOLD_BYTES` | Agent 请求体超过此大小时，将完整工具定义和历史自动外置为 Qwen 文本文档，避免触发约 128 KiB 的 WAF 限制 | `92160`（90 KiB） |
 | `AGENT_CONTEXT_LIVE_PROMPT_BYTES` | 上下文外置后，实时请求中保留的工具协议、system/developer 指令、原始任务、最近工具进度和当前结果的最大大小 | `49152`（48 KiB） |
 | `QWEN_CHAT_PROXY_URL` | 自定义 Chat API 反代地址 | `https://your-proxy.com` |
 | `QWEN_CLI_PROXY_URL` | 自定义 CLI API 反代地址 | `https://your-cli-proxy.com` |
-| `PROXY_URL` | 出站请求代理地址，支持 HTTP/HTTPS/SOCKS5 | `http://127.0.0.1:7890` |
-| `QWEN_CHAT_ENDPOINT_IPS` | 固定 `chat.qwen.ai` 的入口 IP（逗号分隔）。阿里云按来源地区调度，部分地区拿到的入口能完成 TLS 握手却传不动数据；走代理时域名由代理解析，改 hosts 无效。配置后 TCP 连到这些 IP，域名仍用于 SNI、证书校验和 Host（等价于 `curl --connect-to`），证书校验不关闭；某个 IP 不通时自动切到下一个。留空 = 保持原行为 | `47.254.175.31,47.91.78.155` |
-| `QWEN_CLI_ENDPOINT_IPS` | 同上，用于 `portal.qwen.ai`（CLI 通道） | `47.254.175.31` |
+| `PROXY_URL` | 出站请求代理地址，支持 HTTP/HTTPS/SOCKS5/SOCKS5H | `http://127.0.0.1:7890` |
 | `DATA_SAVE_MODE` | 数据持久化方式 | `none`/`file`/`redis` |
 | `REDIS_URL` | Redis 数据库连接地址，使用TLS加密时需使用 `rediss://` 协议 | `redis://localhost:6379` 或 `rediss://xxx.upstash.io` |
 | `BATCH_LOGIN_CONCURRENCY` | 批量添加账号时的登录并发数，可在前端系统设置中动态调整 | `5` |
@@ -249,32 +246,91 @@ git clone https://github.com/Rfym21/Qwen2API.git
 cd Qwen2API
 
 # 安装依赖
-npm install
+bun install --frozen-lockfile
+bun install --cwd public --frozen-lockfile
+bun run build:frontend
 
 # 配置环境变量
 cp .env.example .env
 # 编辑 .env 文件
 
-# 智能启动 (推荐 - 自动判断单进程/多进程)
-npm start
+# Bun 单进程启动
+bun run start
 
 # 开发模式
-npm run dev
+bun run dev
 ```
 
-### 🚀 PM2 多进程部署
+### 运行与验证
 
-使用 PM2 进行生产环境多进程部署，提供更好的性能和稳定性。
+服务使用 Bun 单进程运行，已移除 PM2 和自动 cluster 启动。旧的
+`PM2_INSTANCES`、`PM2_MAX_MEMORY` 不再生效。容器重启由 Compose 的
+`restart: always` 管理；内存上限可使用 Compose 的 `mem_limit` 配置。
+账户统计、限流和运行时设置含进程内状态，多副本部署前需要先解决共享与同步。
 
-**重要说明**: PM2 集群模式下，所有进程共用同一个端口，PM2 会自动进行负载均衡。
+`bun run test` 保留 Node 测试运行器，以继续执行原有回归测试；
+`bun run test:bun` 则启动真实 Bun 服务和本地模拟上游，检查登录、前端、WASM
+及 OpenAI/Anthropic 的 JSON 和 SSE 响应，不使用真实账户。
+默认以源码运行，也可使用 `node src/server.js` 临时对照验证。
 
-### 🤖 智能启动模式
+### 独立二进制
 
-使用 `npm start` 可以自动判断启动方式：
+```bash
+# 当前系统/架构；自动构建前端，输出到 pkg_dist/
+bun run build:binary
 
-- 当 `PM2_INSTANCES=1` 时，使用单进程模式
-- 当 `PM2_INSTANCES>1` 时，使用 Node.js 集群模式
-- 自动限制进程数不超过 CPU 核心数
+# 可选：交叉编译 Linux x64（Alpine 使用 bun-linux-x64-musl）
+bun run build:binary --target bun-linux-x64
+
+# Windows 产物的隔离验证
+bun run test:bun --binary pkg_dist/qwen2api-windows-x64.exe
+```
+
+可执行文件内含 Bun 运行时、后端、前端静态资源和 tiktoken WASM，无需另装
+Node、Bun 或 node_modules。Windows x64 产物为 `pkg_dist/qwen2api-windows-x64.exe`。
+目标系统必须与编译目标一致；交叉编译完成不代表已在该系统验证。
+
+启动前进入一个可写目录，在该目录配置 `.env`（或直接设置环境变量），再运行可执行文件。
+`.env` 和账户凭据不会打包进产物。二进制默认将 `data/`、`logs/`、`caches/`
+放在当前工作目录；可用 `QWEN2API_RUNTIME_DIR` 指定其他可写根目录。
+`--version` 可查看版本，不会启动服务。Docker 使用 Alpine + musl 二进制，
+不再复制源码、node_modules 或单独的 Bun CLI。
+
+### CI 与发布工作流
+
+- `ci.yml`：推送和 PR 调用验证流程，只上传 Actions artifacts，不发布。
+- `verify.yml`：可复用验证。Node 24 执行 lint 与完整回归，Bun 版本取自
+  `package.json` 的 `packageManager`；前端只构建一次。Windows x64、Linux x64/arm64
+  在各自原生 runner 编译并测试二进制，Linux 额外测试实际的 Alpine 容器。
+- `release.yml`：仅监听 `main` 的 `package.json`。比较推送前后的 `version`，
+  未变化就跳过产物构建和发布；新建分支没有比较基准时也跳过，可手动构建。
+  普通源码提交、PR、标签推送均不触发发布。
+
+手动操作：Actions → Release → Run workflow。不勾选 `publish` 只验证并生成 artifacts；
+勾选后只允许从 `main` 发布，且仍必须完整通过验证。
+
+发布产物为 Windows x64、Linux x64/arm64 的 `.tar.gz`（可执行文件、`.env.example`、
+运行说明）和 `SHA256SUMS`，以及 `linux/amd64`、`linux/arm64` 多架构 Docker 镜像。
+Linux 下载包为 glibc 版，Docker 为 musl 版。发布直接加载验证任务导出的镜像，
+不重新构建；自动生成 `v<version>` 标签。只有 main 仍为同一版本、且发布提交仍在
+main 历史中时才更新 `latest`，后续普通文档提交不会阻止更新。
+
+首次启用需要配置 `DOCKERHUB_USERNAME`、`DOCKERHUB_TOKEN` secrets，并确保 Docker Hub
+目标仓库可写。发布使用 `release` environment，可设置 main 分支限制和人工审批；
+只有发布 job 具有 `contents: write` 权限，其他验证任务不接触发布凭据。
+
+已发布版本不能覆盖。Git 标签或 Docker 版本标签指向其他提交时，必须提升版本号。
+中途失败会保留草稿，允许在同一提交上重跑；多个外部服务的发布不是原子事务，
+失败时可能已出现部分镜像标签。当前版本曾发布过旧镜像，首次正式发布应使用新版本。
+发布 job 使用 GitHub 的 `queue: max` 保留等待任务（最多 100 个），不会因新的
+普通 package.json 提交而替换掉待发布版本。验证任务可以并行，发布阶段串行执行。
+
+本地构建二进制镜像仍可直接运行：
+```bash
+docker build -f docker/Dockerfile -t qwen2api:local .
+# Linux 上测试实际容器（使用本地模拟上游，不使用真实账户）
+bun run test:bun --docker-image qwen2api:local
+```
 
 ### ☁️ Hugging Face 部署
 
@@ -289,6 +345,8 @@ npm run dev
 ### ☁️ Vercel 部署
 
 快速部署到 Vercel：
+
+此平台入口仍保留 Node/Express 兼容方式；Bun 运行时迁移适用于本地和 Docker。
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FRfym21%2FQwen2API)
 
@@ -308,7 +366,7 @@ DATA_SAVE_MODE=none
 ```
 Qwen2API/
 ├── README.md
-├── ecosystem.config.js              # PM2配置文件
+├── bun.lock                         # Bun依赖锁文件
 ├── package.json
 │
 ├── docker/                          # Docker配置目录
@@ -325,7 +383,6 @@ Qwen2API/
 │
 ├── src/                             # 后端源代码目录
 │   ├── server.js                    # 主服务器文件
-│   ├── start.js                     # 智能启动脚本 (自动判断单进程/多进程)
 │   ├── config/
 │   │   └── index.js                 # 配置文件
 │   ├── controllers/                 # 控制器目录

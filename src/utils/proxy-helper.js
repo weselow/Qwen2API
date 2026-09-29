@@ -1,23 +1,172 @@
-const config = require('../config/index.js')
-const dns = require('dns')
-const net = require('net')
-const https = require('https')
-const { HttpsProxyAgent } = require('https-proxy-agent')
-const { logger } = require('./logger')
+const { once } = require('node:events');
+const { STATUS_CODES } = require('node:http');
+const { isIP } = require('node:net');
+const { PassThrough } = require('node:stream');
+const { checkServerIdentity } = require('node:tls');
+const axios = require('axios');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const { SocksProxyAgent } = require('socks-proxy-agent');
+// The explicit entry bypasses Bun's built-in undici shim, which ignores custom sockets.
+const { Agent, Pool, ProxyAgent, errors, interceptors, request: proxyRequest } = require('undici/index.js');
 
-// agent 缓存。key = `${代理URL|direct}|${固定入口的域名|-}|${固定入口的IP|-}`
-// 域名和 IP 必须进 key：同一个代理在不同入口 IP 下需要不同的 agent，
-// 否则切换入口后旧 agent 仍然握着连向坏入口的 socket
+const config = require('../config/index.js');
+const { logger } = require('./logger');
+
+// Per-account agent cache keyed by `${proxyUrl}::${email}`.
+// LRU eviction when cache exceeds MAX_AGENT_CACHE_SIZE.
 const proxyAgents = new Map()
-
-// 接受 http/https/socks5 协议；正则故意宽松，仅拦截最常见的拼写错误
-// （缺少协议、错误协议如 'htp://'），不强制 host 形态以免拒绝合法的
-// 含用户名/密码、IPv6、自定义路径的代理 URL
-const PROXY_URL_REGEX = /^(https?|socks5):\/\/[^\s]+$/i
+const MAX_AGENT_CACHE_SIZE = 50
+const PROXY_CONNECT_TIMEOUT_MS = 10_000;
+const proxyUrls = new WeakMap();
+const proxyTransports = new WeakMap();
+// undici transport failures mapped onto the codes request.js already retries / cools down on.
+const UNDICI_ERROR_CODES = {
+    UND_ERR_SOCKET: 'ECONNRESET',
+    UND_ERR_CONNECT_TIMEOUT: 'ETIMEDOUT',
+    UND_ERR_HEADERS_TIMEOUT: 'ECONNABORTED',
+    UND_ERR_BODY_TIMEOUT: 'ECONNABORTED',
+    UND_ERR_ABORTED: 'ERR_CANCELED'
+};
 
 /**
- * 校验代理 URL 格式
- * 空值（null/undefined/空字符串）视为合法（表示"无账号级代理"）
+ * Reuse the account's SOCKS/CONNECT implementation with an HTTP client that honors sockets.
+ */
+const getProxyTransport = (proxyAgent) => {
+    let transport = proxyTransports.get(proxyAgent);
+    if (transport) return transport;
+
+    const dispatcher = proxyAgent instanceof HttpsProxyAgent ? new ProxyAgent({
+        uri: proxyAgent.proxy.href,
+        token: proxyAgent.proxy.username || proxyAgent.proxy.password
+            ? `Basic ${Buffer.from(`${decodeURIComponent(proxyAgent.proxy.username)}:${decodeURIComponent(proxyAgent.proxy.password)}`).toString('base64')}`
+            : undefined,
+        requestTls: { ...proxyAgent.options, timeout: PROXY_CONNECT_TIMEOUT_MS },
+        proxyTls: { ...proxyAgent.connectOpts, timeout: PROXY_CONNECT_TIMEOUT_MS },
+        clientFactory: (origin, options) => new Pool(origin, { ...options, headersTimeout: PROXY_CONNECT_TIMEOUT_MS })
+    }) : new Agent({
+        connect: async (options, callback) => {
+            let socket;
+            try {
+                const secureEndpoint = options.protocol === 'https:';
+                const targetHostname = options.servername || options.hostname;
+                const connector = new SocksProxyAgent(proxyUrls.get(proxyAgent), { timeout: PROXY_CONNECT_TIMEOUT_MS });
+                socket = await connector.connect(new PassThrough(), {
+                    ...proxyAgent.options,
+                    ...options,
+                    host: options.hostname,
+                    port: Number(options.port || (secureEndpoint ? 443 : 80)),
+                    secureEndpoint,
+                    servername: isIP(targetHostname) ? undefined : targetHostname,
+                    checkServerIdentity: (hostname, certificate) => checkServerIdentity(targetHostname, certificate),
+                    ALPNProtocols: ['http/1.1']
+                });
+                if (secureEndpoint) {
+                    await once(socket, 'secureConnect', { signal: AbortSignal.timeout(PROXY_CONNECT_TIMEOUT_MS) });
+                }
+                // Bound tunnel setup without imposing the same idle limit on model generation.
+                socket.setTimeout(0);
+                callback(null, socket);
+            } catch (error) {
+                socket?.destroy();
+                // Undici retries raw hostname errors against alternate SNI values; a proxy must fail closed.
+                callback(error.code === 'ERR_TLS_CERT_ALTNAME_INVALID' ? new errors.SecureProxyConnectionError(error) : error, null);
+            }
+        }
+    });
+    const requestDispatcher = dispatcher.compose(interceptors.redirect({ maxRedirections: 20 }), interceptors.decompress());
+    // Never hand a Readable.toWeb/fromWeb-bridged body to a consumer: under Bun the bridge drops
+    // undici's body error on a mid-body close, so the consumer hangs and the rejection escapes as a
+    // process crash (qwen-next died 6x in 2.5 h on 2026-09-16; reproduced with a proxy that closes
+    // the socket mid-body).
+    // Streams are returned as undici's own Node Readable; everything else is buffered right here.
+    const fetch = async (url, options) => {
+        const request = new globalThis.Request(url, options);
+        // Keep buffered upstream payloads replayable across 307/308 redirects.
+        const body = request.body ? Buffer.from(await request.arrayBuffer()) : undefined;
+        const response = await proxyRequest(request.url, {
+            dispatcher: requestDispatcher,
+            method: request.method,
+            headers: Object.fromEntries(request.headers),
+            body,
+            signal: request.signal,
+            maxRedirections: request.redirect === 'follow' ? 20 : 0
+        });
+        const noBody = request.method === 'HEAD' || [204, 205, 304].includes(response.statusCode);
+        if (noBody) await response.body.dump();
+        const payload = noBody ? null : Buffer.from(await response.body.arrayBuffer());
+        return new globalThis.Response(payload, {
+            status: response.statusCode,
+            statusText: STATUS_CODES[response.statusCode] || '',
+            headers: response.headers
+        });
+    };
+    const readResponseData = (response, responseType) => {
+        if (responseType === 'stream') return response.body;
+        if (responseType === 'arraybuffer') return response.body.arrayBuffer().then((buffer) => Buffer.from(buffer));
+        // json/text/undefined: axios' transformResponse parses the text, exactly as with the Node adapter.
+        return response.body.text();
+    };
+    const adapter = async (requestConfig) => {
+        let response;
+        try {
+            response = await proxyRequest(axios.getUri(requestConfig), {
+                dispatcher: requestDispatcher,
+                method: String(requestConfig.method || 'get').toUpperCase(),
+                headers: axios.AxiosHeaders.from(requestConfig.headers).toJSON(),
+                body: requestConfig.data,
+                signal: requestConfig.signal,
+                headersTimeout: requestConfig.timeout || undefined,
+                bodyTimeout: requestConfig.timeout || undefined,
+                maxRedirections: 20
+            });
+        } catch (error) {
+            throw axios.AxiosError.from(error, UNDICI_ERROR_CODES[error.code] || error.code || axios.AxiosError.ERR_NETWORK, requestConfig);
+        }
+        const axiosResponse = {
+            data: await readResponseData(response, requestConfig.responseType),
+            status: response.statusCode,
+            statusText: STATUS_CODES[response.statusCode] || '',
+            headers: axios.AxiosHeaders.from(response.headers),
+            config: requestConfig,
+            request: null
+        };
+        const { validateStatus } = requestConfig;
+        if (!validateStatus || validateStatus(axiosResponse.status)) return axiosResponse;
+        throw new axios.AxiosError(
+            `Request failed with status code ${axiosResponse.status}`,
+            axiosResponse.status >= 500 ? axios.AxiosError.ERR_BAD_RESPONSE : axios.AxiosError.ERR_BAD_REQUEST,
+            requestConfig,
+            null,
+            axiosResponse
+        );
+    };
+    transport = { dispatcher, fetch, adapter };
+    proxyTransports.set(proxyAgent, transport);
+    return transport;
+};
+
+const destroyProxyAgent = (agent) => {
+    const transport = proxyTransports.get(agent);
+    if (transport) {
+        transport.dispatcher.destroy().catch(error => {
+            logger.warn('关闭代理连接池失败', 'PROXY', '', error.message);
+        });
+        proxyTransports.delete(agent);
+    }
+    agent.destroy();
+};
+
+// Accept http/https/socks5/socks5h; regex intentionally loose to catch common typos only.
+// socks5:// resolves the target hostname LOCALLY and hands the proxy an IP (socks-proxy-agent
+// sets `lookup = true`), so the DNS query leaves through the host's resolver while the TCP
+// goes through the proxy. socks5h:// delegates resolution to the proxy (curl semantics):
+// DNS and TCP share one egress. Measured on qwen-next 2026-09-16: 76/80 upstream connections
+// reached sing-box as bare IPs under socks5://.
+const PROXY_URL_REGEX = /^(https?|socks5h?):\/\/[^\s]+$/i
+
+/**
+ * Validate proxy URL format.
+ * Null/undefined/empty are valid (means "no account-level proxy").
  * @param {string|null|undefined} url
  * @returns {boolean}
  */
@@ -30,9 +179,9 @@ const isValidProxyUrl = (url) => {
 }
 
 /**
- * 解析账号实际使用的代理 URL
- * 优先级: account.proxy > 全局 PROXY_URL > 不使用代理
- * @param {Object} [account] - 账号对象（可选）
+ * Resolve the effective proxy URL for an account.
+ * Priority: account.proxy > global PROXY_URL > null
+ * @param {Object} [account]
  * @returns {string|null}
  */
 const resolveProxyUrl = (account) => {
@@ -43,301 +192,169 @@ const resolveProxyUrl = (account) => {
 }
 
 /**
- * 获取 Chat API 基础 URL
+ * Egress identity for logs: `protocol//host:port` of the proxy an account's
+ * requests leave through, or 'direct' when none applies. Qwen's WAF judges by
+ * egress IP, not by account, so parse failures name this instead of the account.
+ * Credentials never make it out: the WHATWG parser drops userinfo, and the regex
+ * fallback (unparseable URL) masks up to the last `@` of the authority.
+ */
+const describeEgress = (account) => {
+    const url = resolveProxyUrl(account)
+    if (!url) return 'direct'
+    try {
+        const parsed = new URL(url)
+        return `${parsed.protocol}//${parsed.host}`
+    } catch {
+        return url.replace(/\/\/[^/?#]*@/, '//***@')
+    }
+}
+
+/**
+ * Evict oldest entry from agent cache when over limit.
+ * Map iteration order is insertion order, so first key is oldest.
+ */
+const evictOldestAgent = () => {
+    if (proxyAgents.size <= MAX_AGENT_CACHE_SIZE) return
+    const oldestKey = proxyAgents.keys().next().value
+    if (oldestKey !== undefined) {
+        const agent = proxyAgents.get(oldestKey)
+        destroyProxyAgent(agent);
+        proxyAgents.delete(oldestKey)
+    }
+}
+
+/**
+ * Build cache key from proxy URL and account email.
+ * @param {string|null} url
+ * @param {Object} [account]
  * @returns {string}
  */
-const getChatBaseUrl = () => config.qwenChatProxyUrl
-
-/**
- * 获取 CLI API 基础 URL
- * @returns {string}
- */
-const getCliBaseUrl = () => config.qwenCliProxyUrl
-
-// ========== 入口 IP 固定 ==========
-//
-// 阿里云的 DNS 按提问者所在地区返回不同的入口地址。俄罗斯方向拿到的
-// 8.209.x 能建连、能完成握手，但数据流会卡死；境外拿到的 47.x 一切正常。
-// 通过代理时域名由代理自己解析（隧道里走的是 CONNECT chat.qwen.ai:443），
-// 所以 hosts 和自建 DNS 都救不了。
-//
-// 这里做的等价于 curl --connect-to：TCP 连到指定 IP，域名照旧进 SNI、
-// 证书校验和 Host 头。rejectUnauthorized 一律不动。
-
-// 域名 -> { ips: string[], index: number }。只有配置了对应环境变量的域名才在表里
-let endpointRegistry = null
-
-/**
- * 从 URL 中安全地取出域名
- * @param {string|null|undefined} baseUrl
- * @returns {string|null}
- */
-const safeHostname = (baseUrl) => {
-    if (!baseUrl || typeof baseUrl !== 'string') return null
-    try {
-        return new URL(baseUrl).hostname || null
-    } catch (_) {
-        return null
-    }
+const buildAgentCacheKey = (url, account) => {
+    const email = account && account.email ? account.email : '__global__'
+    return `${url || ''}::${email}`
 }
 
 /**
- * 构建入口 IP 表（惰性，首次使用时构建）
- * @returns {Map<string, {ips: string[], index: number}>}
+ * Get or create a proxy agent, keyed by proxy URL + account email.
+ * Separate TCP pools per account even when sharing the same proxy.
+ * @param {string|null} url
+ * @param {Object} [account]
+ * @returns {HttpsProxyAgent|SocksProxyAgent|undefined}
  */
-const getEndpointRegistry = () => {
-    if (endpointRegistry) return endpointRegistry
-
-    endpointRegistry = new Map()
-    const register = (baseUrl, ips) => {
-        if (!Array.isArray(ips) || ips.length === 0) return
-        const hostname = safeHostname(baseUrl)
-        if (!hostname) return
-        endpointRegistry.set(hostname, { ips: [...ips], index: 0 })
-        logger.info(`入口 IP 已固定 ${hostname} -> ${ips.join(', ')}（域名仍用于 SNI 与证书校验）`, 'PROXY', '📌')
-    }
-    register(config.qwenChatProxyUrl, config.qwenChatEndpointIps)
-    register(config.qwenCliProxyUrl, config.qwenCliEndpointIps)
-    return endpointRegistry
-}
-
-/**
- * 重新读取入口 IP 配置并丢弃全部缓存的 agent
- * 配置在运行时被改动（或测试需要重置）时调用
- */
-const reloadEndpointConfig = () => {
-    endpointRegistry = null
-    for (const [key, agent] of proxyAgents) {
-        destroyAgent(agent)
-        proxyAgents.delete(key)
-    }
-}
-
-/**
- * 目标 URL 当前生效的入口 IP
- * @param {string} baseUrl
- * @returns {string|null} 未配置固定入口时返回 null
- */
-const getActiveEndpointIp = (baseUrl) => {
-    const state = getEndpointRegistry().get(safeHostname(baseUrl))
-    return state ? state.ips[state.index] : null
-}
-
-/**
- * 目标 URL 配置了几个入口 IP
- * @param {string} baseUrl
- * @returns {number}
- */
-const getEndpointIpCount = (baseUrl) => {
-    const state = getEndpointRegistry().get(safeHostname(baseUrl))
-    return state ? state.ips.length : 0
-}
-
-/**
- * 当前入口 IP 不通时切到下一个，并记住它
- * @param {string} baseUrl
- * @param {string|null} [failedIp] - 报告故障时用的那个 IP
- * @returns {string|null} 切换后的 IP；无可切换时返回 null
- */
-const rotateEndpointIp = (baseUrl, failedIp) => {
-    const hostname = safeHostname(baseUrl)
-    const state = getEndpointRegistry().get(hostname)
-    if (!state || state.ips.length < 2) return null
-
-    // 并发请求会就同一次故障重复报告；别人已经轮换过就直接沿用他们的结果，
-    // 否则一次故障会把整个列表转一圈
-    const current = state.ips[state.index]
-    if (failedIp && failedIp !== current) return current
-
-    state.index = (state.index + 1) % state.ips.length
-    const next = state.ips[state.index]
-    // 旧 agent 上的 keep-alive 连接仍然连着坏入口，必须一起丢掉
-    dropAgentsForEndpoint(hostname, current)
-    logger.warn(`入口 IP 切换 ${hostname}: ${current} -> ${next}`, 'PROXY')
-    return next
-}
-
-/**
- * 解析目标 URL 需要固定的入口
- * @param {string} baseUrl
- * @returns {{hostname: string, ip: string}|null}
- */
-const resolveEndpointPin = (baseUrl) => {
-    const hostname = safeHostname(baseUrl)
-    if (!hostname) return null
-    const state = getEndpointRegistry().get(hostname)
-    if (!state) return null
-    return { hostname, ip: state.ips[state.index] }
-}
-
-/**
- * 走代理时固定入口 IP 的 agent
- * CONNECT 发往 IP，TLS 握手仍按域名：servername 进 SNI，证书也按域名校验
- */
-class PinnedHttpsProxyAgent extends HttpsProxyAgent {
-    constructor(proxyUrl, pin) {
-        super(proxyUrl)
-        this.pin = pin
-    }
-
-    connect(req, opts) {
-        // 同一个 agent 只服务被固定的那个域名；其余目标原样透传
-        if (!this.pin || opts.host !== this.pin.hostname) {
-            return super.connect(req, opts)
-        }
-        return super.connect(req, {
-            ...opts,
-            host: this.pin.ip,
-            servername: opts.servername || this.pin.hostname
-        })
-    }
-}
-
-/**
- * 不走代理时固定入口 IP 用的域名解析函数
- * 与改 hosts 等价，但只作用于本进程，且只作用于被固定的域名
- * @param {{hostname: string, ip: string}} pin
- * @returns {Function}
- */
-const createPinnedLookup = (pin) => (hostname, options, callback) => {
-    if (typeof options === 'function') {
-        callback = options
-        options = {}
-    }
-    const family = net.isIPv6(pin.ip) ? 6 : 4
-    // 目标不是被固定的域名，或调用方点名要另一个协议族 —— 交回系统解析
-    if (hostname !== pin.hostname || (options && options.family && options.family !== family)) {
-        return dns.lookup(hostname, options, callback)
-    }
-    // Node 会用两种形态调用：all=true 要数组，否则要 (address, family)
-    if (options && options.all) {
-        return process.nextTick(callback, null, [{ address: pin.ip, family }])
-    }
-    return process.nextTick(callback, null, pin.ip, family)
-}
-
-/**
- * 销毁 agent，失败不影响后续逻辑
- * @param {Object} agent
- */
-function destroyAgent(agent) {
-    try {
-        if (agent && typeof agent.destroy === 'function') {
-            agent.destroy()
-        }
-    } catch (_) {
-        // destroy 失败不影响后续逻辑
-    }
-}
-
-/**
- * 丢弃绑定在某个入口 IP 上的全部 agent
- * @param {string} hostname
- * @param {string} ip
- */
-function dropAgentsForEndpoint(hostname, ip) {
-    const suffix = `|${hostname}|${ip}`
-    for (const [key, agent] of proxyAgents) {
-        if (!key.endsWith(suffix)) continue
-        destroyAgent(agent)
-        proxyAgents.delete(key)
-    }
-}
-
-/**
- * 按代理 URL + 固定入口获取或创建 agent
- * @param {string|null} proxyUrl
- * @param {{hostname: string, ip: string}|null} pin
- * @returns {Object|undefined} 既无代理又无固定入口时返回 undefined（保持原行为）
- */
-const getOrCreateAgent = (proxyUrl, pin) => {
-    if (!proxyUrl && !pin) return undefined
-
-    const key = `${proxyUrl || 'direct'}|${pin ? pin.hostname : '-'}|${pin ? pin.ip : '-'}`
+const getOrCreateAgent = (url, account) => {
+    if (!url) return undefined
+    const key = buildAgentCacheKey(url, account)
     let agent = proxyAgents.get(key)
     if (!agent) {
-        if (proxyUrl) {
-            agent = pin
-                ? new PinnedHttpsProxyAgent(proxyUrl, pin)
-                : new HttpsProxyAgent(proxyUrl)
-        } else {
-            agent = new https.Agent({ keepAlive: true, lookup: createPinnedLookup(pin) })
+        const proxyUrl = new URL(url);
+        switch (proxyUrl.protocol) {
+            case 'socks5:':
+            case 'socks5h:':
+                // The agent reads the scheme itself: socks5h → shouldLookup=false.
+                agent = new SocksProxyAgent(proxyUrl);
+                break;
+            case 'http:':
+            case 'https:':
+                agent = new HttpsProxyAgent(proxyUrl);
+                break;
+            default:
+                throw new Error(`Unsupported proxy protocol: ${proxyUrl.protocol}`);
         }
+        proxyUrls.set(agent, proxyUrl);
+        proxyAgents.set(key, agent)
+        evictOldestAgent()
+    } else {
+        // Move to end (most recently used) by deleting and re-inserting
+        proxyAgents.delete(key)
         proxyAgents.set(key, agent)
     }
     return agent
 }
 
 /**
- * 获取请求用的 Agent（代理 + 入口 IP 固定）
- * @param {Object} [account] - 账号对象（可选）。未传则回退到全局 PROXY_URL
- * @param {string} [targetBaseUrl] - 目标服务的基础 URL。默认 Chat 服务；
- *        发往 CLI（portal.qwen.ai）等其他域名时必须显式传入，否则会套用 Chat 的入口 IP
- * @returns {Object|undefined}
+ * Get proxy agent for an account.
+ * @param {Object} [account] - Account object (optional). Falls back to global PROXY_URL
+ * @returns {HttpsProxyAgent|SocksProxyAgent|undefined}
  */
-const getProxyAgent = (account, targetBaseUrl) => {
-    const baseUrl = targetBaseUrl === undefined ? getChatBaseUrl() : targetBaseUrl
-    return getOrCreateAgent(resolveProxyUrl(account), resolveEndpointPin(baseUrl))
+const getProxyAgent = (account) => {
+    return getOrCreateAgent(resolveProxyUrl(account), account)
 }
 
 /**
- * 显式失效缓存中某个代理 URL 的全部 agent
- * 当账号代理 URL 被修改或删除时调用，释放底层 socket
+ * Invalidate cached agent for a specific proxy URL.
+ * Called when an account's proxy is changed or removed.
  * @param {string|null} url
+ * @returns {void}
  */
 const invalidateProxyAgent = (url) => {
     if (!url) return
-    const prefix = `${url}|`
-    for (const [key, agent] of proxyAgents) {
-        if (!key.startsWith(prefix)) continue
-        destroyAgent(agent)
-        proxyAgents.delete(key)
+    // Delete all entries matching this proxy URL exactly (any account).
+    // Cache keys are `${proxyUrl}::${email}`; match only when the URL segment
+    // before '::' equals the target url to avoid prefix collisions (e.g. port 8080 vs 80800).
+    for (const [key, agent] of proxyAgents.entries()) {
+        const sepIdx = key.lastIndexOf('::')
+        if (sepIdx !== -1 && key.slice(0, sepIdx) === url) {
+            destroyProxyAgent(agent);
+            proxyAgents.delete(key)
+        }
     }
 }
 
 /**
- * 为 axios 请求配置添加代理设置
- * 注意：account 作为第二个可选参数以保持向后兼容（旧调用点只传 requestConfig）
- * @param {Object} [requestConfig] - axios 请求配置对象
- * @param {Object} [account] - 账号对象（可选）
- * @param {string} [targetBaseUrl] - 目标服务基础 URL（默认 Chat 服务）
+ * Get Chat API base URL.
+ * @returns {string}
+ */
+const getChatBaseUrl = () => config.qwenChatProxyUrl
+
+/**
+ * Get CLI API base URL.
+ * @returns {string}
+ */
+const getCliBaseUrl = () => config.qwenCliProxyUrl
+
+/**
+ * Apply proxy settings to axios request config.
+ * Note: account as second optional param for backward compatibility.
+ * @param {Object} [requestConfig]
+ * @param {Object} [account]
  * @returns {Object}
  */
-const applyProxyToAxiosConfig = (requestConfig = {}, account, targetBaseUrl) => {
-    const proxyAgent = getProxyAgent(account, targetBaseUrl)
+const applyProxyToAxiosConfig = (requestConfig = {}, account) => {
+    const proxyAgent = getProxyAgent(account)
     if (proxyAgent) {
+        requestConfig.httpAgent = proxyAgent;
         requestConfig.httpsAgent = proxyAgent
         requestConfig.proxy = false
+        if (process.versions.bun) {
+            requestConfig.adapter = getProxyTransport(proxyAgent).adapter;
+        }
     }
     return requestConfig
 }
 
 /**
- * 为 fetch 请求配置添加代理设置
- * @param {Object} [fetchOptions] - fetch 请求配置对象
- * @param {Object} [account] - 账号对象（可选）
- * @param {string} [targetBaseUrl] - 目标服务基础 URL（默认 Chat 服务）
- * @returns {Object}
+ * Fetch through the account proxy, falling back to the global proxy.
+ * @param {string|URL} url
+ * @param {Object} [fetchOptions]
+ * @param {Object} [account]
+ * @returns {Promise<Response>}
  */
-const applyProxyToFetchOptions = (fetchOptions = {}, account, targetBaseUrl) => {
-    const proxyAgent = getProxyAgent(account, targetBaseUrl)
-    if (proxyAgent) {
-        fetchOptions.agent = proxyAgent
-    }
-    return fetchOptions
-}
+const fetchWithProxy = (url, fetchOptions = {}, account) => {
+    const proxyAgent = getProxyAgent(account);
+    if (!proxyAgent) return fetch(url, fetchOptions);
+
+    return getProxyTransport(proxyAgent).fetch(url, fetchOptions);
+};
 
 module.exports = {
     resolveProxyUrl,
+    describeEgress,
     getProxyAgent,
     invalidateProxyAgent,
     getChatBaseUrl,
     getCliBaseUrl,
     applyProxyToAxiosConfig,
-    applyProxyToFetchOptions,
-    isValidProxyUrl,
-    getActiveEndpointIp,
-    getEndpointIpCount,
-    rotateEndpointIp,
-    reloadEndpointConfig
+    getProxyTransport,
+    fetchWithProxy,
+    isValidProxyUrl
 }

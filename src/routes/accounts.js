@@ -5,13 +5,13 @@ const accountManager = require('../utils/account')
 const { logger } = require('../utils/logger')
 const { JwtDecode } = require('../utils/tools')
 const { adminKeyVerify } = require('../middlewares/authorization')
-const { deleteAccount, saveAccounts, refreshAccountToken } = require('../utils/setting')
+const { deleteAccount, saveAccounts } = require('../utils/setting')
 const { parseAccountLine } = require('../utils/account-parser')
 const { isValidProxyUrl } = require('../utils/proxy-helper')
 const { DEFAULT_CLI_QUOTA_LIMIT, getAccountCliState } = require('../utils/cli-support')
 
 // 仅在 proxy 字段存在时触发；空字符串/null 一律视为"清除代理"，无需校验
-const PROXY_FORMAT_ERROR = '代理 URL 格式无效，应以 http://、https:// 或 socks5:// 开头'
+const PROXY_FORMAT_ERROR = '代理 URL 格式无效，应以 http://、https://、socks5:// 或 socks5h:// 开头'
 
 const batchAccountTasks = new Map()
 const BATCH_TASK_RETENTION_MS = 1000 * 60 * 30
@@ -744,8 +744,8 @@ router.get('/statsHistory', adminKeyVerify, async (req, res) => {
  * smoke-testing the storage layer).
  *
  * Registered ONLY when ENABLE_STATS_DEBUG_ARCHIVE === 'true'.
- * NODE_ENV is intentionally NOT used — this repo does not set it
- * (src/start.js, ecosystem.config.js), so 'production' cannot be guaranteed.
+ * NODE_ENV is intentionally NOT used: debug access must be explicitly enabled
+ * regardless of the runtime or deployment environment.
  *
  * In any normal (including production) configuration the route is absent —
  * POST returns 404. Caveat: GET on any unknown path falls into app.get('*')

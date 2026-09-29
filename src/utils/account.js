@@ -3,6 +3,7 @@ const DataPersistence = require('./data-persistence')
 const TokenManager = require('./token-manager')
 const AccountRotator = require('./account-rotator')
 const { logger } = require('./logger')
+const { generateDeterministicFingerprint } = require('./fingerprint')
 
 /**
  * 默认 daily stats 结构。返回新对象，调用方安全修改
@@ -12,6 +13,24 @@ const createDefaultStats = () => ({
     chat: { input: 0, output: 0 },
     cli: { calls: 0, input: 0, output: 0 }
 })
+
+/**
+ * Ensure account has a deterministic fingerprint.
+ * Generates one from SHA-256(email) if missing; persists on next save.
+ * @param {Object} account - Account object (mutated in place)
+ */
+const ensureAccountFingerprint = (account) => {
+    if (!account || !account.email) return
+    if (!account.fingerprint || typeof account.fingerprint !== 'object' || !account.fingerprint.deviceId) {
+        try {
+            account.fingerprint = generateDeterministicFingerprint(account.email)
+            logger.info(`Generated deterministic fingerprint for ${account.email}`, 'ACCOUNT')
+        } catch (err) {
+            logger.error(`Failed to generate fingerprint for ${account.email}: ${err.message}`, 'ACCOUNT')
+            // Fall back: leave undefined so header-profile uses legacy headers
+        }
+    }
+}
 
 /**
  * 保证账户具备 stats 和 statsHistory 字段（兼容老 data.json/Redis 数据）
@@ -155,6 +174,9 @@ class Account {
 
             // 兼容历史数据：旧 data.json/Redis 没有 stats 字段
             this.accountTokens.forEach(ensureStats)
+
+            // Antidetect: ensure every account has a deterministic fingerprint
+            this.accountTokens.forEach(ensureAccountFingerprint)
 
             // 如果是环境变量模式，需要进行登录获取令牌
             if (config.dataSaveMode === 'none' && this.accountTokens.length > 0) {
@@ -317,10 +339,9 @@ class Account {
      * saveAllAccounts batch (instead of 30 individual saves).
      *
      * Caveats:
-     * - PM2_INSTANCES > 1: each worker archives its own partial copy of stats;
-     *   the daily total would be under-reported proportionally to the worker
-     *   count. With instances=1 (ecosystem.config.js default) this is not
-     *   triggered.
+     * - Multiple replicas archive independent in-memory stats. They need
+     *   coordinated aggregation before sharing persistence; one process is
+     *   the supported default.
      * - DATA_SAVE_MODE=none: saveAllAccounts returns false and history is not
      *   persisted. Set DATA_SAVE_MODE=file or redis to enable the feature.
      * @private
@@ -522,7 +543,7 @@ class Account {
      * 获取下一个可用的账户对象（包含 proxy 等完整字段）
      * @returns {Object|null} 账户对象或 null
      */
-    getAccount() {
+    getAccount(excludedEmails = []) {
         if (!this.isInitialized) {
             logger.warn('账户管理器尚未初始化完成', 'ACCOUNT')
             return null
@@ -533,7 +554,7 @@ class Account {
             return null
         }
 
-        const account = this.accountRotator.getNextAccount()
+        const account = this.accountRotator.getNextAccount(excludedEmails)
         if (!account) {
             logger.error('所有账户令牌都不可用', 'ACCOUNT')
         }
@@ -635,18 +656,6 @@ class Account {
         return false
     }
 
-    // 更新销毁方法，清除定时器
-    destroy() {
-        if (this.saveInterval) {
-            clearInterval(this.saveInterval)
-        }
-        if (this.refreshInterval) {
-            clearInterval(this.refreshInterval)
-        }
-    }
-
-
-
     /**
      * 生成 Markdown 表格
      * @param {Array} websites - 网站信息数组
@@ -743,9 +752,20 @@ class Account {
     }
 
     /**
+     * 记录“该账户今天的额度已耗尽”，把它移出轮询直到额度恢复。
+     * 调用方：anthropic.js / chat.js 的 catch，经 upstream-error#noteRateLimitedAccount。
+     * 额度耗尽藏在 HTTP 200 的 SSE 包体里，request.js 的状态码分支永远看不到它。
+     * @param {string} email - 邮箱地址
+     * @param {number|null} [retryAfterSeconds] - 上游给的真实等待（秒）
+     */
+    recordAccountQuotaExhausted(email, retryAfterSeconds = null) {
+        this.accountRotator.recordQuotaExhausted(email, retryAfterSeconds)
+    }
+
+    /**
      * 累计 daily stats（per-account）
      * 调用方：chat.js / anthropic.js / cli.chat.js 在成功消费完上游 usage 后
-     * 注意：PM2_INSTANCES>1 时各 worker 各持一份 in-memory 副本（已记于 epic notes）
+     * 注意：多个副本各持一份 in-memory 统计，不会自动聚合。
      * @param {string} email - 邮箱地址
      * @param {'chat'|'cli'} kind - 统计类别
      * @param {Object} delta - 增量

@@ -1,6 +1,6 @@
 const crypto = require('crypto')
 const { logger } = require('./logger')
-const { getProxyAgent, getChatBaseUrl, applyProxyToFetchOptions } = require('./proxy-helper')
+const { getChatBaseUrl, fetchWithProxy } = require('./proxy-helper');
 
 /**
  * 为 PKCE 生成随机代码验证器
@@ -86,10 +86,8 @@ class CliAuthManager {
             body: bodyData,
         }
 
-        applyProxyToFetchOptions(fetchOptions, account)
-
         try {
-            const response = await fetch(`${chatBaseUrl}/api/v1/oauth2/device/code`, fetchOptions)
+            const response = await fetchWithProxy(`${chatBaseUrl}/api/v1/oauth2/device/code`, fetchOptions, account);
 
             if (response.ok) {
                 const result = await response.json()
@@ -132,9 +130,9 @@ class CliAuthManager {
      * @returns {Promise<boolean>} 是否授权成功
      */
     async authorizeLogin(user_code, access_token, account) {
-        try {
-            const chatBaseUrl = getChatBaseUrl()
+        const chatBaseUrl = getChatBaseUrl()
 
+        try {
             const fetchOptions = {
                 method: 'POST',
                 headers: {
@@ -147,9 +145,7 @@ class CliAuthManager {
                 })
             }
 
-            applyProxyToFetchOptions(fetchOptions, account)
-
-            const response = await fetch(`${chatBaseUrl}/api/v2/oauth2/authorize`, fetchOptions)
+            const response = await fetchWithProxy(`${chatBaseUrl}/api/v2/oauth2/authorize`, fetchOptions, account);
 
             if (response.ok) {
                 return true
@@ -200,10 +196,8 @@ class CliAuthManager {
                 body: bodyData,
             }
 
-            applyProxyToFetchOptions(fetchOptions, account)
-
             try {
-                const response = await fetch(`${chatBaseUrl}/api/v1/oauth2/token`, fetchOptions)
+                const response = await fetchWithProxy(`${chatBaseUrl}/api/v1/oauth2/token`, fetchOptions, account);
 
                 if (response.ok) {
                     const tokenData = await response.json()
@@ -317,9 +311,7 @@ class CliAuthManager {
                 body: bodyData
             }
 
-            applyProxyToFetchOptions(fetchOptions, account)
-
-            const response = await fetch(`${chatBaseUrl}/api/v1/oauth2/token`, fetchOptions)
+            const response = await fetchWithProxy(`${chatBaseUrl}/api/v1/oauth2/token`, fetchOptions, account);
 
             if (response.ok) {
                 const tokenData = await response.json()

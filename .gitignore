@@ -1,5 +1,4 @@
 node_modules
-package-lock.json
 .tmp/
 mitm_mcp_traffic.db
 .env
@@ -36,3 +35,4 @@ docs_fork/
 
 # Локальные настройки Claude Code (разрешения конкретной машины)
 .claude/settings.local.json
+.bce-tool/

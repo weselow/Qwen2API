@@ -576,7 +576,7 @@ const editProxy = ref({ email: '', proxy: '' })
 const isSavingProxy = ref(false)
 
 // 与后端 src/utils/proxy-helper.js#PROXY_URL_REGEX 保持一致
-const PROXY_URL_REGEX = /^(https?|socks5):\/\/[^\s]+$/i
+const PROXY_URL_REGEX = /^(https?|socks5h?):\/\/[^\s]+$/i
 const isValidProxy = (value) => {
   if (!value) return true
   const trimmed = String(value).trim()
@@ -1452,14 +1452,16 @@ onBeforeUnmount(() => {
   position: absolute;
   top: 0;
   left: 0;
-  width: 0;
+  width: 100%;
   height: 100%;
   background: rgba(99, 102, 241, 0.1);
-  transition: width 0.3s ease;
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 0.3s ease;
 }
 
 .custom-checkbox:hover .checkbox-icon:before {
-  width: 100%;
+  transform: scaleX(1);
 }
 
 .custom-checkbox input:checked + .checkbox-icon svg {

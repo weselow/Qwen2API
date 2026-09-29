@@ -7,37 +7,16 @@ const { generateChatID } = require('../utils/request.js')
 const { uploadFileToQwenOss } = require('../utils/upload.js')
 const { parserModel } = require('../utils/chat-helpers.js')
 const { getDefaultModelByChatType } = require('../models/models-map.js')
-const { getSsxmodItna, getSsxmodItna2 } = require('../utils/ssxmod-manager')
-const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
+const { getSsxmodForAccount } = require('../utils/ssxmod-manager')
+const { applyProxyToAxiosConfig, getChatBaseUrl } = require('../utils/proxy-helper');
+const { buildRequestHeaders } = require('../utils/header-profile')
+const {
+    assertChatChallengeBreakerClosed, bindChatChallengeContext, chatChallengeFrom,
+    isWafChallengeError, noteChatChallengeAnswer, releaseChatProbe
+} = require('../utils/upstream-error.js')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
-
-/**
- * 构造与当前账号一致的上游 Cookie 头
- * @param {string} token - 当前账号令牌
- * @returns {string} Cookie 头
- */
-const buildUpstreamCookieHeader = (token) => {
-    const cookieParts = []
-
-    if (token) {
-        cookieParts.push(`token=${token}`)
-    }
-
-    const ssxmodItna = getSsxmodItna()
-    const ssxmodItna2 = getSsxmodItna2()
-
-    if (ssxmodItna) {
-        cookieParts.push(`ssxmod_itna=${ssxmodItna}`)
-    }
-
-    if (ssxmodItna2) {
-        cookieParts.push(`ssxmod_itna2=${ssxmodItna2}`)
-    }
-
-    return cookieParts.join('; ')
-}
 
 /**
  * 将上游响应体格式化为便于日志输出的对象
@@ -90,7 +69,18 @@ const buildAxiosErrorLog = (error) => ({
     data: formatPayloadForLog(error?.response?.data)
 })
 
-const parseUpstreamImageError = (data) => {
+/**
+ * 图片/视频也走 /api/v2/chat/completions，同样会被 chat challenge 拦截：
+ * 转成可重试的 503（带 retry_after），与聊天接口一致。
+ */
+const imageChallengeError = (challenge) => ({
+    error: challenge.publicMessage,
+    code: challenge.code,
+    status: 503,
+    retry_after: challenge.retryAfter
+})
+
+const parseUpstreamImageError = (data, source = data) => {
     try {
         const rawPayload = formatPayloadForLog(data)
         let payload = data
@@ -103,8 +93,15 @@ const parseUpstreamImageError = (data) => {
             payload = JSON.parse(payload)
         }
 
+        const challenge = chatChallengeFrom(payload, source)
+        if (challenge) {
+            logger.error('图片/视频请求被上游 WAF 拦截 (chat challenge)', 'CHAT', '', { raw_response_body: rawPayload })
+            return imageChallengeError(challenge)
+        }
+
         // 只有明确 success=false 且带错误码时，才按上游错误包处理，避免误伤正常业务响应
         if (!payload || payload.success !== false || !payload.data?.code) {
+            if (Array.isArray(payload?.choices)) noteChatChallengeAnswer(source)
             return null
         }
 
@@ -138,18 +135,67 @@ const parseUpstreamImageError = (data) => {
     }
 }
 
-const parseUpstreamImageErrorFromText = (text) => {
+const parseUpstreamImageErrorFromText = (text, source) => {
     try {
         if (!text || typeof text !== 'string') {
             return null
         }
 
         // 图片接口在额度耗尽时可能返回普通 JSON 文本而不是 SSE，需要在流结束后补做一次识别
-        return parseUpstreamImageError(JSON.parse(text))
+        return parseUpstreamImageError(JSON.parse(text), source)
     } catch (e) {
         return null
     }
 }
+
+/**
+ * 流结束后的兜底：从整段原始文本里找出可识别的上游错误。
+ *
+ * 不能只试 `JSON.parse(整段)`：上游有时把 JSON 包在 `data:` 前缀里发（额度耗尽的
+ * 非流式响应就是这样），整段 JSON.parse 会失败，WAF/业务错误就整个滑过去被当成成功。
+ * 这里复用流式路径同一个 parseSsePayloads，两种形态都拆得开。
+ * @param {string} text - 上游原始文本
+ * @returns {object|null} 上游错误，未识别到则为 null
+ */
+const parseUpstreamErrorFromRawText = (text, source) => {
+    if (!text || typeof text !== 'string') {
+        return null
+    }
+
+    const trimmed = text.trim()
+    if (!trimmed) {
+        return null
+    }
+
+    // La página de captcha del WAF llega como HTML y no se deja ver por ninguna de las
+    // ramas de abajo (no hay `data:`, no es JSON). Se comprueba primero.
+    const htmlChallenge = chatChallengeFrom(trimmed, source)
+    if (htmlChallenge) {
+        logger.error('图片/视频上游返回 WAF/captcha HTML 页面，需人工验证', 'CHAT', '', {
+            raw_preview: trimmed.slice(0, 200)
+        })
+        return imageChallengeError(htmlChallenge)
+    }
+
+    const fromWholeText = parseUpstreamImageErrorFromText(trimmed, source)
+    if (fromWholeText) {
+        return fromWholeText
+    }
+
+    for (const payload of parseSsePayloads(trimmed, true).payloads) {
+        const parsed = parseUpstreamImageError(payload, source)
+        if (parsed) {
+            return parsed
+        }
+    }
+
+    return null
+}
+
+// t2v may return HTML or a data:-wrapped frame despite asking Axios for JSON.
+const parseUpstreamBody = (data, source = data) => (
+    typeof data === 'string' ? parseUpstreamErrorFromRawText(data, source) : parseUpstreamImageError(data, source)
+)
 
 /**
  * 收集对象中的所有值
@@ -278,7 +324,7 @@ const extractResponseIDsFromText = (text) => {
     ]
 
     for (const pattern of patterns) {
-        let matched = null
+        let matched
         while ((matched = pattern.exec(text)) !== null) {
             const responseID = matched[1]?.trim()
             if (responseID && !responseIDs.includes(responseID)) {
@@ -538,13 +584,6 @@ const extractVideoTaskIdentifiersFromPayload = (payload) => {
 }
 
 /**
- * 从上游响应中提取首个视频任务 ID
- * @param {*} payload - 上游响应负载
- * @returns {string|null} 视频任务 ID
- */
-const extractVideoTaskIDFromPayload = (payload) => extractVideoTaskIdentifiersFromPayload(payload)[0] || null
-
-/**
  * 判断是否属于可重试的上游生成错误
  * @param {object|null} upstreamError - 上游错误
  * @returns {boolean} 是否可重试
@@ -565,6 +604,7 @@ const isRetryableUpstreamError = (upstreamError) => {
  */
 const sendUpstreamError = (res, upstreamError) => {
     const { status, ...payload } = upstreamError
+    if (Number(payload.retry_after) > 0) res.set({ 'Retry-After': String(payload.retry_after) })
     return res.status(status || 500).json(payload)
 }
 
@@ -649,6 +689,7 @@ const normalizeOpenAIImageVideoSize = (size) => {
 const sendOpenAIErrorResponse = (res, error) => {
     const status = error?.status || 500
     const message = error?.error || error?.message || 'Service error, please try again later'
+    if (Number(error?.retry_after) > 0) res.set({ 'Retry-After': String(error.retry_after) })
 
     return res.status(status).json({
         error: {
@@ -664,16 +705,12 @@ const sendOpenAIErrorResponse = (res, error) => {
  * @returns {Promise<string>} Base64 内容
  */
 const downloadAssetAsBase64 = async (contentUrl, account) => {
-    const proxyAgent = getProxyAgent(account)
     const requestConfig = {
         responseType: 'arraybuffer',
         timeout: 1000 * 60 * 2
     }
 
-    if (proxyAgent) {
-        requestConfig.httpsAgent = proxyAgent
-        requestConfig.proxy = false
-    }
+    applyProxyToAxiosConfig(requestConfig, account);
 
     const responseData = await axios.get(contentUrl, requestConfig)
     return Buffer.from(responseData.data).toString('base64')
@@ -848,7 +885,7 @@ const readVideoUpstreamResult = async (responseStream) => {
         const videoTaskCandidates = extractVideoTaskIdentifiersFromPayload(responseStream)
         const responseIDs = extractResponseIDsFromPayload(responseStream)
         return {
-            upstreamError: parseUpstreamImageError(responseStream),
+            upstreamError: parseUpstreamBody(responseStream, responseStream),
             contentUrl: extractResourceUrlFromPayload(responseStream),
             videoTaskID: videoTaskCandidates[0] || null,
             videoTaskCandidates,
@@ -877,7 +914,7 @@ const readVideoUpstreamResult = async (responseStream) => {
 
     const applyPayload = (payload) => {
         if (!upstreamError) {
-            upstreamError = parseUpstreamImageError(payload)
+            upstreamError = parseUpstreamImageError(payload, responseStream)
         }
 
         if (!contentUrl) {
@@ -918,7 +955,7 @@ const readVideoUpstreamResult = async (responseStream) => {
 
     const trimmedRawText = rawText.trim()
     if (!upstreamError) {
-        upstreamError = parseUpstreamImageErrorFromText(trimmedRawText) || parseUpstreamImageError(trimmedRawText)
+        upstreamError = parseUpstreamErrorFromRawText(trimmedRawText, responseStream)
     }
 
     if (!contentUrl) {
@@ -947,7 +984,7 @@ const readVideoUpstreamResult = async (responseStream) => {
 const readImageUpstreamResult = async (responseStream) => {
     if (!responseStream || typeof responseStream.on !== 'function') {
         return {
-            upstreamError: parseUpstreamImageError(responseStream),
+            upstreamError: parseUpstreamBody(responseStream, responseStream),
             contentUrl: extractResourceUrlFromPayload(responseStream),
             responseIDs: extractResponseIDsFromPayload(responseStream),
             rawPreview: typeof responseStream === 'string' ? responseStream.slice(0, 400) : ''
@@ -968,7 +1005,7 @@ const readImageUpstreamResult = async (responseStream) => {
 
     const applyPayload = (payload) => {
         if (!upstreamError) {
-            upstreamError = parseUpstreamImageError(payload)
+            upstreamError = parseUpstreamImageError(payload, responseStream)
         }
 
         if (!contentUrl) {
@@ -1005,7 +1042,7 @@ const readImageUpstreamResult = async (responseStream) => {
 
     const trimmedRawText = rawText.trim()
     if (!upstreamError) {
-        upstreamError = parseUpstreamImageErrorFromText(trimmedRawText) || parseUpstreamImageError(trimmedRawText)
+        upstreamError = parseUpstreamErrorFromRawText(trimmedRawText, responseStream)
     }
 
     if (!contentUrl) {
@@ -1035,22 +1072,23 @@ const getChatDetail = async (chatID, token) => {
         const chatBaseUrl = getChatBaseUrl()
         // 通过 token 反查 account 解析账号级代理（找不到则回退到全局 PROXY_URL）
         const account = accountManager.getAccountByToken(token)
-        const proxyAgent = getProxyAgent(account)
-        const cookieHeader = buildUpstreamCookieHeader(token)
+        // Antidetect: per-account fingerprint headers replace static block
+        const ssxmod = getSsxmodForAccount(account)
+        const headers = buildRequestHeaders(account, {
+            chatBaseUrl,
+            token,
+            ssxmodItna: ssxmod.ssxmod_itna,
+            ssxmodItna2: ssxmod.ssxmod_itna2,
+            extra: {
+                'Authorization': `Bearer ${token}`
+            }
+        })
 
         const requestConfig = {
-            headers: {
-                "Authorization": `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                ...(cookieHeader && { 'Cookie': cookieHeader })
-            }
+            headers
         }
 
-        if (proxyAgent) {
-            requestConfig.httpsAgent = proxyAgent
-            requestConfig.proxy = false
-        }
+        applyProxyToAxiosConfig(requestConfig, account);
 
         const responseData = await axios.get(`${chatBaseUrl}/api/v2/chats/${chatID}`, requestConfig)
         return responseData.data || null
@@ -1169,6 +1207,9 @@ const resolveVideoResultContentUrl = async (responseStream, token, chatID) => {
         throw upstreamError
     }
 
+    // Qwen accepted the video task; do not hold the sole probe throughout polling.
+    if (upstreamContentUrl || videoTaskCandidates.length > 0) noteChatChallengeAnswer(responseStream)
+
     if (upstreamContentUrl) {
         return upstreamContentUrl
     }
@@ -1245,6 +1286,7 @@ const generateImageVideoResult = async (payload) => {
     // 一次取出账户对象，确保 token 与 proxy 走同一个账号
     const account = accountManager.getAccount()
     const token = account ? account.token : null
+    let breakerContext = null
 
     try {
         const reqBody = {
@@ -1266,14 +1308,6 @@ const generateImageVideoResult = async (payload) => {
             ]
         }
 
-        const chatID = await generateChatID(token, model, account, chat_type)
-
-        if (!chatID) {
-            throw new Error('生成 chat_id 失败')
-        }
-
-        reqBody.chat_id = chatID
-
         const userPrompt = messages?.[messages.length - 1]?.content
         if (!userPrompt) {
             throw {
@@ -1281,6 +1315,20 @@ const generateImageVideoResult = async (payload) => {
                 error: '缺少有效的提示词'
             }
         }
+
+        try {
+            breakerContext = assertChatChallengeBreakerClosed(account)
+        } catch (challenge) {
+            throw imageChallengeError(challenge)
+        }
+
+        const chatID = await generateChatID(token, model, account, chat_type)
+
+        if (!chatID) {
+            throw new Error('生成 chat_id 失败')
+        }
+
+        reqBody.chat_id = chatID
 
         const messagesHistory = messages.filter(item => item.role === 'user' || item.role === 'assistant')
         const selectedImageList = []
@@ -1361,47 +1409,41 @@ const generateImageVideoResult = async (payload) => {
         }
 
         const chatBaseUrl = getChatBaseUrl()
-        const proxyAgent = getProxyAgent(account)
-        const cookieHeader = buildUpstreamCookieHeader(token)
+        // Antidetect: per-account fingerprint headers replace static block
+        const ssxmod = getSsxmodForAccount(account)
+        // The Accept header depends on whether the upstream call streams, so the
+        // flag has to be resolved before the headers are built. Declaring it after
+        // this block put it in the temporal dead zone and threw
+        // "Cannot access 'upstreamStream' before initialization" on every call.
+        const newChatType = reqBody.messages[0]?.chat_type
+        const upstreamStream = newChatType === 't2i' || newChatType === 'image_edit'
+        const headers = buildRequestHeaders(account, {
+            chatBaseUrl,
+            token,
+            ssxmodItna: ssxmod.ssxmod_itna,
+            ssxmodItna2: ssxmod.ssxmod_itna2,
+            accept: upstreamStream ? 'application/json, text/plain, */*' : 'application/json',
+            extra: {
+                'authorization': `Bearer ${token}`,
+                'bx-v': '2.5.36'
+            }
+        })
 
         logger.info('发送图片视频请求', 'CHAT')
         logger.info(`选择图片: ${selectedImageList[selectedImageList.length - 1] || '未选择图片，切换生成图/视频模式'}`, 'CHAT')
         logger.info(`使用提示: ${reqBody.messages[0].content}`, 'CHAT')
 
-        const newChatType = reqBody.messages[0].chat_type
-        const upstreamStream = newChatType === 't2i' || newChatType === 'image_edit'
         reqBody.stream = upstreamStream
 
         logger.info(`图片视频流策略: upstream=${upstreamStream} downstream=${payload.stream === true}`, 'CHAT')
 
         const requestConfig = {
-            headers: {
-                'authorization': `Bearer ${token}`,
-                'sec-ch-ua-platform': '"Windows"',
-                'referer': `${chatBaseUrl}/`,
-                'accept-language': 'zh-CN,zh;q=0.9',
-                'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-                'sec-ch-ua-mobile': '?0',
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
-                'content-type': 'application/json',
-                'bx-v': '2.5.36',
-                'accept': upstreamStream ? 'application/json, text/plain, */*' : 'application/json',
-                'accept-encoding': 'gzip, deflate, br, zstd',
-                ...(cookieHeader && { 'cookie': cookieHeader }),
-                'host': chatBaseUrl.replace('https://', ''),
-                'origin': chatBaseUrl,
-                'sec-fetch-dest': 'empty',
-                'sec-fetch-mode': 'cors',
-                'sec-fetch-site': 'same-origin',
-            },
+            headers,
             responseType: newChatType === 't2v' ? 'json' : (upstreamStream ? 'stream' : 'text'),
             timeout: 1000 * 60 * 5
         }
 
-        if (proxyAgent) {
-            requestConfig.httpsAgent = proxyAgent
-            requestConfig.proxy = false
-        }
+        applyProxyToAxiosConfig(requestConfig, account);
 
         let responseData = null
         const maxUpstreamAttempts = 2
@@ -1410,7 +1452,10 @@ const generateImageVideoResult = async (payload) => {
             try {
                 responseData = await axios.post(`${chatBaseUrl}/api/v2/chat/completions?chat_id=${chatID}`, reqBody, requestConfig)
 
-                const inlineUpstreamError = parseUpstreamImageError(responseData.data)
+                bindChatChallengeContext(responseData.data, breakerContext)
+                const inlineUpstreamError = parseUpstreamBody(responseData.data, breakerContext)
+                // Ya contado como strike: no dejar que el resolver lo vuelva a parsear y contar.
+                if (inlineUpstreamError?.code === 'upstream_waf_challenge') throw inlineUpstreamError
                 if (attempt < maxUpstreamAttempts && isRetryableUpstreamError(inlineUpstreamError)) {
                     logger.warn(`图片/视频请求上游返回业务错误包，准备第 ${attempt + 1} 次重试，请求ID: ${inlineUpstreamError.request_id || '未知'}`, 'CHAT')
                     await sleep(800)
@@ -1420,7 +1465,8 @@ const generateImageVideoResult = async (payload) => {
                 break
             } catch (error) {
                 logger.error('图片/视频请求失败', 'CHAT', '', buildAxiosErrorLog(error))
-                const upstreamError = parseUpstreamImageError(error.response?.data)
+                const upstreamError = parseUpstreamBody(error.response?.data, breakerContext)
+                if (isWafChallengeError(upstreamError)) throw upstreamError
                 if (attempt < maxUpstreamAttempts && isRetryableUpstreamError(upstreamError)) {
                     logger.warn(`图片/视频请求上游返回瞬时内部错误，准备第 ${attempt + 1} 次重试`, 'CHAT')
                     await sleep(800)
@@ -1433,6 +1479,7 @@ const generateImageVideoResult = async (payload) => {
 
         if (newChatType === 't2i' || newChatType === 'image_edit') {
             const contentUrl = await resolveImageResultContentUrl(responseData.data, chatID, token)
+            noteChatChallengeAnswer(breakerContext)
             return {
                 model,
                 chatType: newChatType,
@@ -1443,6 +1490,7 @@ const generateImageVideoResult = async (payload) => {
 
         if (newChatType === 't2v') {
             const contentUrl = await resolveVideoResultContentUrl(responseData.data, token, chatID)
+            noteChatChallengeAnswer(breakerContext)
             return {
                 model,
                 chatType: newChatType,
@@ -1456,14 +1504,17 @@ const generateImageVideoResult = async (payload) => {
         logger.error('图片/视频主流程异常', 'CHAT', '', buildAxiosErrorLog(error))
 
         if (error?.error) {
+            if (!isWafChallengeError(error)) releaseChatProbe(breakerContext)
             throw error
         }
 
-        const upstreamError = parseUpstreamImageError(error.response?.data)
+        const upstreamError = parseUpstreamBody(error.response?.data, breakerContext)
         if (upstreamError) {
+            if (!isWafChallengeError(upstreamError)) releaseChatProbe(breakerContext)
             throw upstreamError
         }
 
+        releaseChatProbe(breakerContext)
         throw {
             status: 500,
             error: error?.message || 'Service error, please try again later'
@@ -1503,6 +1554,13 @@ const handleImageVideoCompletion = async (req, res) => {
         }
 
         logger.error('图片视频资源处理错误', 'CHAT', '', error)
+
+        // chat challenge 且尚未提交：返回真正的 503 + Retry-After（t2v 预设了 text/event-stream，需改回 JSON），
+        // 而不是把错误文本当成 200 的流式正文。
+        if (downstreamStream && !res.headersSent && error?.code === 'upstream_waf_challenge') {
+            res.set({ 'Content-Type': 'application/json' })
+            return sendUpstreamError(res, error)
+        }
 
         if (downstreamStream) {
             return returnResponse(res, req.body.model, error?.error || error?.message || 'Service error, please try again later', true)
@@ -1723,152 +1781,28 @@ const handleOpenAIVideoGeneration = async (req, res) => {
     }
 }
 
-const handleVideoCompletion = async (res, responseStream, token, model, downstreamStream, chatID) => {
-    let keepAliveTimer = null
-
-    try {
-        if (downstreamStream) {
-            setResponseHeaders(res, true)
-            keepAliveTimer = setInterval(() => {
-                if (!res.writableEnded) {
-                    res.write(`: keep-alive\n\n`)
-                }
-            }, 15000)
-        }
-
-        const { upstreamError, contentUrl: upstreamContentUrl, videoTaskID, videoTaskCandidates, responseIDs, rawPreview } = await readVideoUpstreamResult(responseStream)
-        if (upstreamError) {
-            if (keepAliveTimer) {
-                clearInterval(keepAliveTimer)
-            }
-
-            if (downstreamStream) {
-                res.status(upstreamError.status || 500)
-                return returnResponse(res, model, upstreamError.error || '视频生成失败', true)
-            }
-
-            return sendUpstreamError(res, upstreamError)
-        }
-
-        if (upstreamContentUrl) {
-            if (keepAliveTimer) {
-                clearInterval(keepAliveTimer)
-            }
-
-            return returnResponse(res, model, buildVideoContent(upstreamContentUrl), downstreamStream)
-        }
-
-        let resolvedContentUrl = upstreamContentUrl
-        let resolvedTaskCandidates = [...videoTaskCandidates]
-
-        if (!resolvedContentUrl && resolvedTaskCandidates.length === 0 && chatID) {
-            logger.info(`视频上游未直接返回任务信息，尝试从聊天详情补取，chat_id=${chatID} responseIDs=${JSON.stringify(responseIDs)}`, 'CHAT')
-
-            for (let attempt = 1; attempt <= 5; attempt++) {
-                const chatDetail = await getChatDetail(chatID, token)
-                const extractedInfo = extractVideoInfoFromChatDetail(chatDetail, responseIDs)
-
-                if (!resolvedContentUrl && extractedInfo.contentUrl) {
-                    resolvedContentUrl = extractedInfo.contentUrl
-                }
-
-                for (const taskID of extractedInfo.videoTaskCandidates) {
-                    if (!resolvedTaskCandidates.includes(taskID)) {
-                        resolvedTaskCandidates.push(taskID)
-                    }
-                }
-
-                if (resolvedContentUrl || resolvedTaskCandidates.length > 0) {
-                    break
-                }
-
-                await sleep(1200)
-            }
-        }
-
-        if (resolvedContentUrl) {
-            if (keepAliveTimer) {
-                clearInterval(keepAliveTimer)
-            }
-
-            return returnResponse(res, model, buildVideoContent(resolvedContentUrl), downstreamStream)
-        }
-
-        if (resolvedTaskCandidates.length === 0) {
-            logger.warn(`视频上游响应未解析出任务信息，contentUrl=${resolvedContentUrl || '空'} candidates=${JSON.stringify(resolvedTaskCandidates)} responseIDs=${JSON.stringify(responseIDs)} preview=${rawPreview}`, 'CHAT')
-            throw new Error('上游未返回视频任务 ID 或视频链接')
-        }
-
-        logger.info(`视频任务候选ID: ${JSON.stringify(resolvedTaskCandidates)}`, 'CHAT')
-
-        const maxAttempts = 60
-        const delay = 20 * 1000
-
-        for (const taskCandidate of resolvedTaskCandidates) {
-            logger.info(`开始轮询视频任务ID: ${taskCandidate}`, 'CHAT')
-
-            for (let i = 0; i < maxAttempts; i++) {
-                const content = await getVideoTaskStatus(taskCandidate, token)
-                if (content) {
-                    if (keepAliveTimer) {
-                        clearInterval(keepAliveTimer)
-                    }
-
-                    return returnResponse(res, model, buildVideoContent(content), downstreamStream)
-                }
-
-                await sleep(delay)
-            }
-        }
-
-        logger.error(`视频任务 ${JSON.stringify(resolvedTaskCandidates)} 轮询超时`, 'CHAT')
-        if (keepAliveTimer) {
-            clearInterval(keepAliveTimer)
-        }
-
-        if (downstreamStream) {
-            return returnResponse(res, model, '视频生成超时，请稍后再试', true)
-        }
-
-        return res.status(504).json({ error: '视频生成超时，请稍后再试' })
-    } catch (error) {
-        if (keepAliveTimer) {
-            clearInterval(keepAliveTimer)
-        }
-
-        logger.error('获取视频任务状态失败', 'CHAT', '', error)
-
-        const errorMessage = error.response?.data?.data?.code || error.message || '可能该帐号今日生成次数已用完'
-
-        if (downstreamStream) {
-            return returnResponse(res, model, `视频生成失败: ${errorMessage}`, true)
-        }
-
-        res.status(500).json({ error: errorMessage })
-    }
-}
 
 const getVideoTaskStatus = async (videoTaskID, token) => {
     try {
         const chatBaseUrl = getChatBaseUrl()
         const account = accountManager.getAccountByToken(token)
-        const proxyAgent = getProxyAgent(account)
-        const cookieHeader = buildUpstreamCookieHeader(token)
+        // Antidetect: per-account fingerprint headers replace static block
+        const ssxmod = getSsxmodForAccount(account)
+        const headers = buildRequestHeaders(account, {
+            chatBaseUrl,
+            token,
+            ssxmodItna: ssxmod.ssxmod_itna,
+            ssxmodItna2: ssxmod.ssxmod_itna2,
+            extra: {
+                'Authorization': `Bearer ${token}`
+            }
+        })
 
         const requestConfig = {
-            headers: {
-                "Authorization": `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                ...(cookieHeader && { 'Cookie': cookieHeader })
-            }
+            headers
         }
 
-        // 添加代理配置
-        if (proxyAgent) {
-            requestConfig.httpsAgent = proxyAgent
-            requestConfig.proxy = false
-        }
+        applyProxyToAxiosConfig(requestConfig, account);
 
         const response_data = await axios.get(`${chatBaseUrl}/api/v1/tasks/status/${videoTaskID}`, requestConfig)
 
@@ -1889,5 +1823,7 @@ module.exports = {
     handleImageVideoCompletion,
     handleOpenAIImagesGeneration,
     handleOpenAIImagesEdit,
-    handleOpenAIVideoGeneration
+    handleOpenAIVideoGeneration,
+    // 暴露内部辅助以便测试
+    parseUpstreamImageError
 }

@@ -3,7 +3,9 @@ const OSS = require('ali-oss')
 const mimetypes = require('mime-types')
 const { logger } = require('./logger')
 const { generateUUID } = require('./tools.js')
-const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./proxy-helper')
+const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig, describeEgress } = require('./proxy-helper')
+const { buildRequestHeaders } = require('./header-profile')
+const config = require('../config/index.js')
 
 // 配置常量
 const UPLOAD_CONFIG = {
@@ -59,11 +61,15 @@ const getSimpleFileType = (mimeType) => {
  */
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
-const createAuthorizedHeaders = (authToken) => ({
-    'Authorization': authToken.startsWith('Bearer ') ? authToken : `Bearer ${authToken}`,
-    'Content-Type': 'application/json',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-})
+const createAuthorizedHeaders = (authToken, account) => {
+    // Antidetect: per-account fingerprint headers replace static UA
+    const base = buildRequestHeaders(account, {
+        extra: {
+            'Authorization': authToken.startsWith('Bearer ') ? authToken : `Bearer ${authToken}`
+        }
+    })
+    return base
+}
 
 const unwrapApiData = (response) => {
     const payload = response?.data
@@ -97,14 +103,15 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
 
         const requestId = generateUUID()
         const bearerToken = authToken.startsWith('Bearer ') ? authToken : `Bearer ${authToken}`
-        const proxyAgent = getProxyAgent(account)
 
-        const headers = {
-            'Authorization': bearerToken,
-            'Content-Type': 'application/json',
-            'x-request-id': requestId,
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+        // Antidetect: per-account fingerprint headers replace static UA
+        const baseHeaders = buildRequestHeaders(account, {
+            extra: {
+                'Authorization': bearerToken,
+                'x-request-id': requestId
+            }
+        })
+        const headers = baseHeaders
 
         const payload = {
             filename,
@@ -117,11 +124,7 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
             timeout: UPLOAD_CONFIG.timeout
         }
 
-        // 添加代理配置
-        if (proxyAgent) {
-            requestConfig.httpsAgent = proxyAgent
-            requestConfig.proxy = false
-        }
+        applyProxyToAxiosConfig(requestConfig, account);
 
         logger.info(`请求STS Token: ${filename} (${filesize} bytes, ${filetypeSimple})`, 'UPLOAD', '🎫')
 
@@ -174,7 +177,7 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
         if (error.response?.status === 403) {
             logger.error('403 Forbidden错误，可能是Token权限问题', 'UPLOAD')
             logger.error('认证失败，请检查Token权限', 'UPLOAD')
-            throw new Error('认证失败，请检查Token权限')
+            throw new Error('认证失败，请检查Token权限', { cause: error })
         }
 
         // 重试逻辑
@@ -194,15 +197,51 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
 }
 
 /**
+ * Preserve the OSS buffered-upload response contract while bypassing Bun's Node agent shim.
+ */
+const createOssProxyClient = (account) => {
+    if (!process.versions.bun || !getProxyAgent(account)) return undefined;
+    return {
+        async request(url, options) {
+            let response;
+            try {
+                response = await axios.request(applyProxyToAxiosConfig({
+                    url,
+                    method: options.method,
+                    headers: options.headers,
+                    data: options.content,
+                    timeout: options.timeout,
+                    responseType: 'arraybuffer',
+                    validateStatus: () => true
+                }, account));
+            } catch (error) {
+                // ali-oss recognizes urllib's transport status codes when preserving errors.
+                error.status = ['ETIMEDOUT', 'ECONNABORTED'].includes(error.code) ? -2 : -1;
+                throw error;
+            }
+            const data = Buffer.from(response.data);
+            const headers = response.headers.toJSON();
+            return {
+                status: response.status,
+                headers,
+                data,
+                res: { status: response.status, statusCode: response.status, headers, size: data.length }
+            };
+        }
+    };
+};
+
+/**
  * 使用STS凭证将文件Buffer上传到阿里云OSS（带重试机制）
  * @param {Buffer} fileBuffer - 文件内容的Buffer
  * @param {Object} stsCredentials - STS凭证
  * @param {Object} ossInfo - OSS信息
  * @param {string} fileContentTypeFull - 文件的完整MIME类型
  * @param {number} retryCount - 重试次数
+ * @param {Object} [account] - 账户对象，用于保持 STS 和 OSS 的代理一致
  * @returns {Promise<Object>} 上传结果
  */
-const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileContentTypeFull, retryCount = 0) => {
+const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileContentTypeFull, retryCount = 0, account) => {
     try {
         // 参数验证
         if (!fileBuffer || !stsCredentials || !ossInfo) {
@@ -210,6 +249,7 @@ const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileConte
             throw new Error('缺少必要的上传参数')
         }
 
+        const proxyAgent = getProxyAgent(account);
         const client = new OSS({
             accessKeyId: stsCredentials.access_key_id,
             accessKeySecret: stsCredentials.access_key_secret,
@@ -217,6 +257,9 @@ const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileConte
             bucket: ossInfo.bucket,
             endpoint: ossInfo.endpoint,
             secure: true,
+            agent: proxyAgent,
+            httpsAgent: proxyAgent,
+            urllib: createOssProxyClient(account),
             timeout: UPLOAD_CONFIG.timeout
         })
 
@@ -244,7 +287,7 @@ const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileConte
             logger.warn(`等待 ${delayMs}ms 后重试OSS上传...`, 'UPLOAD', '⏳')
             await delay(delayMs)
 
-            return uploadToOssWithSts(fileBuffer, stsCredentials, ossInfo, fileContentTypeFull, retryCount + 1)
+            return uploadToOssWithSts(fileBuffer, stsCredentials, ossInfo, fileContentTypeFull, retryCount + 1, account);
         }
 
         throw error
@@ -291,7 +334,7 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, acco
         )
 
         // 第二步：上传到OSS
-        await uploadToOssWithSts(fileBuffer, credentials, file_info, mimeType)
+        await uploadToOssWithSts(fileBuffer, credentials, file_info, mimeType, 0, account);
 
         logger.success('文件上传流程完成', 'UPLOAD')
 
@@ -315,25 +358,85 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, acco
  * @param {Object} [account]
  * @param {Object} [options]
  */
+/**
+ * 解析服务整体故障的信号。Qwen 挂掉时仍回 HTTP 200，但 body 是
+ * `{"success":false,"data":{"code":"Internal_Server_Error"}}`（status 接口）或
+ * `{"success":true,"data":{"code":"Internal_Server_Error"}}`（parse 接口），没有任何
+ * 按文件的 status。下面的轮询把它当成「还没好」：30 次 × 500 ms = 15 s，然后报一个
+ * 并非超时的「解析超时」。实测 2026-09-09 21:25 起 22/22 次都是这个形状。
+ * @param {import('axios').AxiosResponse} response
+ * @returns {string|null} 故障码；正常或未知时为 null
+ */
+/**
+ * Segunda forma, medida en vivo 2026-09-10 04:29-04:54 con un probe desde el VPS:
+ * getstsToken y OSS van bien, pero POST /api/v2/files/parse contesta HTTP 200 con la
+ * pagina `aliyun_waf_captcha` (16 KiB de HTML, `<meta name="aliyun_waf_captcha">`).
+ * axios entrega el HTML como string; para el parser JSON de arriba era "sin codigo",
+ * asi que se hacian 30 sondeos y luego un "解析超时" que tampoco era timeout.
+ */
+const WAF_CAPTCHA_CODE = 'WAF_CAPTCHA'
+const WAF_BODY_RE = /aliyun_waf|AliyunCaptcha|<!doctype html|<html[\s>]/i
+
+const parseServiceFailureCode = (response) => {
+    const body = response?.data
+    const contentType = String(response?.headers?.['content-type'] || '')
+    if (typeof body === 'string') {
+        if (/text\/html/i.test(contentType) || WAF_BODY_RE.test(body.slice(0, 4096))) return WAF_CAPTCHA_CODE
+        return 'non_json_body'
+    }
+    if (!body || typeof body !== 'object') return null
+    const code = body.data && typeof body.data === 'object' ? body.data.code : undefined
+    if (body.success === false) return String(code || body.code || body.message || 'unknown')
+    if (typeof code === 'string' && /error|fail/i.test(code)) return code
+    return null
+}
+
+// `egress` names the proxy (or 'direct') the parse left through. The WAF
+// challenge is per egress IP, so this is the field that tells one burnt proxy
+// apart from a Qwen-side outage.
+const throwIfParseServiceFailed = (response, fileId, egress = 'unknown') => {
+    const code = parseServiceFailureCode(response)
+    if (code === null) return
+    const error = new Error(`Qwen 文档解析服务失败: ${code} (${fileId}, via ${egress})`)
+    error.code = code === WAF_CAPTCHA_CODE ? 'qwen_parse_waf_challenge' : 'qwen_parse_unavailable'
+    error.parseCode = code
+    error.egress = egress
+    throw error
+}
+
 const parseUploadedTextFile = async (fileId, authToken, account, options = {}) => {
     if (!fileId || !authToken) throw new Error('解析文档缺少 fileId 或认证 Token')
+    const egress = describeEgress(account)
 
     const baseUrl = getChatBaseUrl()
     const requestConfig = applyProxyToAxiosConfig({
-        headers: createAuthorizedHeaders(authToken),
+        headers: createAuthorizedHeaders(authToken, account),
         timeout: Math.max(1000, Number(options.timeoutMs) || 30000)
     }, account)
 
-    await axios.post(`${baseUrl}/api/v2/files/parse`, { file_id: fileId }, requestConfig)
+    // Transport failures (dead proxy, reset, timeout) never reach the JSON checks in
+    // throwIfParseServiceFailed; tag them with the egress too, or a burnt proxy logs as a bare ECONNRESET.
+    const postViaEgress = async (path, body) => {
+        try {
+            return await axios.post(`${baseUrl}${path}`, body, requestConfig)
+        } catch (error) {
+            if (error && typeof error === 'object' && !error.egress) {
+                error.egress = egress
+                error.message = `${error.message} (${fileId}, via ${egress})`
+            }
+            throw error
+        }
+    }
+
+    const parseResponse = await postViaEgress('/api/v2/files/parse', { file_id: fileId })
+    throwIfParseServiceFailed(parseResponse, fileId, egress)
 
     const maxAttempts = Math.max(1, Number(options.maxAttempts) || 30)
     const intervalMs = Math.max(50, Number(options.intervalMs) || 500)
+    let lastStatus = ''
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        const response = await axios.post(
-            `${baseUrl}/api/v2/files/parse/status`,
-            { file_id_list: [fileId] },
-            requestConfig
-        )
+        const response = await postViaEgress('/api/v2/files/parse/status', { file_id_list: [fileId] })
+        throwIfParseServiceFailed(response, fileId, egress)
         const payload = unwrapApiData(response)
         const records = Array.isArray(payload) ? payload : (payload?.list || payload?.items || [])
         const record = records.find(item => item?.file_id === fileId) || records[0]
@@ -343,10 +446,11 @@ const parseUploadedTextFile = async (fileId, authToken, account, options = {}) =
         if (status === 'failed' || status === 'error') {
             throw new Error(record?.error_msg || record?.message || 'Qwen 文档解析失败')
         }
+        if (status) lastStatus = status
         if (attempt < maxAttempts) await delay(intervalMs)
     }
 
-    throw new Error(`Qwen 文档解析超时: ${fileId}`)
+    throw new Error(`Qwen 文档解析超时: ${fileId} (last status="${lastStatus || 'none'}")`)
 }
 
 /**
@@ -393,12 +497,114 @@ const buildChatFileDescriptor = ({ fileId, fileUrl, filename, size }) => {
 /**
  * 上传并解析 Agent 长上下文，返回可直接放入 message.files 的描述符。
  */
+/**
+ * Cortacircuitos del parse. Con el WAF desafiando /files/parse cada intento cuesta un
+ * upload a OSS + un parse (~2-3 s) y otra pagina captcha contra la cuenta, y el cliente
+ * agentico vuelve cada Retry-After: 20 turnos en 5 min el 2026-09-10 04:32-04:37 (prod y
+ * qwen-next, identico), 0 respuestas utiles. Tras PARSE_BREAKER_STRIKES desafios seguidos
+ * se deja de subir durante `agentParseBreakerSeconds`; el 529 sale al instante con ese
+ * tiempo en Retry-After y el primer parse bueno lo cierra. No es evasion del WAF: es
+ * dejar de golpearlo.
+ */
+// Reloj inyectable: breaker y limitador comparten la fuente de tiempo para que los
+// tests avancen la ventana sin dormir.
+let parseClock = () => Date.now()
+const nowMs = () => parseClock()
+const setParseClockForTests = (fn) => { parseClock = typeof fn === 'function' ? fn : () => Date.now() }
+
+const PARSE_BREAKER_STRIKES = 3
+const parseBreaker = { strikes: 0, openUntil: 0 }
+
+const parseBreakerRemainingSeconds = () => Math.max(0, Math.ceil((parseBreaker.openUntil - nowMs()) / 1000))
+
+const resetParseBreaker = () => {
+    parseBreaker.strikes = 0
+    parseBreaker.openUntil = 0
+}
+
+/** @param {Error|null} error - null cuando el parse termino bien */
+const noteParseOutcome = (error) => {
+    if (!error) {
+        resetParseBreaker()
+        return
+    }
+    if (error.code !== 'qwen_parse_waf_challenge') return
+    parseBreaker.strikes += 1
+    const cooldownSeconds = Math.max(0, Number(config.agentParseBreakerSeconds) || 0)
+    if (cooldownSeconds > 0 && parseBreaker.strikes >= PARSE_BREAKER_STRIKES) {
+        parseBreaker.openUntil = nowMs() + cooldownSeconds * 1000
+        error.retryAfterSeconds = cooldownSeconds
+        logger.warn(`Agent 上下文解析被 WAF 连续拦截 ${parseBreaker.strikes} 次，${cooldownSeconds}s 内不再上传 (egress ${error.egress || 'unknown'})`, 'UPLOAD')
+    }
+}
+
+const assertParseBreakerClosed = (account) => {
+    const remaining = parseBreakerRemainingSeconds()
+    if (remaining <= 0) return
+    const egress = describeEgress(account)
+    const error = new Error(`Qwen 文档解析服务失败: ${WAF_CAPTCHA_CODE} (breaker open, ${remaining}s left, upload skipped, via ${egress})`)
+    error.code = 'qwen_parse_waf_challenge'
+    error.parseCode = WAF_CAPTCHA_CODE
+    error.egress = egress
+    error.retryAfterSeconds = remaining
+    error.breakerOpen = true
+    throw error
+}
+
+/**
+ * Limitador de ritmo del parse. El WAF de Aliyun cuenta POST /files/parse por IP de
+ * origen: el 2026-09-10 12:28-12:31 diez upload+parse en 150 s (un turno de Claude Code
+ * cada ~15 s, 120-195 KB cada uno) bastaron para que empezara a desafiar; ~1/hora nunca
+ * lo hace. El breaker solo reacciona DESPUES del desafio y luego bloquea 300 s. Aqui se
+ * reserva un hueco ANTES de tocar STS/OSS/parse: sin hueco, 529 inmediato con Retry-After
+ * corto (5-20 s) y el cliente agentico se autorregula. Los intentos limitados no llegan
+ * al WAF, asi que no cuentan como strike. `agentParseMaxPerWindow` = 0 lo desactiva.
+ */
+const PARSE_RATE_LIMITED_CODE = 'PARSE_RATE_LIMITED'
+const PARSE_RATE_RETRY_MIN_SECONDS = 5
+const PARSE_RATE_RETRY_MAX_SECONDS = 20
+const parseWindow = []
+
+const resetParseRateLimiter = () => { parseWindow.length = 0 }
+
+const takeParseSlot = (account) => {
+    const max = Math.max(0, parseInt(config.agentParseMaxPerWindow, 10) || 0)
+    if (max <= 0) return
+    const windowSeconds = Math.max(1, parseInt(config.agentParseWindowSeconds, 10) || 120)
+    const windowMs = windowSeconds * 1000
+    const now = nowMs()
+    while (parseWindow.length > 0 && parseWindow[0] <= now - windowMs) parseWindow.shift()
+    if (parseWindow.length < max) {
+        parseWindow.push(now)
+        return
+    }
+    const untilFree = Math.ceil((parseWindow[0] + windowMs - now) / 1000)
+    const retryAfter = Math.min(PARSE_RATE_RETRY_MAX_SECONDS, Math.max(PARSE_RATE_RETRY_MIN_SECONDS, untilFree))
+    const egress = describeEgress(account)
+    logger.warn(`Agent 上下文解析已达速率上限 (${max}/${windowSeconds}s)，${retryAfter}s 后重试 (egress ${egress})`, 'UPLOAD')
+    const error = new Error(`Qwen 文档解析服务失败: ${PARSE_RATE_LIMITED_CODE} (${max}/${windowSeconds}s reached, upload skipped, via ${egress})`)
+    error.code = 'qwen_parse_rate_limited'
+    error.parseCode = PARSE_RATE_LIMITED_CODE
+    error.egress = egress
+    error.retryAfterSeconds = retryAfter
+    error.breakerOpen = false
+    throw error
+}
+
 const uploadAgentContextFile = async (text, authToken, account, options = {}) => {
     const content = Buffer.from(String(text || ''), 'utf8')
     if (content.length === 0) throw new Error('Agent 上下文为空')
+    assertParseBreakerClosed(account)
+    takeParseSlot(account)
     const filename = options.filename || `QWEN2API_AGENT_CONTEXT_${Date.now()}.txt`
     const uploaded = await uploadFileToQwenOss(content, filename, authToken, account)
-    await parseUploadedTextFile(uploaded.file_id, authToken, account, options)
+    try {
+        await parseUploadedTextFile(uploaded.file_id, authToken, account, options)
+    } catch (error) {
+        noteParseOutcome(error)
+        throw error
+    }
+    noteParseOutcome(null)
     return buildChatFileDescriptor({
         fileId: uploaded.file_id,
         fileUrl: uploaded.file_url,
@@ -413,5 +619,11 @@ module.exports = {
     uploadFileToQwenOss,
     parseUploadedTextFile,
     buildChatFileDescriptor,
-    uploadAgentContextFile
+    uploadAgentContextFile,
+    resetParseBreaker,
+    noteParseOutcome,
+    assertParseBreakerClosed,
+    takeParseSlot,
+    resetParseRateLimiter,
+    setParseClockForTests
 }

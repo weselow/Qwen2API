@@ -1,33 +1,54 @@
-FROM node:lts-alpine
+# syntax=docker/dockerfile:1
 
-# 全局安装PM2
-RUN npm install -g pm2
+ARG BUN_VERSION=1.3.14
+ARG BINARY_SOURCE=build
 
+FROM --platform=$BUILDPLATFORM oven/bun:${BUN_VERSION}-alpine AS base
 WORKDIR /app
 
-# 复制package文件
-COPY package*.json ./
+FROM base AS frontend-build
+WORKDIR /app/public
+COPY public/package.json public/bun.lock ./
+RUN --mount=type=cache,target=/root/.bun/install/cache \
+    bun install --frozen-lockfile
+COPY public/ ./
+RUN bun run --bun build
 
-# 安装依赖
-RUN npm install
+FROM base AS production-dependencies
+COPY package.json bun.lock ./
+RUN --mount=type=cache,target=/root/.bun/install/cache \
+    bun install --frozen-lockfile --production
 
-# 复制应用代码
-COPY . .
+FROM base AS build
+ARG TARGETARCH
+COPY --from=production-dependencies /app/node_modules ./node_modules
+COPY package.json ./
+COPY src/ ./src/
+COPY tools/build-binary.mjs tools/binary-entry.mjs tools/binary-frontend.mjs ./tools/
+COPY --from=frontend-build /app/public/dist ./public/dist
+RUN case "$TARGETARCH" in \
+      amd64) bun_arch=x64 ;; \
+      arm64) bun_arch=arm64 ;; \
+      *) echo "Unsupported architecture: $TARGETARCH"; exit 1 ;; \
+    esac && \
+    bun --no-env-file tools/build-binary.mjs \
+      --target "bun-linux-${bun_arch}-musl" --outfile /out/qwen2api
 
-# 构建前端应用
-RUN cd public && npm install && npm run build
+# CI selects this stage to package the same executable it just compiled.
+FROM scratch AS prebuilt
+ARG TARGETARCH
+COPY pkg_dist/docker/${TARGETARCH}/qwen2api /out/qwen2api
 
-# 删除前端不必要文件
-RUN rm -rf public/src public/node_modules public/package*.json
+FROM ${BINARY_SOURCE} AS selected-binary
 
-# 设置权限
-RUN chmod 777 /app
+FROM alpine:3.24 AS runtime
+RUN apk add --no-cache ca-certificates libstdc++ \
+    && mkdir -p /app/data /app/logs /app/caches
+WORKDIR /app
+ENV NODE_ENV=production \
+    QWEN2API_RUNTIME_DIR=/app
+COPY --from=selected-binary --chmod=0755 /out/qwen2api /usr/local/bin/qwen2api
 
-# 创建日志目录
-RUN mkdir -p logs
-
-# 暴露端口（通过环境变量SERVICE_PORT控制）
 EXPOSE 3000
-
-# 使用PM2启动应用，并保持容器运行
-CMD ["npm", "start"]
+ENTRYPOINT ["/usr/local/bin/qwen2api"]
+CMD []
