@@ -5,7 +5,8 @@ const { logger } = require('./logger')
  * 负责账户的轮询选择和负载均衡
  */
 class AccountRotator {
-  constructor() {
+  constructor(isTokenValid = token => Boolean(token)) {
+    this.isTokenValid = isTokenValid
     this.accounts = []
     this.currentIndex = 0
     this.lastUsedTimes = new Map() // 记录每个账户的最后使用时间
@@ -233,7 +234,7 @@ class AccountRotator {
    * @private
    */
   _isAccountAvailable(account) {
-    if (!account.token) {
+    if (!this.isTokenValid(account.token)) {
       return false
     }
 
