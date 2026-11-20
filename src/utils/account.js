@@ -101,7 +101,7 @@ class Account {
         // 初始化各个管理器
         this.dataPersistence = new DataPersistence()
         this.tokenManager = new TokenManager()
-        this.accountRotator = new AccountRotator()
+        this.accountRotator = new AccountRotator(token => Boolean(this.tokenManager.validateToken(token)))
 
         // 账户数据
         this.accountTokens = []
@@ -183,8 +183,12 @@ class Account {
                 await this._loginEnvironmentAccounts()
             }
 
-            // 验证和清理无效令牌
-            await this._validateAndCleanTokens()
+            // Persisted records belong in account management even when their token
+            // is expired. Startup must not silently drop them or retry their login.
+            // Rotation validates tokens independently before selecting an account.
+            if (config.dataSaveMode === 'none') {
+                await this._validateAndCleanTokens()
+            }
 
             // 更新账户轮询器
             this.accountRotator.setAccounts(this.accountTokens)
@@ -195,7 +199,9 @@ class Account {
                 if (config.cliEnabled) {
                     logger.info(`后台初始化所有 ${this.accountTokens.length} 个账户的 CLI`, 'ACCOUNT')
                     Promise.allSettled(
-                        this.accountTokens.map(account => this._initializeCliAccount(account))
+                        this.accountTokens
+                            .filter(account => this.tokenManager.validateToken(account.token))
+                            .map(account => this._initializeCliAccount(account))
                     ).then(() => {
                         const cliReady = this.accountTokens.filter(a => a.cli_info).length
                         const cliUnsupported = this.accountTokens.filter(a => a.cli_unavailable_reason === 'unsupported').length
