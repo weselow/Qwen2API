@@ -191,6 +191,22 @@ const resolveProxyUrl = (account) => {
     return config.proxyUrl || null
 }
 
+
+/** Format only the proxy endpoint for logs; never return raw input on parse errors. */
+const formatProxyForLog = (value) => {
+    if (!value) return 'direct'
+    try {
+        const parsed = new URL(value)
+        if (!parsed.host || !['http:', 'https:', 'socks5:', 'socks5h:'].includes(parsed.protocol)) {
+            return '[invalid proxy URL]'
+        }
+        const credentials = parsed.username || parsed.password ? '***@' : ''
+        return `${parsed.protocol}//${credentials}${parsed.host}`
+    } catch {
+        return '[invalid proxy URL]'
+    }
+}
+
 /**
  * Egress identity for logs: `protocol//host:port` of the proxy an account's
  * requests leave through, or 'direct' when none applies. Qwen's WAF judges by
@@ -349,6 +365,7 @@ const fetchWithProxy = (url, fetchOptions = {}, account) => {
 module.exports = {
     resolveProxyUrl,
     describeEgress,
+    formatProxyForLog,
     getProxyAgent,
     invalidateProxyAgent,
     getChatBaseUrl,

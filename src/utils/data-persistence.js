@@ -37,6 +37,24 @@ const enqueueFileTask = (task) => {
   return result
 }
 
+// Serialize account writes/deletes across persistence instances. A deleted record
+// may only be recreated by an explicit account addition, never a stale stats save.
+const accountWriteQueues = new Map()
+const deletedAccountKeys = new Set()
+const accountVersions = new Map()
+const markAccountDeleted = (key) => {
+  if (!deletedAccountKeys.has(key)) accountVersions.set(key, (accountVersions.get(key) || 0) + 1)
+  deletedAccountKeys.add(key)
+}
+const enqueueAccountTask = (key, task) => {
+  const previous = accountWriteQueues.get(key) || Promise.resolve()
+  const result = previous.then(task, task)
+  const tail = result.then(() => {}, () => {})
+  accountWriteQueues.set(key, tail)
+  tail.then(() => { if (accountWriteQueues.get(key) === tail) accountWriteQueues.delete(key) })
+  return result
+}
+
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
 class DataPersistence {
@@ -72,30 +90,87 @@ class DataPersistence {
     }
   }
 
-  /**
-   * 保存单个账户数据
-   * @param {string} email - 邮箱
-   * @param {Object} accountData - 账户数据
-   * @returns {Promise<boolean>} 保存是否成功
-   */
-  async saveAccount(email, accountData) {
-    try {
-      switch (config.dataSaveMode) {
-        case 'redis':
-          return await this._saveToRedis(email, accountData)
-        case 'file':
-          return await this._saveToFile(email, accountData)
-        case 'none':
-          logger.warn('环境变量模式不支持保存账户数据', 'DATA')
-          return false
-        default:
-          logger.error(`不支持的数据保存模式: ${config.dataSaveMode}`, 'DATA')
-          throw new Error(`不支持的数据保存模式: ${config.dataSaveMode}`)
+  _accountKey(email) {
+    const store = config.dataSaveMode === 'redis' ? config.redisURL : this.dataFilePath
+    return JSON.stringify([config.dataSaveMode, store, email])
+  }
+
+  /** Save an account; only explicit additions may recreate a deleted record. */
+  async saveAccount(email, accountData, { allowCreate = false, expectedVersion } = {}) {
+    const key = this._accountKey(email)
+    const version = expectedVersion ?? (accountVersions.get(key) || 0)
+    return enqueueAccountTask(key, async () => {
+      if ((accountVersions.get(key) || 0) !== version || (deletedAccountKeys.has(key) && !allowCreate)) return false
+      try {
+        let saved
+        switch (config.dataSaveMode) {
+          case 'redis': saved = await this._saveToRedis(email, accountData); break
+          case 'file': saved = await this._saveToFile(email, accountData); break
+          case 'none': return false
+          default: throw new Error(`Unsupported data save mode: ${config.dataSaveMode}`)
+        }
+        if (saved && allowCreate) deletedAccountKeys.delete(key)
+        return saved
+      } catch (error) {
+        logger.error(`保存账户数据失败 (${email})`, 'DATA', '', error)
+        return false
       }
-    } catch (error) {
-      logger.error(`保存账户数据失败 (${email})`, 'DATA', '', error)
-      return false
-    }
+    })
+  }
+
+  /** Delete storage before acknowledging removal from the in-memory account list. */
+  async deleteAccount(email) {
+    const key = this._accountKey(email)
+    return enqueueAccountTask(key, async () => {
+      try {
+        let removed
+        switch (config.dataSaveMode) {
+          case 'redis': removed = await redisClient.deleteAccount(email); break
+          case 'file': removed = await this._deleteFromFile(email, key); break
+          case 'none': removed = true; break
+          default: throw new Error(`Unsupported data save mode: ${config.dataSaveMode}`)
+        }
+        if (removed) {
+          markAccountDeleted(key)
+          const timer = this._statsPersistTimers.get(email)
+          if (timer) clearTimeout(timer)
+          this._statsPersistTimers.delete(email)
+          this._statsPendingPayload.delete(email)
+        }
+        return removed
+      } catch (error) {
+        logger.error(`删除账户数据失败 (${email})`, 'DATA', '', error)
+        return false
+      }
+    })
+  }
+
+  async _deleteFromFile(email, key) {
+    return enqueueFileTask(async () => {
+      const data = await this._readDataFile()
+      data.accounts = (data.accounts || []).filter(account => account.email !== email)
+      const content = JSON.stringify(data, null, 2)
+      // Deletion must also reach recovery data, including deletion of the last
+      // record. Refresh this snapshot before committing the authoritative file.
+      let previousBackup = null
+      try { previousBackup = await fs.readFile(this.backupFilePath, 'utf-8') }
+      catch (error) { if (error.code !== 'ENOENT') throw error }
+      await this._writeFileAtomic(this.backupFilePath, content)
+      try {
+        await this._writeFileAtomic(this.dataFilePath, content)
+      } catch (error) {
+        try {
+          if (previousBackup === null) await fs.unlink(this.backupFilePath)
+          else await this._writeFileAtomic(this.backupFilePath, previousBackup)
+        } catch (rollbackError) {
+          logger.error('Account deletion backup rollback failed', 'DATA', '', rollbackError)
+        }
+        throw error
+      }
+      lastBackupAt = Date.now()
+      markAccountDeleted(key)
+      return true
+    })
   }
 
   /**
@@ -169,12 +244,13 @@ class DataPersistence {
    * @returns {Promise<boolean>} 保存是否成功
    */
   async saveAllAccounts(accounts) {
+    const versions = new Map(accounts.map(account => [account.email, accountVersions.get(this._accountKey(account.email)) || 0]))
     try {
       switch (config.dataSaveMode) {
         case 'redis':
-          return await this._saveAllToRedis(accounts)
+          return await this._saveAllToRedis(accounts, versions)
         case 'file':
-          return await this._saveAllToFile(accounts)
+          return await this._saveAllToFile(accounts, versions)
         case 'none':
           logger.warn('环境变量模式不支持保存账户数据', 'DATA')
           return false
@@ -283,10 +359,10 @@ class DataPersistence {
    * 批量保存到 Redis
    * @private
    */
-  async _saveAllToRedis(accounts) {
+  async _saveAllToRedis(accounts, versions) {
     let successCount = 0
     for (const account of accounts) {
-      const success = await this._saveToRedis(account.email, account)
+      const success = await this.saveAccount(account.email, account, { expectedVersion: versions.get(account.email) })
       if (success) successCount++
     }
     return successCount === accounts.length
@@ -296,20 +372,28 @@ class DataPersistence {
    * 批量保存到文件
    * @private
    */
-  async _saveAllToFile(accounts) {
+  async _saveAllToFile(accounts, versions) {
     return enqueueFileTask(async () => {
       const data = await this._readDataFile()
 
-      data.accounts = accounts.map(account => ({
-        email: account.email,
-        password: account.password,
-        token: account.token,
-        expires: account.expires,
-        proxy: account.proxy ?? null,
-        stats: account.stats ?? undefined,
-        statsHistory: account.statsHistory ?? undefined,
-        fingerprint: account.fingerprint ?? undefined
-      }))
+      // Like Redis HSET, a daily snapshot updates records without removing
+      // accounts added concurrently. Ignore snapshots predating a deletion.
+      const merged = new Map((data.accounts || []).map(account => [account.email, account]))
+      for (const account of accounts) {
+        const key = this._accountKey(account.email)
+        if (deletedAccountKeys.has(key) || versions.get(account.email) !== (accountVersions.get(key) || 0)) continue
+        merged.set(account.email, {
+          email: account.email,
+          password: account.password,
+          token: account.token,
+          expires: account.expires,
+          proxy: account.proxy ?? null,
+          stats: account.stats ?? undefined,
+          statsHistory: account.statsHistory ?? undefined,
+          fingerprint: account.fingerprint ?? undefined
+        })
+      }
+      data.accounts = [...merged.values()]
 
       await this._writeDataFile(data)
       return true
@@ -328,7 +412,7 @@ class DataPersistence {
     if (config.dataSaveMode === 'none') {
       return false
     }
-    if (!email || !stats) {
+    if (!email || !stats || deletedAccountKeys.has(this._accountKey(email))) {
       return false
     }
 
