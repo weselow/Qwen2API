@@ -994,7 +994,8 @@ class Account {
                 invalidateProxyAgent(oldProxy)
             }
 
-            logger.success(`账户 ${email} 代理更新成功 (${oldProxy || '无'} → ${newProxy || '无'})`, 'ACCOUNT')
+            const { formatProxyForLog } = require('./proxy-helper')
+            logger.success(`账户 ${email} 代理更新成功 (${formatProxyForLog(oldProxy)} → ${formatProxyForLog(newProxy)})`, 'ACCOUNT')
             return true
         } catch (error) {
             logger.error(`更新账户 ${email} 代理失败`, 'ACCOUNT', '', error)
