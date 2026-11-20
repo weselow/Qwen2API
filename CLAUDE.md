@@ -35,6 +35,8 @@ docs_fork/               # Наши заметки (в .gitignore)
 - Docker Compose: `docker/docker-compose.yml`
 - Env: `API_KEY`, `ACCOUNTS`, `DATA_SAVE_MODE=file`
 - Coolify: проект из GitHub-репозитория
+- Прод: coolify-triglav, `ssh root@10.20.0.210` (не coolify.jabc.loc), контейнер `qwen2api-m04skwsg8kck8ckwkc04ssss-*`, данные `/app/data/data.json` внутри контейнера
+- Логи: `docker logs --since 30m <контейнер> 2>&1 | grep -E "\[(ERROR|AUTH|CHAT|ACCOUNT)\]" -A1` — без фильтра идут стеки axios и куски собранного JS
 
 ## Синхронизация с upstream
 
