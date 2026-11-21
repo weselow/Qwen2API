@@ -30,6 +30,24 @@ const parseApiKeys = (apiKeyEnv = process.env.API_KEY) => {
 
 const { apiKeys, adminKey } = parseApiKeys()
 
+/**
+ * 解析 COMPLETIONS_TRANSPORT（completions 的 TLS 传输选择）：
+ * auto（默认，有 curl-impersonate 就用，否则 axios + 一次性警告）|
+ * impersonate（强制，缺二进制直接报错）| axios（纯 Node TLS，旧行为）。
+ * 拼错直接拒绝启动：静默回落到 axios 会把 Baxia 风控带回来且无从排查。
+ * @returns {string}
+ */
+const parseCompletionsTransport = (value = process.env.COMPLETIONS_TRANSPORT) => {
+    const raw = value == null || String(value).trim() === '' ? 'auto' : String(value).trim().toLowerCase()
+    if (!['auto', 'impersonate', 'axios'].includes(raw)) {
+        throw new Error(
+            `COMPLETIONS_TRANSPORT="${value}" 无效：只接受 auto | impersonate | axios。` +
+            'auto = 找到 curl-impersonate 就用 Chrome TLS 指纹，否则 axios；impersonate = 强制；axios = 旧行为。'
+        )
+    }
+    return raw
+}
+
 const config = {
     dataSaveMode: process.env.DATA_SAVE_MODE || "none",
     apiKeys: apiKeys,
@@ -145,6 +163,11 @@ const config = {
     // Antidetect Tier 1: per-account fingerprint & header diversity.
     // Set to 'false' to instantly roll back to legacy static headers.
     antidetectTier1Enabled: process.env.ANTIDETECT_TIER1_ENABLED !== 'false',
+    // completions 传输（src/utils/impersonate-transport.js）：纯 Node TLS 会被
+    // Baxia 风控（2026-11-21 实测），curl-impersonate 的 Chrome 指纹可通过。
+    // curlImpersonateBin 显式指定二进制路径，留空则按 PATH 查找。
+    completionsTransport: parseCompletionsTransport(),
+    curlImpersonateBin: process.env.CURL_IMPERSONATE_BIN || null,
     // Anthropic SSE `ping` cadence during upstream silence. Lower it if a client
     // or reverse proxy gives up sooner than this; the compensation retry can hold
     // the stream for tens of seconds with nothing else to send.
@@ -156,5 +179,6 @@ const config = {
 
 // 暴露解析器本身以便测试空槽位的拒绝逻辑（config 对象是模块级单例，无法重复解析）。
 config.parseApiKeys = parseApiKeys
+config.parseCompletionsTransport = parseCompletionsTransport
 
 module.exports = config

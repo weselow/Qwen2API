@@ -115,9 +115,9 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
-      - name: Compile Alpine executable
+      - name: Compile Debian (glibc) executable
         if: runner.os == 'Linux'
-        run: bun --no-env-file tools/build-binary.mjs --target bun-${{ matrix.platform }}-musl --outfile pkg_dist/docker/${{ matrix.docker_arch }}/qwen2api
+        run: bun --no-env-file tools/build-binary.mjs --target bun-${{ matrix.platform }} --outfile pkg_dist/docker/${{ matrix.docker_arch }}/qwen2api
       - uses: docker/setup-buildx-action@v3
         if: runner.os == 'Linux'
       - name: Build container from the compiled executable
@@ -136,7 +136,7 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           cache-from: type=gha,scope=binary-image-${{ matrix.docker_arch }}
           cache-to: type=gha,mode=max,scope=binary-image-${{ matrix.docker_arch }}
-      - name: Verify actual Alpine container
+      - name: Verify actual Debian container
         if: runner.os == 'Linux'
         run: bun run test:bun --docker-image qwen2api:ci-${{ matrix.docker_arch }}
       - name: Export the tested image without rebuilding it

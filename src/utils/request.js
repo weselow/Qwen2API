@@ -4,7 +4,8 @@ const accountManager = require('./account.js')
 const config = require('../config/index.js')
 const { logger } = require('./logger')
 const { getSsxmodForAccount } = require('./ssxmod-manager')
-const { applyProxyToAxiosConfig, getChatBaseUrl } = require('./proxy-helper');
+const { applyProxyToAxiosConfig, getChatBaseUrl, resolveProxyUrl } = require('./proxy-helper');
+const { postCompletions } = require('./impersonate-transport.js')
 const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
@@ -802,7 +803,12 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
             if (attempt === 1) {
                 logger.network(`发送聊天请求`, 'REQUEST')
             }
-            const response = await axios.post(url, payload, requestConfig)
+            // completions 唯一的发送点：由 impersonate-transport 按 COMPLETIONS_TRANSPORT
+            // 在 curl-impersonate（Chrome TLS 指纹）与 axios 之间分派。代理的取值与上面
+            // applyProxyToAxiosConfig 的条件保持一致——lab 模式直连。
+            const response = await postCompletions(url, payload, requestConfig, {
+                proxyUrl: lab.authOrigin ? null : resolveProxyUrl(currentAccount)
+            })
             if (response.status === 200) {
                 // 返回 currentAccount——调用方在消费完 stream 后据此累计 stats
                 // 注意：当前实现单次尝试都用同一个 currentAccount（不轮换），
