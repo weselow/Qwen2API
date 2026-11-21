@@ -73,7 +73,8 @@ Volume `signin_profiles` хранит браузерные профили: в н
 каталог на хосте должен быть доступен на запись UID 10001 (пользователь `app`
 в образе). Coolify: существующий ресурс, Base Directory `/`, Compose Location
 `/docker/docker-compose.signin.yml` (как в DNS-варианте, см. `docs/dns-sidecar.md`);
-профили можно оставить named volume.
+профили можно оставить named volume. Для прода вместе с DNS-sidecar используйте
+`/docker/docker-compose.prod.yml` (см. `docs/prod-hybrid-deploy.md`).
 
 Пер-аккаунтные прокси: приложение передаёт `account.proxy` (или глобальный
 `PROXY_URL`) в каждом запросе к воркеру; браузерный контекст запускается через
