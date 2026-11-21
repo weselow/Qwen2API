@@ -463,14 +463,10 @@ const deleteAccount = async (key) => {
   try {
     const client = await ensureConnection()
 
-    const result = await client.del(`user:${key}`)
-    if (result > 0) {
-      logger.success(`账户 ${key} 删除成功`, 'REDIS')
-      return true
-    } else {
-      logger.warn(`账户 ${key} 不存在`, 'REDIS')
-      return false
-    }
+    await client.del(`user:${key}`)
+    // DEL is idempotent: an already absent record is also durably deleted.
+    logger.success(`账户 ${key} 删除成功`, 'REDIS')
+    return true
   } catch (err) {
     logger.error(`删除账户 ${key} 失败`, 'REDIS', '', err)
     return false
@@ -595,6 +591,11 @@ const redisClient = {
   async hgetall(key) {
     const client = await ensureConnection()
     return client.hgetall(key)
+  },
+
+  async hdel(key, ...fields) {
+    const client = await ensureConnection()
+    return client.hdel(key, ...fields)
   },
 
   async exists(key) {

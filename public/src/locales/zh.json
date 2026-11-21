@@ -87,6 +87,12 @@
     "chat": "测试会话"
   },
   "msg": {
+    "signin_waf_block": "Qwen 安全服务拦截了登录。请打开 Qwen Chat 检查访问情况。",
+    "signin_verification_required": "请在 Qwen Chat 完成验证。",
+    "signin_rejected": "Qwen 拒绝了登录。",
+    "signin_upstream_error": "Qwen 返回了异常登录响应。",
+    "signin_transport_error": "登录时无法收到 Qwen 响应。",
+    "signin_local_error": "本地登录请求失败。",
     "batchComplete": "批量添加完成: 成功{n}个",
     "batchFailed": "失败{n}个",
     "batchSkipped": "跳过{n}个",

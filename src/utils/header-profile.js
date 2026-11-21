@@ -8,12 +8,13 @@ const config = require('../config/index.js')
 const { getTimezoneHeader } = require('./tools')
 
 // chat.qwen.ai 前端版本（FE version）：请求头 Version 必须与线上前端一致，
-// 否则 /api/v2/chat/completions 返回 Bad_Request（2026-10-17 实测线上为 0.3.19）。
-// 前端三天内从 0.3.17 升到 0.3.19，此处过期需同步更新。
-const QWEN_WEB_VERSION = '0.3.19'
+// 否则 /api/v2/chat/completions 返回 Bad_Request（2026-11-21 实测线上为 0.3.49，
+// 见 docs/et0-live-integration-2026-11-21.md；漂移检测：tools/et0-live-probe.js）。
+const QWEN_WEB_VERSION = '0.3.49'
 
-// Chrome version pool — small set to avoid identical UA across all accounts
-const CHROME_VERSIONS = ['149.0.0.0', '148.0.0.0', '147.0.0.0', '146.0.0.0']
+// Refreshed against locally observed Chrome 157 (not a stable-release claim).
+// Keep the existing four-major deterministic profile spread.
+const CHROME_VERSIONS = ['157.0.0.0', '156.0.0.0', '155.0.0.0', '154.0.0.0']
 
 /**
  * Derive a stable Chrome major version from fingerprint hash.
@@ -64,22 +65,73 @@ function buildUserAgent(fingerprint) {
 function buildSecChUa(fingerprint) {
     const ver = pickChromeVersion(fingerprint)
     const major = ver.split('.')[0]
-    return `"Google Chrome";v="${major}", "Chromium";v="${major}", "Not)A;Brand";v="24"`
+    return `"Not-A.Brand";v="99", "Google Chrome";v="${major}", "Chromium";v="${major}"`
 }
 
 /**
  * Legacy static headers used when ANTIDETECT_TIER1_ENABLED=false.
- * Matches pre-change hardcoded values exactly.
+ * Uses the refreshed default browser identity without per-account variation.
  */
 const LEGACY_HEADERS = {
     'sec-ch-ua-platform': '"Windows"',
     'accept-language': 'zh-CN,zh;q=0.9',
-    'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+    'sec-ch-ua': buildSecChUa(),
     'sec-ch-ua-mobile': '?0',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36'
+    'user-agent': buildUserAgent()
 }
 
 const LEGACY_UA = LEGACY_HEADERS['user-agent']
+
+/**
+ * Signin-specific browser context. Never assemble chat authentication cookies,
+ * Authorization, frontend Version, timezone or source headers here.
+ * These headers improve consistency; they are not a demonstrated WAF remedy.
+ * Let axios negotiate supported encodings and connection framing.
+ */
+function buildSigninHeaders(account, options = {}) {
+    const fp = config.antidetectTier1Enabled && account && account.fingerprint
+    const language = fp && fp.language || 'zh-CN'
+    const headers = {
+        'user-agent': buildUserAgent(fp),
+        'sec-ch-ua': buildSecChUa(fp),
+        'sec-ch-ua-platform': platformToSecChUa(fp && fp.platform),
+        'sec-ch-ua-mobile': '?0',
+        'accept': 'application/json',
+        'content-type': 'application/json',
+        'accept-language': language.includes('-') ? `${language},${language.split('-')[0]};q=0.9` : language,
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+        'priority': 'u=1, i'
+    }
+    if (options.chatBaseUrl) {
+        const origin = new URL(options.chatBaseUrl).origin
+        headers.origin = origin
+        headers.referer = `${origin}/auth`
+    }
+    return headers
+}
+
+
+/**
+ * Build the timezone header in the live FE's format ('Sat Nov 21 2026 19:55:52 GMT+0400')
+ * from a fingerprint timezoneOffset (minutes behind UTC, as Date#getTimezoneOffset).
+ * 2026-11-21 live capture sends this exact shape; the old 'UTC+04' form is not FE-shaped.
+ * @param {number} tzOffset - getTimezoneOffset-style minutes (UTC+4 => -240)
+ * @returns {string}
+ */
+function fingerprintTimezoneHeader(tzOffset) {
+    const shifted = new Date(Date.now() - tzOffset * 60000)
+    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    const pad = n => String(n).padStart(2, '0')
+    const sign = tzOffset <= 0 ? '+' : '-'
+    const hours = Math.abs(tzOffset) / 60
+    const hhmm = `${pad(Math.floor(hours))}${pad(Math.round((hours % 1) * 60))}`
+    return `${days[shifted.getUTCDay()]} ${months[shifted.getUTCMonth()]} ${pad(shifted.getUTCDate())} ` +
+        `${shifted.getUTCFullYear()} ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}:` +
+        `${pad(shifted.getUTCSeconds())} GMT${sign}${hhmm}`
+}
 
 /**
  * Build full request headers for an upstream Qwen API call.
@@ -137,9 +189,7 @@ function buildRequestHeaders(account, options = {}) {
     // Derive timezone from fingerprint offset; fall back to server TZ only when missing or invalid
     const rawTz = fp && fp.timezoneOffset != null ? Number(fp.timezoneOffset) : NaN
     const tzOffset = Number.isFinite(rawTz) ? Math.trunc(rawTz) : null
-    const timezone = tzOffset !== null
-        ? `UTC${tzOffset <= 0 ? '+' : '-'}${String(Math.abs(tzOffset) / 60).padStart(2, '0')}`
-        : getTimezoneHeader()
+    const timezone = tzOffset !== null ? fingerprintTimezoneHeader(tzOffset) : getTimezoneHeader()
 
     const headers = {
         'sec-ch-ua-platform': secChPlatform,
@@ -180,11 +230,13 @@ function buildRequestHeaders(account, options = {}) {
 }
 
 module.exports = {
+    buildSigninHeaders,
     buildRequestHeaders,
     buildUserAgent,
     buildSecChUa,
     platformToSecChUa,
     pickChromeVersion,
+    fingerprintTimezoneHeader,
     LEGACY_HEADERS,
     LEGACY_UA
 }

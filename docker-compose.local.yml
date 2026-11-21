@@ -1,0 +1,93 @@
+# Локальный стенд форка: новый код (после слияния с upstream) против старого.
+# Не заменяет docker/docker-compose.dev.yml из upstream — тот трогать нельзя,
+# иначе каждое слияние будет давать конфликт.
+#
+# Запуск из корня проекта:
+#   docker compose -f docker-compose.local.yml up -d --build
+#
+# Аккаунты берутся из .env в корне: ACCOUNTS=почта1:пароль1,почта2:пароль2
+# Данные, журналы и кэш картинок — в .volumes/ (в .gitignore).
+
+services:
+  # Новый код — текущее состояние рабочего каталога (production со слиянием upstream)
+  qwen2api-new:
+    container_name: qwen2api-new
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "4000:3000"
+    volumes:
+      - ./.volumes/new/data:/app/data
+      - ./.volumes/new/logs:/app/logs
+      - ./.volumes/new/caches:/app/caches
+    environment:
+      - SERVICE_PORT=3000
+      - API_KEY=sk-local
+      - LISTEN_ADDRESS=
+      - PM2_INSTANCES=1
+      - PM2_MAX_MEMORY=1G
+      - SEARCH_INFO_MODE=table
+      - OUTPUT_THINK=true
+      - SIMPLE_MODEL_MAP=false
+      - REDIS_URL=
+      - DATA_SAVE_MODE=file
+      - ACCOUNTS=${ACCOUNTS}
+      - CACHE_MODE=file
+
+  # Стенд для опытов: тот же образ, что и qwen2api-new, но backend монтируется
+  # с диска из рабочей копии .worktrees/test-upstream — правка + restart, без пересборки.
+  qwen2api-exp:
+    container_name: qwen2api-exp
+    image: qwen2api-qwen2api-new:latest
+    restart: unless-stopped
+    ports:
+      - "4002:3000"
+    volumes:
+      - ./.worktrees/test-upstream/src:/app/src
+      - ./.volumes/exp/data:/app/data
+      - ./.volumes/exp/logs:/app/logs
+      - ./.volumes/exp/caches:/app/caches
+    environment:
+      - SERVICE_PORT=3000
+      - API_KEY=sk-local
+      - LISTEN_ADDRESS=
+      - PM2_INSTANCES=1
+      - PM2_MAX_MEMORY=1G
+      - SEARCH_INFO_MODE=table
+      - OUTPUT_THINK=true
+      - SIMPLE_MODEL_MAP=false
+      - REDIS_URL=
+      - DATA_SAVE_MODE=file
+      - ACCOUNTS=${ACCOUNTS}
+      - CACHE_MODE=file
+      # Трассировка сырых кадров от Qwen (задача Qwen2API-red) -> logs/raw-trace.jsonl
+      - RAW_TRACE=${RAW_TRACE:-0}
+
+  # Старый код — рабочая копия на коммите 19404b4 (до обновления из upstream)
+  qwen2api-old:
+    container_name: qwen2api-old
+    build:
+      context: ./.worktrees/test-prod
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "4001:3000"
+    volumes:
+      - ./.volumes/old/data:/app/data
+      - ./.volumes/old/logs:/app/logs
+      - ./.volumes/old/caches:/app/caches
+    environment:
+      - SERVICE_PORT=3000
+      - API_KEY=sk-local
+      - LISTEN_ADDRESS=
+      - PM2_INSTANCES=1
+      - PM2_MAX_MEMORY=1G
+      - SEARCH_INFO_MODE=table
+      - OUTPUT_THINK=true
+      - SIMPLE_MODEL_MAP=false
+      - REDIS_URL=
+      - DATA_SAVE_MODE=file
+      - ACCOUNTS=${ACCOUNTS}
+      - CACHE_MODE=file

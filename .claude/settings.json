@@ -1,0 +1,78 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"(()=>{const{execSync}=require('child_process'),p=require('path'),fs=require('fs');const g=a=>{try{return execSync('git '+a,{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim()}catch{return''}};const c=g('rev-parse --path-format=absolute --git-common-dir');for(const d of [process.env.CLAUDE_PROJECT_DIR,g('rev-parse --show-toplevel'),c?p.dirname(c):'',process.cwd()]){if(!d)continue;const f=p.join(d,'.claude','hooks',process.argv[1]);if(fs.existsSync(f)){require(f);return}}})()\" enforce-branch-before-edit.cjs"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"(()=>{const{execSync}=require('child_process'),p=require('path'),fs=require('fs');const g=a=>{try{return execSync('git '+a,{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim()}catch{return''}};const c=g('rev-parse --path-format=absolute --git-common-dir');for(const d of [process.env.CLAUDE_PROJECT_DIR,g('rev-parse --show-toplevel'),c?p.dirname(c):'',process.cwd()]){if(!d)continue;const f=p.join(d,'.claude','hooks',process.argv[1]);if(fs.existsSync(f)){require(f);return}}})()\" enforce-branch-before-edit.cjs"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"(()=>{const{execSync}=require('child_process'),p=require('path'),fs=require('fs');const g=a=>{try{return execSync('git '+a,{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim()}catch{return''}};const c=g('rev-parse --path-format=absolute --git-common-dir');for(const d of [process.env.CLAUDE_PROJECT_DIR,g('rev-parse --show-toplevel'),c?p.dirname(c):'',process.cwd()]){if(!d)continue;const f=p.join(d,'.claude','hooks',process.argv[1]);if(fs.existsSync(f)){require(f);return}}})()\" bash-guard.cjs"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"(()=>{const{execSync}=require('child_process'),p=require('path'),fs=require('fs');const g=a=>{try{return execSync('git '+a,{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim()}catch{return''}};const c=g('rev-parse --path-format=absolute --git-common-dir');for(const d of [process.env.CLAUDE_PROJECT_DIR,g('rev-parse --show-toplevel'),c?p.dirname(c):'',process.cwd()]){if(!d)continue;const f=p.join(d,'.claude','hooks',process.argv[1]);if(fs.existsSync(f)){require(f);return}}})()\" memory-capture.cjs",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"(()=>{const{execSync}=require('child_process'),p=require('path'),fs=require('fs');const g=a=>{try{return execSync('git '+a,{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim()}catch{return''}};const c=g('rev-parse --path-format=absolute --git-common-dir');for(const d of [process.env.CLAUDE_PROJECT_DIR,g('rev-parse --show-toplevel'),c?p.dirname(c):'',process.cwd()]){if(!d)continue;const f=p.join(d,'.claude','hooks',process.argv[1]);if(fs.existsSync(f)){require(f);return}}})()\" validate-completion.cjs"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"(()=>{const{execSync}=require('child_process'),p=require('path'),fs=require('fs');const g=a=>{try{return execSync('git '+a,{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim()}catch{return''}};const c=g('rev-parse --path-format=absolute --git-common-dir');for(const d of [process.env.CLAUDE_PROJECT_DIR,g('rev-parse --show-toplevel'),c?p.dirname(c):'',process.cwd()]){if(!d)continue;const f=p.join(d,'.claude','hooks',process.argv[1]);if(fs.existsSync(f)){require(f);return}}})()\" session-start.cjs"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"(()=>{const{execSync}=require('child_process'),p=require('path'),fs=require('fs');const g=a=>{try{return execSync('git '+a,{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim()}catch{return''}};const c=g('rev-parse --path-format=absolute --git-common-dir');for(const d of [process.env.CLAUDE_PROJECT_DIR,g('rev-parse --show-toplevel'),c?p.dirname(c):'',process.cwd()]){if(!d)continue;const f=p.join(d,'.claude','hooks',process.argv[1]);if(fs.existsSync(f)){require(f);return}}})()\" nudge-claude-md-update.cjs"
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "plan-tango@plan-tango": true
+  }
+}

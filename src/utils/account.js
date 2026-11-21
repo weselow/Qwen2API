@@ -1,6 +1,9 @@
 const config = require('../config/index.js')
 const DataPersistence = require('./data-persistence')
 const TokenManager = require('./token-manager')
+const lab = require('./v2-lab-sessions')
+const v2sessions = require('./v2-session-store')
+const sessionPersistence = require('./v2-session-persistence')
 const AccountRotator = require('./account-rotator')
 const { logger } = require('./logger')
 const { generateDeterministicFingerprint } = require('./fingerprint')
@@ -101,9 +104,10 @@ class Account {
         // 初始化各个管理器
         this.dataPersistence = new DataPersistence()
         this.tokenManager = new TokenManager()
-        this.accountRotator = new AccountRotator()
+        this.accountRotator = new AccountRotator(token => Boolean(this.tokenManager.validateToken(token)))
 
         // 账户数据
+        this._accountMutationQueues = new Map()
         this.accountTokens = []
         this.isInitialized = false
         // 初始化失败的原因（例如 data.json 损坏），用于给客户端返回可读的错误
@@ -128,6 +132,14 @@ class Account {
         try {
             // 加载账户信息
             await this.loadAccountTokens()
+
+            // jik.4：恢复持久化的 v2 浏览器会话（off/lab 模式下 no-op）。
+            // 恢复失败不阻塞启动——会话可再生，首次请求/自动刷新会重建
+            try {
+                await sessionPersistence.restoreSessions()
+            } catch (error) {
+                logger.error('v2 会话恢复失败，继续启动（会话将由登录/刷新重建）', 'ACCOUNT', '', error)
+            }
 
             // 设置定期刷新令牌
             if (config.autoRefresh) {
@@ -183,8 +195,12 @@ class Account {
                 await this._loginEnvironmentAccounts()
             }
 
-            // 验证和清理无效令牌
-            await this._validateAndCleanTokens()
+            // Persisted records belong in account management even when their token
+            // is expired. Startup must not silently drop them or retry their login.
+            // Rotation validates tokens independently before selecting an account.
+            if (config.dataSaveMode === 'none') {
+                await this._validateAndCleanTokens()
+            }
 
             // 更新账户轮询器
             this.accountRotator.setAccounts(this.accountTokens)
@@ -195,7 +211,9 @@ class Account {
                 if (config.cliEnabled) {
                     logger.info(`后台初始化所有 ${this.accountTokens.length} 个账户的 CLI`, 'ACCOUNT')
                     Promise.allSettled(
-                        this.accountTokens.map(account => this._initializeCliAccount(account))
+                        this.accountTokens
+                            .filter(account => this.tokenManager.validateToken(account.token))
+                            .map(account => this._initializeCliAccount(account))
                     ).then(() => {
                         const cliReady = this.accountTokens.filter(a => a.cli_info).length
                         const cliUnsupported = this.accountTokens.filter(a => a.cli_unavailable_reason === 'unsupported').length
@@ -504,24 +522,8 @@ class Account {
         // 逐个刷新账户，每次成功后立即保存
         for (const account of needsRefresh) {
             try {
-                const updatedAccount = await this.tokenManager.refreshToken(account)
-                if (updatedAccount) {
-                    // 立即更新内存中的账户数据
-                    const index = this.accountTokens.findIndex(acc => acc.email === account.email)
-                    if (index !== -1) {
-                        this.accountTokens[index] = updatedAccount
-                    }
-
-                    // 立即保存到持久化存储
-                    await this.dataPersistence.saveAccount(account.email, {
-                        password: updatedAccount.password,
-                        token: updatedAccount.token,
-                        expires: updatedAccount.expires,
-                        proxy: updatedAccount.proxy ?? account.proxy ?? null
-                    })
-
-                    // 重置失败计数
-                    this.accountRotator.resetFailures(account.email)
+                const refreshed = await this.refreshAccountToken(account.email)
+                if (refreshed) {
                     successCount++
 
                     logger.info(`账户 ${account.email} 令牌刷新并保存成功 (${successCount}/${needsRefresh.length})`, 'TOKEN', '✅')
@@ -628,41 +630,50 @@ class Account {
         }
     }
 
+    /** Serialize mutations of the same account, including refresh and deletion. */
+    _runAccountMutation(email, operation) {
+        const previous = this._accountMutationQueues.get(email) || Promise.resolve()
+        const result = previous.then(operation, operation)
+        const tail = result.then(() => {}, () => {})
+        this._accountMutationQueues.set(email, tail)
+        tail.then(() => {
+            if (this._accountMutationQueues.get(email) === tail) this._accountMutationQueues.delete(email)
+        })
+        return result
+    }
+
     /**
      * 手动刷新指定账户的令牌
      * @param {string} email - 邮箱地址
      * @returns {Promise<boolean>} 刷新是否成功
      */
-    async refreshAccountToken(email) {
+    async refreshAccountToken(email, options) {
+        return this._runAccountMutation(email, () => this._refreshAccountToken(email, options))
+    }
+
+    async _refreshAccountToken(email, options) {
         const account = this.accountTokens.find(acc => acc.email === email)
-        if (!account) {
-            logger.error(`未找到邮箱为 ${email} 的账户`, 'ACCOUNT')
-            return false
-        }
-
-        const updatedAccount = await this.tokenManager.refreshToken(account)
-        if (updatedAccount) {
-            // 更新内存中的数据
-            const index = this.accountTokens.findIndex(acc => acc.email === email)
-            if (index !== -1) {
-                this.accountTokens[index] = updatedAccount
-            }
-
-            // 保存到持久化存储
-            await this.dataPersistence.saveAccount(email, {
-                password: updatedAccount.password,
-                token: updatedAccount.token,
-                expires: updatedAccount.expires,
-                proxy: updatedAccount.proxy ?? account.proxy ?? null
-            })
-
-            // 重置失败计数
-            this.accountRotator.resetFailures(email)
-
-            return true
-        }
-
-        return false
+        if (!account) return false
+        let publishSession
+        // Publish the rotated v2 session (lab and browser modes) only after storage
+        // accepted the new token, keeping requests off a token that is not durable.
+        const refreshOptions = v2sessions.active ? { ...options, afterSave: fn => { publishSession = fn } } : options
+        const updatedAccount = await this.tokenManager.refreshToken(account, refreshOptions)
+        if (!updatedAccount) return false
+        const saved = await this.dataPersistence.saveAccount(email, {
+            password: updatedAccount.password,
+            token: updatedAccount.token,
+            expires: updatedAccount.expires,
+            proxy: updatedAccount.proxy ?? account.proxy ?? null
+        })
+        if (!saved) return false
+        const index = this.accountTokens.findIndex(acc => acc.email === email)
+        if (index === -1) return false
+        publishSession?.()
+        this.accountTokens[index] = updatedAccount
+        this.accountRotator.setAccounts(this.accountTokens)
+        this.accountRotator.resetFailures(email)
+        return true
     }
 
     /**
@@ -720,9 +731,9 @@ class Account {
      * @param {string} password - 密码
      * @returns {Promise<string|null>} 令牌或null
      */
-    async login(email, password, proxy) {
+    async login(email, password, proxy, options) {
         const accountLike = proxy ? { proxy } : undefined
-        return await this.tokenManager.login(email, password, accountLike)
+        return await this.tokenManager.login(email, password, accountLike, options)
     }
 
     /**
@@ -828,6 +839,10 @@ class Account {
      * @returns {Promise<boolean>} 添加是否成功
      */
     async addAccount(email, password, proxy = null) {
+        return this._runAccountMutation(email, () => this._addAccount(email, password, proxy))
+    }
+
+    async _addAccount(email, password, proxy = null) {
         try {
             // 检查账户是否已存在
             const existingAccount = this.accountTokens.find(acc => acc.email === email)
@@ -860,12 +875,12 @@ class Account {
 
             // 添加到内存
             this.accountTokens.push(newAccount)
-            const insertedIndex = this.accountTokens.length - 1
 
             // 保存到持久化存储
-            const saved = await this.dataPersistence.saveAccount(email, newAccount)
+            const saved = await this.dataPersistence.saveAccount(email, newAccount, { allowCreate: true })
             if (!saved) {
-                this.accountTokens.splice(insertedIndex, 1)
+                const insertedIndex = this.accountTokens.indexOf(newAccount)
+                if (insertedIndex !== -1) this.accountTokens.splice(insertedIndex, 1)
                 this.accountRotator.setAccounts(this.accountTokens)
                 logger.error(`账户 ${email} 持久化失败，已回滚内存数据`, 'ACCOUNT')
                 return false
@@ -897,6 +912,10 @@ class Account {
      * @returns {Promise<boolean>} 添加是否成功
      */
     async addAccountWithToken(email, password, token, expires, proxy = null) {
+        return this._runAccountMutation(email, () => this._addAccountWithToken(email, password, token, expires, proxy))
+    }
+
+    async _addAccountWithToken(email, password, token, expires, proxy = null) {
         try {
             // 检查账户是否已存在
             const existingAccount = this.accountTokens.find(acc => acc.email === email)
@@ -916,12 +935,12 @@ class Account {
 
             // 添加到内存
             this.accountTokens.push(newAccount)
-            const insertedIndex = this.accountTokens.length - 1
 
             // 保存到持久化存储
-            const saved = await this.dataPersistence.saveAccount(email, newAccount)
+            const saved = await this.dataPersistence.saveAccount(email, newAccount, { allowCreate: true })
             if (!saved) {
-                this.accountTokens.splice(insertedIndex, 1)
+                const insertedIndex = this.accountTokens.indexOf(newAccount)
+                if (insertedIndex !== -1) this.accountTokens.splice(insertedIndex, 1)
                 this.accountRotator.setAccounts(this.accountTokens)
                 logger.error(`账户 ${email} 持久化失败，已回滚内存数据`, 'ACCOUNT')
                 return false
@@ -951,6 +970,10 @@ class Account {
      * @returns {Promise<boolean>} 更新是否成功
      */
     async updateAccountProxy(email, proxy) {
+        return this._runAccountMutation(email, () => this._updateAccountProxy(email, proxy))
+    }
+
+    async _updateAccountProxy(email, proxy) {
         try {
             const account = this.accountTokens.find(acc => acc.email === email)
             if (!account) {
@@ -988,7 +1011,8 @@ class Account {
                 invalidateProxyAgent(oldProxy)
             }
 
-            logger.success(`账户 ${email} 代理更新成功 (${oldProxy || '无'} → ${newProxy || '无'})`, 'ACCOUNT')
+            const { formatProxyForLog } = require('./proxy-helper')
+            logger.success(`账户 ${email} 代理更新成功 (${formatProxyForLog(oldProxy)} → ${formatProxyForLog(newProxy)})`, 'ACCOUNT')
             return true
         } catch (error) {
             logger.error(`更新账户 ${email} 代理失败`, 'ACCOUNT', '', error)
@@ -1002,40 +1026,33 @@ class Account {
      * @returns {Promise<boolean>} 移除是否成功
      */
     async removeAccount(email) {
-        try {
-            const index = this.accountTokens.findIndex(acc => acc.email === email)
-            if (index === -1) {
-                logger.warn(`账户 ${email} 不存在`, 'ACCOUNT')
+        return this._runAccountMutation(email, async () => {
+            try {
+                const account = this.accountTokens.find(acc => acc.email === email)
+                if (!account) return false
+                // Keep memory and rotation intact if storage refuses the deletion.
+                if (!await this.dataPersistence.deleteAccount(email)) return false
+                const index = this.accountTokens.findIndex(acc => acc.email === email)
+                lab.sessions.delete(email)
+                if (index !== -1) this.accountTokens.splice(index, 1)
+                if (account.cli_info?.refresh_token_interval) clearInterval(account.cli_info.refresh_token_interval)
+                this.accountRotator.setAccounts(this.accountTokens)
+                logger.success(`成功移除账户: ${email}`, 'ACCOUNT')
+                return true
+            } catch (error) {
+                logger.error(`移除账户失败 (${email})`, 'ACCOUNT', '', error)
                 return false
             }
-
-            // 从内存中移除
-            this.accountTokens.splice(index, 1)
-
-            // 更新轮询器
-            this.accountRotator.setAccounts(this.accountTokens)
-
-            logger.success(`成功移除账户: ${email}`, 'ACCOUNT')
-            return true
-        } catch (error) {
-            logger.error(`移除账户失败 (${email})`, 'ACCOUNT', '', error)
-            return false
-        }
+        })
     }
 
     /**
      * 删除账户（向后兼容）
      * @param {string} email - 邮箱地址
-     * @returns {boolean} 删除是否成功
+     * @returns {Promise<boolean>} 删除是否成功
      */
-    deleteAccount(email) {
-        const index = this.accountTokens.findIndex(t => t.email === email)
-        if (index !== -1) {
-            this.accountTokens.splice(index, 1)
-            this.accountRotator.setAccounts(this.accountTokens)
-            return true
-        }
-        return false
+    async deleteAccount(email) {
+        return this.removeAccount(email)
     }
 
     /**
@@ -1071,6 +1088,7 @@ class Account {
      * 清理资源
      */
     destroy() {
+        lab.sessions.clear()
         // 清理自动刷新定时器
         if (this.refreshInterval) {
             clearInterval(this.refreshInterval)

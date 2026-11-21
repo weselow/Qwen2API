@@ -561,7 +561,7 @@ import axios from 'axios'
 import LangSwitcher from '../components/LangSwitcher.vue'
 import { formatCompact as _formatCompact } from '../utils/format.js'
 
-const { t } = useI18n()
+const { t, te } = useI18n()
 
 const tokens = ref([])
 const showAddModal = ref(false)
@@ -1038,6 +1038,12 @@ const getTokens = async () => {
   }
 }
 
+const signinFailureMessage = error => {
+  const code = error.response?.data?.code
+  const key = `msg.${code}`
+  return typeof code === 'string' && te(key) ? t(key) : error.message
+}
+
 const addToken = async () => {
   try {
     const payload = {
@@ -1053,8 +1059,7 @@ const addToken = async () => {
     await getTokens()
     showToast(t('msg.addSuccess'))
   } catch (error) {
-    console.error('addToken error:', error)
-    showToast(t('msg.addFailed') + error.message, 'error')
+    showToast(t('msg.addFailed') + signinFailureMessage(error), 'error')
   }
 }
 
@@ -1142,8 +1147,7 @@ const refreshToken = async (email) => {
     await getTokens()
     showToast(t('msg.refreshSuccess', { email }))
   } catch (error) {
-    console.error('refreshToken error:', error)
-    showToast(t('msg.refreshFailed') + error.message, 'error')
+    showToast(t('msg.refreshFailed') + signinFailureMessage(error), 'error')
   } finally {
     const index = refreshingTokens.value.indexOf(email)
     if (index > -1) {

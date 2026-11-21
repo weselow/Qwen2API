@@ -87,6 +87,12 @@
     "chat": "тестовая сессия"
   },
   "msg": {
+    "signin_waf_block": "Служба защиты Qwen заблокировала вход. Откройте Qwen Chat и проверьте доступ.",
+    "signin_verification_required": "Пройдите проверку в Qwen Chat.",
+    "signin_rejected": "Qwen отклонил вход.",
+    "signin_upstream_error": "Qwen вернул неожиданный ответ на запрос входа.",
+    "signin_transport_error": "Не удалось получить ответ Qwen при входе.",
+    "signin_local_error": "Локальная ошибка при подготовке запроса входа.",
     "batchComplete": "Добавление завершено: успешно {n}",
     "batchFailed": "ошибок: {n}",
     "batchSkipped": "пропущено: {n}",
@@ -249,7 +255,7 @@
     }
   },
   "chat": {
-    "send": "отправлять",
-    "title": "Протестируйте API ChatCompletion"
+    "send": "Отправить",
+    "title": "Проверка API ChatCompletion"
   }
 }

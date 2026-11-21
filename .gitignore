@@ -12,4 +12,30 @@ pkg_dist/
 .idea
 /public/dist
 .vscode
+
+# Beads / Dolt files (added by bd init)
+.beads/
+.dolt/
+*.db
+.beads-credential-key
+issues.jsonl
+
+# Beads orchestration
+.worktrees/
+
+# Our fork notes (not for upstream)
+docs_fork/
+
+# Локальные конфиги ИИ-инструментов (содержат API-ключи) — не коммитить
+.mcp.json
+.codex/
+
+# Локальный docker-стенд: данные, журналы, кэш картинок
+.volumes/
+
+# Локальные настройки Claude Code (разрешения конкретной машины)
+.claude/settings.local.json
 .bce-tool/
+
+# Браузерные профили signin-worker при локальном запуске (секреты сессий)
+signin-worker/profiles/

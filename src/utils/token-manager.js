@@ -1,19 +1,21 @@
 const axios = require('axios')
+const lab = require('./v2-lab-sessions')
+const v2sessions = require('./v2-session-store')
+const sessionPersistence = require('./v2-session-persistence')
+const signinWorker = require('./signin-worker-client')
+const { SigninError } = require('./signin-error')
 const { sha256Encrypt, JwtDecode, jitter } = require('./tools')
 const { logger } = require('./logger')
 const { applyProxyToAxiosConfig, getChatBaseUrl } = require('./proxy-helper');
-const { buildUserAgent } = require('./header-profile')
+const { buildSigninHeaders } = require('./header-profile')
 
 /**
  * 令牌管理器
  * 负责令牌的获取、验证、刷新等操作
  */
 class TokenManager {
-    constructor() {
-        // Legacy default; overridden per-account when fingerprint is available
-        this.defaultHeaders = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0'
-        }
+    constructor(httpClient = axios) {
+        this.httpClient = httpClient
     }
 
     /**
@@ -21,6 +23,7 @@ class TokenManager {
      * @returns {string} 登录端点URL
      */
     get loginEndpoint() {
+        if (lab.authOrigin) return `${lab.authOrigin}/api/v2/auths/signin`
         return `${getChatBaseUrl()}/api/v1/auths/signin`
     }
 
@@ -31,40 +34,76 @@ class TokenManager {
      * @param {Object} [account] - 账户对象（用于解析账号级代理；为空时回退到全局 PROXY_URL）
      * @returns {Promise<string|null>} 令牌或null
      */
-    async login(email, password, account) {
+    async login(email, password, account, options = {}) {
+        // Browser mode: the WAF captcha makes pure-Node sign-in impossible; the
+        // signin worker signs in inside real Chromium and hands back the jar.
+        if (v2sessions.browser) {
+            try {
+                return await this.loginBrowserSession(email, password, account)
+            } catch (error) {
+                const failure = error instanceof SigninError ? error : SigninError.fromError(error)
+                logger.error(`Qwen signin: ${failure.code} (upstream HTTP ${failure.upstreamStatus ?? 'none'})`, 'AUTH')
+                if (options.throwOnFailure) throw failure
+                return null
+            }
+        }
         try {
-            // Use per-account fingerprint UA when available; fall back to legacy Edge UA
-            const ua = (account && account.fingerprint) ? buildUserAgent(account.fingerprint) : this.defaultHeaders['User-Agent']
             const requestConfig = {
-                headers: { 'User-Agent': ua },
+                headers: buildSigninHeaders(account, { chatBaseUrl: getChatBaseUrl() }),
                 timeout: 10000 // 10秒超时
             }
 
-            applyProxyToAxiosConfig(requestConfig, account);
+            let formJar
+            if (lab.authOrigin) {
+                formJar = await lab.openAuthForm(this.httpClient)
+                const cookies = formJar.getCookieStringSync(this.loginEndpoint)
+                if (cookies) requestConfig.headers.Cookie = cookies
+                Object.assign(requestConfig, { proxy: false, maxRedirects: 0 })
+            } else {
+                applyProxyToAxiosConfig(requestConfig, account)
+            }
 
-            const response = await axios.post(this.loginEndpoint, {
+            const response = await this.httpClient.post(this.loginEndpoint, {
                 email: email,
                 password: sha256Encrypt(password)
             }, requestConfig)
 
+            if (lab.authOrigin) {
+                const session = lab.authenticatedJar(response, this.loginEndpoint, { jar: formJar }, token => this.validateToken(token))
+                lab.sessions.set(email, session)
+            }
             if (response.data && response.data.token) {
                 // 不记录令牌本身：日志可能落盘或被采集，令牌可直接冒充该账户
                 logger.success(`${email} 登录成功`, 'AUTH')
                 return response.data.token
-            } else {
-                logger.error(`${email} 登录响应缺少令牌`, 'AUTH')
-                return null
             }
+            throw SigninError.fromResponse(response)
         } catch (error) {
-            if (error.response) {
-                logger.error(`${email} 登录失败 (${error.response.status})`, 'AUTH', '', error)
-            } else if (error.request) {
-                logger.error(`${email} 登录失败: 网络请求超时或无响应`, 'AUTH')
-            } else {
-                logger.error(`${email} 登录失败`, 'AUTH', '', error)
-            }
+            const failure = SigninError.fromError(error)
+            // Axios errors can include a reusable password hash, cookies and proxy credentials.
+            logger.error(`Qwen signin: ${failure.code} (upstream HTTP ${failure.upstreamStatus ?? 'none'})`, 'AUTH')
+            if (options.throwOnFailure) throw failure
             return null
         }
+    }
+
+    /**
+     * Browser-режим: вход через signin-worker и сохранение сессии (token + jar).
+     * @returns {Promise<string>} 令牌
+     */
+    async loginBrowserSession(email, password, account) {
+        const harvested = await signinWorker.acquireSession(email, password, account)
+        const decoded = this.validateToken(harvested.token)
+        if (!decoded) throw new SigninError('signin_upstream_error', 502, 'Signin worker returned an invalid token.')
+        // publishSession = setSession + 持久化（jik.4）：重启后无需重新登录
+        await sessionPersistence.publishSession(email, {
+            token: harvested.token,
+            expiresAt: decoded.exp,
+            jar: harvested.jar
+        })
+        // 不记录令牌本身：日志可能落盘或被采集，令牌可直接冒充该账户
+        logger.success(`${email} 登录成功`, 'AUTH')
+        return harvested.token
     }
 
     /**
@@ -127,9 +166,11 @@ class TokenManager {
      * @param {Object} account - 账户对象 {email, password, token, expires}
      * @returns {Promise<Object|null>} 更新后的账户对象或null
      */
-    async refreshToken(account) {
+    async refreshToken(account, options) {
         try {
-            const newToken = await this.login(account.email, account.password, account)
+            if (v2sessions.browser) return await this.refreshBrowserSession(account, options)
+            if (lab.authOrigin) return await this.refreshLabSession(account, options)
+            const newToken = await this.login(account.email, account.password, account, options)
             if (!newToken) {
                 return null
             }
@@ -151,7 +192,69 @@ class TokenManager {
 
             return updatedAccount
         } catch (error) {
+            if (error instanceof SigninError) throw error
             logger.error(`刷新令牌失败 (${account.email})`, 'TOKEN', '', error)
+            return null
+        }
+    }
+
+    /**
+     * Browser-режим: обновление = попросить воркер тихо перезагрузить профиль
+     * (v2 refresh endpoint доступен только Electron-FE). Мёртвый профиль
+     * (sessionLost) откатывается на полный вход с паролем.
+     */
+    async refreshBrowserSession(account, options = {}) {
+        try {
+            let harvested
+            try {
+                harvested = await signinWorker.renewSession(account.email, account)
+            } catch (error) {
+                if (!error.sessionLost) throw error
+                harvested = await signinWorker.acquireSession(account.email, account.password, account)
+            }
+            const decoded = this.validateToken(harvested.token)
+            if (!decoded) throw new SigninError('signin_upstream_error', 502, 'Signin worker returned an invalid token.')
+            const next = { token: harvested.token, expiresAt: decoded.exp, jar: harvested.jar }
+            const previous = v2sessions.sessions.get(account.email)
+            const publish = () => {
+                const current = v2sessions.sessions.get(account.email)
+                // publishSession 同时写 store 与持久层（jik.4）；
+                // 它不会抛错——此处 fire-and-forget 安全
+                if (!current || current === previous) sessionPersistence.publishSession(account.email, next)
+            }
+            if (options.afterSave) options.afterSave(publish)
+            else publish()
+            return { ...account, token: next.token, expires: decoded.exp }
+        } catch (error) {
+            const failure = error instanceof SigninError ? error : SigninError.fromError(error)
+            logger.error(`Browser session refresh: ${failure.code}`, 'AUTH')
+            if (options.throwOnFailure) throw failure
+            return null
+        }
+    }
+
+    async refreshLabSession(account, options = {}) {
+        const previous = lab.sessionFor(account.email, account.token)
+        if (!previous) return null
+        const url = `${lab.authOrigin}/api/v2/auths/refresh`
+        const headers = buildSigninHeaders(account, { chatBaseUrl: getChatBaseUrl() })
+        delete headers['content-type']
+        const cookie = previous.jar.getCookieStringSync(url)
+        if (cookie) headers.cookie = cookie
+        try {
+            const response = await this.httpClient.get(url, { headers, timeout: 10000, proxy: false, maxRedirects: 0 })
+            const next = lab.authenticatedJar(response, url, previous, token => this.validateToken(token))
+            if (lab.sessions.get(account.email) !== previous) return null
+            const publish = () => {
+                if (lab.sessions.get(account.email) === previous) lab.sessions.set(account.email, next)
+            }
+            if (options.afterSave) options.afterSave(publish)
+            else publish()
+            return { ...account, token: next.token, expires: this.validateToken(next.token).exp }
+        } catch (error) {
+            const failure = SigninError.fromError(error)
+            logger.error(`Lab session refresh: ${failure.code}`, 'AUTH')
+            if (options.throwOnFailure) throw failure
             return null
         }
     }

@@ -1,4 +1,5 @@
 const express = require('express')
+const { SigninError } = require('../utils/signin-error')
 const router = express.Router()
 const config = require('../config')
 const accountManager = require('../utils/account')
@@ -353,7 +354,7 @@ router.post('/setAccount', adminKeyVerify, async (req, res) => {
       return res.status(409).json({ error: '账号已存在' })
     }
 
-    const authToken = await accountManager.login(email, password, normalizedProxy)
+    const authToken = await accountManager.login(email, password, normalizedProxy, { throwOnFailure: true })
     if (!authToken) {
       return res.status(401).json({ error: '登录失败' })
     }
@@ -372,6 +373,7 @@ router.post('/setAccount', adminKeyVerify, async (req, res) => {
       res.status(500).json({ error: '账号创建失败' })
     }
   } catch (error) {
+    if (error instanceof SigninError) return res.status(error.status).json(error.toPublicResponse())
     logger.error('创建账号失败', 'ACCOUNT', '', error)
     res.status(500).json({ error: error.message })
   }
@@ -556,7 +558,7 @@ router.post('/refreshAccount', adminKeyVerify, async (req, res) => {
     }
 
     // 刷新账号令牌
-    const success = await accountManager.refreshAccountToken(email)
+    const success = await accountManager.refreshAccountToken(email, { throwOnFailure: true })
 
     if (success) {
       res.json({
@@ -567,6 +569,7 @@ router.post('/refreshAccount', adminKeyVerify, async (req, res) => {
       res.status(500).json({ error: '账号令牌刷新失败' })
     }
   } catch (error) {
+    if (error instanceof SigninError) return res.status(error.status).json(error.toPublicResponse())
     logger.error('刷新账号令牌失败', 'ACCOUNT', '', error)
     res.status(500).json({ error: error.message })
   }

@@ -1272,7 +1272,7 @@ const handleChatCompletion = async (req, res) => {
         // Adjunto de contexto caido con tools: 503 reintentable (gemelo del 529 de
         // anthropic.js). Cualquier otra cosa conserva el 500 de siempre.
         const failure = describeUpstreamFailure(error, 500, 503)
-        if (failure.overloaded) {
+        if (failure.overloaded || failure.code) {
             // Misma forma que produce el traductor compartido para "upstream sobrecargado".
             return writeOpenAIHttpError(res, openAIErrorShape(
                 failure,
