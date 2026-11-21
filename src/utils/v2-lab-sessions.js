@@ -1,6 +1,6 @@
 const { CookieJar } = require('tough-cookie')
 const { SigninError } = require('./signin-error')
-const { detectWafChallenge } = require('./upstream-error')
+const { ChatCreationError, detectWafChallenge } = require('./upstream-error')
 const config = require('../config')
 
 function labOrigin(value) {
@@ -59,7 +59,7 @@ function prepareChat(requestConfig, url, account, token) {
     if (new URL(url).origin !== chatOrigin) throw new Error('Unexpected v2 lab chat origin')
     Object.assign(requestConfig, { proxy: false, maxRedirects: 0 })
     const session = sessionFor(account?.email, token)
-    if (!session) return
+    if (!session) throw new ChatCreationError('lab_session_required', 409)
     const cookies = session.jar.getCookiesSync(url)
     if (!cookies.length) return
     // Preserve existing app cookies except where the server supplied the same name for this URL.

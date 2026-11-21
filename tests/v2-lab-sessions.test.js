@@ -51,6 +51,8 @@ test('isolated v2 sessions select cookies per account, host and path on the wire
     fs.rmdirSync(runtime)
   })
   const records = []
+  const pendingForms = new Set()
+  let formCount = 0
   let refuse = false
   const server = https.createServer(tls, async (req, res) => {
     const url = new URL(req.url, 'https://' + req.headers.host)
@@ -64,14 +66,21 @@ test('isolated v2 sessions select cookies per account, host and path on the wire
     res.setHeader('Content-Type', 'application/json')
     if (url.pathname === '/auth') {
       res.setHeader('Content-Type', 'text/html')
+      const id = String(++formCount)
+      pendingForms.add(id)
+      res.setHeader('Set-Cookie', `prelogin=${id}; Domain=${domain}; Path=${signin}; Secure; HttpOnly`)
       return res.end('<form></form>')
     }
     if (url.pathname === signin) {
+      if (!pendingForms.delete(fixture.prelogin)) {
+        res.writeHead(400)
+        return res.end('{}')
+      }
       const { email } = JSON.parse(raw)
       if (email.startsWith('blocked') || refuse) {
         res.setHeader('Content-Type', 'text/html')
         res.setHeader('Set-Cookie', 'untrusted=denied; Path=/; Secure')
-        return res.end('<html>verification</html>')
+        return res.end('<title>Verification</title>')
       }
       res.setHeader('Set-Cookie', [
         `shared=${email}; Domain=${domain}; Path=/; Secure; HttpOnly`,
@@ -98,7 +107,10 @@ test('isolated v2 sessions select cookies per account, host and path on the wire
     if (url.pathname === newChat) return res.end(JSON.stringify({ data: { id: 'fixture-chat' } }))
     if (url.pathname === completions) {
       res.setHeader('Content-Type', 'text/event-stream')
-      return res.end('data: [DONE]\n\n')
+      const message = JSON.parse(raw).messages[0]
+      const content = message?.role === 'user' && message.content === 'Reply with OK' ? 'OK' : 'Unexpected request'
+      const frame = { choices: [{ delta: { phase: 'answer', content } }] }
+      return res.end(`data: ${JSON.stringify(frame)}\n\ndata: [DONE]\n\n`)
     }
     res.writeHead(404)
     res.end('{}')
@@ -138,17 +150,28 @@ test('isolated v2 sessions select cookies per account, host and path on the wire
     assert.ok(token)
     return { email, token, password: 'fixture' }
   }))
-  assert.equal(await manager.login('blocked@example.invalid', 'fixture'), null)
+  const beforeBlockedSignin = records.length
+  await assert.rejects(manager.login('blocked@example.invalid', 'fixture', null, { throwOnFailure: true }),
+    { code: 'signin_verification_required', upstreamStatus: 200 })
+  assert.deepEqual(records.slice(beforeBlockedSignin).map(({ method, path }) => [method, path]),
+    [['GET', '/auth'], ['POST', signin]])
   assert.equal(lab.sessions.has('blocked@example.invalid'), false)
+  const signinRequests = records.filter(r => r.path === signin)
+  assert.equal(signinRequests.length, 3)
+  assert.equal(new Set(signinRequests.map(r => r.fixture.prelogin)).size, 3)
+  assert.equal(pendingForms.size, 0)
   for (const account of accounts) {
     assert.equal(await manager.addAccountWithToken(account.email, account.password, account.token,
       manager.tokenManager.validateToken(account.token).exp), true)
   }
   const [a, b] = accounts
+  const body = { model: 'fixture', messages: [{ role: 'user', content: 'Reply with OK' }] }
   const post = async account => {
-    const result = await sendChatRequest({ model: 'fixture', messages: [] }, { currentAccount: account })
+    const result = await sendChatRequest(body, { currentAccount: account })
     assert.equal(result.status, true)
-    assert.equal(await text(result.response), 'data: [DONE]\n\n')
+    const [answer, done] = (await text(result.response)).trimEnd().split('\n\n')
+    assert.equal(JSON.parse(answer.slice('data: '.length)).choices[0].delta.content, 'OK')
+    assert.equal(done, 'data: [DONE]')
   }
   await Promise.all(accounts.map(post))
   for (const acct of accounts) {
@@ -159,7 +182,7 @@ test('isolated v2 sessions select cookies per account, host and path on the wire
       assert.equal(r.fixture.shared, acct.email)
       assert.equal(r.fixture.token, acct.token)
       assert.equal(r.fixture.chatOnly, r.path === completions ? acct.email : undefined)
-      for (const key of ['authOnly', 'refreshOnly', 'gone', 'foreign']) assert.equal(r.fixture[key], undefined)
+      for (const key of ['authOnly', 'refreshOnly', 'gone', 'foreign', 'prelogin']) assert.equal(r.fixture[key], undefined)
     }
     assert.equal(lab.sessionFor(acct.email, acct.token).jar.getCookieStringSync('http://' + chat + '/'), '')
   }
@@ -179,7 +202,7 @@ test('isolated v2 sessions select cookies per account, host and path on the wire
   assert.notEqual(renewed.token, a.token)
   const disk = fs.readFileSync(dataPath, 'utf8')
   assert.equal(JSON.parse(disk).accounts.find(row => row.email === a.email).token, renewed.token)
-  assert.doesNotMatch(disk, /shared=|authOnly|refreshOnly|chatOnly|cookieJar|renewed-/)
+  assert.doesNotMatch(disk, /shared=|authOnly|refreshOnly|chatOnly|cookieJar|renewed-|prelogin/)
   assert.equal(lab.sessionFor(a.email, a.token), null)
   for (const r of records.filter(row => row.path === refresh)) {
     assert.equal(r.method, 'GET')
@@ -196,6 +219,9 @@ test('isolated v2 sessions select cookies per account, host and path on the wire
   assert.equal(await manager.removeAccount(a.email), true)
   assert.equal(lab.sessions.has(a.email), false)
   assert.ok(lab.sessionFor(b.email, b.token))
-  await generateChatID(renewed.token, 'fixture', { email: b.email, token: b.token })
-  assert.equal(records.at(-1).fixture.shared, undefined)
+  const requestCount = records.length
+  await assert.rejects(generateChatID(renewed.token, 'fixture', b), { code: 'lab_session_required', status: 409 })
+  await assert.rejects(sendChatRequest(body, { currentAccount: renewed, chatId: 'fixture-chat' }),
+    { code: 'lab_session_required', status: 409 })
+  assert.equal(records.length, requestCount)
 })
