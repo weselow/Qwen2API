@@ -43,7 +43,6 @@ function observeResponse(res, meta, done) {
       try { body = JSON.parse(text); result.json_body = true; } catch { result.json_body = false; }
       if (body && typeof body === 'object') {
         const detail = typeof body.detail === 'string' ? body.detail : '';
-        const errorText = typeof body.error === 'string' ? body.error : typeof body.error?.message === 'string' ? body.error.message : '';
         const safeFields = [];
         const codes = [];
         function collect(obj, depth = 0) {
