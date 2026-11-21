@@ -1,6 +1,7 @@
 const config = require('../config/index.js')
 const DataPersistence = require('./data-persistence')
 const TokenManager = require('./token-manager')
+const lab = require('./v2-lab-sessions')
 const AccountRotator = require('./account-rotator')
 const { logger } = require('./logger')
 const { generateDeterministicFingerprint } = require('./fingerprint')
@@ -643,7 +644,9 @@ class Account {
     async _refreshAccountToken(email, options) {
         const account = this.accountTokens.find(acc => acc.email === email)
         if (!account) return false
-        const updatedAccount = await this.tokenManager.refreshToken(account, options)
+        let publishSession
+        const refreshOptions = lab.authOrigin ? { ...options, afterSave: fn => { publishSession = fn } } : options
+        const updatedAccount = await this.tokenManager.refreshToken(account, refreshOptions)
         if (!updatedAccount) return false
         const saved = await this.dataPersistence.saveAccount(email, {
             password: updatedAccount.password,
@@ -654,6 +657,7 @@ class Account {
         if (!saved) return false
         const index = this.accountTokens.findIndex(acc => acc.email === email)
         if (index === -1) return false
+        publishSession?.()
         this.accountTokens[index] = updatedAccount
         this.accountRotator.setAccounts(this.accountTokens)
         this.accountRotator.resetFailures(email)
@@ -1017,6 +1021,7 @@ class Account {
                 // Keep memory and rotation intact if storage refuses the deletion.
                 if (!await this.dataPersistence.deleteAccount(email)) return false
                 const index = this.accountTokens.findIndex(acc => acc.email === email)
+                lab.sessions.delete(email)
                 if (index !== -1) this.accountTokens.splice(index, 1)
                 if (account.cli_info?.refresh_token_interval) clearInterval(account.cli_info.refresh_token_interval)
                 this.accountRotator.setAccounts(this.accountTokens)
@@ -1071,6 +1076,7 @@ class Account {
      * 清理资源
      */
     destroy() {
+        lab.sessions.clear()
         // 清理自动刷新定时器
         if (this.refreshInterval) {
             clearInterval(this.refreshInterval)

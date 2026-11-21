@@ -1,4 +1,5 @@
 const axios = require('axios')
+const lab = require('./v2-lab-sessions')
 const { SigninError } = require('./signin-error')
 const { sha256Encrypt, JwtDecode, jitter } = require('./tools')
 const { logger } = require('./logger')
@@ -15,6 +16,7 @@ class TokenManager {
      * @returns {string} 登录端点URL
      */
     get loginEndpoint() {
+        if (lab.authOrigin) return `${lab.authOrigin}/api/v2/auths/signin`
         return `${getChatBaseUrl()}/api/v1/auths/signin`
     }
 
@@ -32,13 +34,18 @@ class TokenManager {
                 timeout: 10000 // 10秒超时
             }
 
-            applyProxyToAxiosConfig(requestConfig, account);
+            if (lab.authOrigin) Object.assign(requestConfig, { proxy: false, maxRedirects: 0 })
+            else applyProxyToAxiosConfig(requestConfig, account);
 
             const response = await axios.post(this.loginEndpoint, {
                 email: email,
                 password: sha256Encrypt(password)
             }, requestConfig)
 
+            if (lab.authOrigin) {
+                const session = lab.authenticatedJar(response, this.loginEndpoint, null, token => this.validateToken(token))
+                lab.sessions.set(email, session)
+            }
             if (response.data && response.data.token) {
                 // 不记录令牌本身：日志可能落盘或被采集，令牌可直接冒充该账户
                 logger.success(`${email} 登录成功`, 'AUTH')
@@ -116,6 +123,7 @@ class TokenManager {
      */
     async refreshToken(account, options) {
         try {
+            if (lab.authOrigin) return await this.refreshLabSession(account, options)
             const newToken = await this.login(account.email, account.password, account, options)
             if (!newToken) {
                 return null
@@ -140,6 +148,32 @@ class TokenManager {
         } catch (error) {
             if (error instanceof SigninError) throw error
             logger.error(`刷新令牌失败 (${account.email})`, 'TOKEN', '', error)
+            return null
+        }
+    }
+
+    async refreshLabSession(account, options = {}) {
+        const previous = lab.sessionFor(account.email, account.token)
+        if (!previous) return null
+        const url = `${lab.authOrigin}/api/v2/auths/refresh`
+        const headers = buildSigninHeaders(account, { chatBaseUrl: getChatBaseUrl() })
+        delete headers['content-type']
+        const cookie = previous.jar.getCookieStringSync(url)
+        if (cookie) headers.cookie = cookie
+        try {
+            const response = await axios.get(url, { headers, timeout: 10000, proxy: false, maxRedirects: 0 })
+            const next = lab.authenticatedJar(response, url, previous, token => this.validateToken(token))
+            if (lab.sessions.get(account.email) !== previous) return null
+            const publish = () => {
+                if (lab.sessions.get(account.email) === previous) lab.sessions.set(account.email, next)
+            }
+            if (options.afterSave) options.afterSave(publish)
+            else publish()
+            return { ...account, token: next.token, expires: this.validateToken(next.token).exp }
+        } catch (error) {
+            const failure = SigninError.fromError(error)
+            logger.error(`Lab session refresh: ${failure.code}`, 'AUTH')
+            if (options.throwOnFailure) throw failure
             return null
         }
     }

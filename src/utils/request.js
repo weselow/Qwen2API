@@ -8,6 +8,7 @@ const { applyProxyToAxiosConfig, getChatBaseUrl } = require('./proxy-helper');
 const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
+const lab = require('./v2-lab-sessions')
 const {
     ContextExternalizationError, isTransportInterruption, assertChatChallengeBreakerClosed,
     bindChatChallengeContext, chatChallengeFrom, isWafChallengeError, releaseChatProbe,
@@ -738,7 +739,7 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
         timeout: 10 * 60 * 1000, // Max/thinking models may exceed 60s before answer
     }
 
-    applyProxyToAxiosConfig(requestConfig, currentAccount);
+    if (!lab.authOrigin) applyProxyToAxiosConfig(requestConfig, currentAccount);
 
     const chatType = body.chat_type || body.messages?.[0]?.chat_type || 't2t'
     const chat_id = options.chatId || await generateChatID(currentToken, body.model, currentAccount, chatType)
@@ -755,6 +756,7 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
     // 浏览器 referer 为 /c/<chat_id>（在 chat_id 生成后动态设置）
     requestConfig.headers.referer = `${chatBaseUrl}/c/${chat_id}`
     const url = `${chatBaseUrl}/api/v2/chat/completions?chat_id=` + chat_id
+    lab.prepareChat(requestConfig, url, currentAccount, currentToken)
     // 对齐网页双写 chatId/parentId（FE 0.3.19）
     const parentId = options.parentId ?? body.parentId ?? body.parent_id ?? null
     const messages = Array.isArray(body.messages)
@@ -927,10 +929,12 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
             headers
         }
 
-        applyProxyToAxiosConfig(requestConfig, account);
+        const url = `${chatBaseUrl}/api/v2/chats/new`
+        if (lab.authOrigin) lab.prepareChat(requestConfig, url, account, currentToken)
+        else applyProxyToAxiosConfig(requestConfig, account);
 
         // 对齐 chat.qwen.ai FE 0.3.19：chatId/project_id + normal 模式
-        const response_data = await axios.post(`${chatBaseUrl}/api/v2/chats/new`, {
+        const response_data = await axios.post(url, {
             chatId: '',
             models: [model],
             project_id: '',
