@@ -6,8 +6,6 @@ const https = require('node:https');
 const zlib = require('node:zlib');
 const OUT = '/app/data/profile-safe.jsonl';
 const CAP = 512 * 1024;
-const ALLOWED = new Set(['/api/models', '/api/v2/chats/new', '/api/v2/chat/completions', '/api/v1/auths/']);
-let authProbeStarted = false;
 function emit(value) {
   try { fs.appendFileSync(OUT, JSON.stringify({ utc: new Date().toISOString(), ...value }) + '\n', { mode: 0o600 }); }
   catch { /* Never fall back to printing application data. */ }
@@ -43,7 +41,6 @@ function observeResponse(res, meta, done) {
       try { body = JSON.parse(text); result.json_body = true; } catch { result.json_body = false; }
       if (body && typeof body === 'object') {
         const detail = typeof body.detail === 'string' ? body.detail : '';
-        const errorText = typeof body.error === 'string' ? body.error : typeof body.error?.message === 'string' ? body.error.message : '';
         const safeFields = [];
         const codes = [];
         function collect(obj, depth = 0) {
