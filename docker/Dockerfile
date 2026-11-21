@@ -69,10 +69,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     tar -xzf "$tarball" -C /out curl-impersonate-chrome && \
     chmod 0755 /out/curl-impersonate-chrome
 
-# Debian (glibc) runtime: required by curl-impersonate; oven/bun's debian
-# variant already carries the ca-certificates/libstdc++ the compiled binary needs.
+# Debian (glibc) runtime: required by curl-impersonate. ca-certificates is
+# installed explicitly: bun ships its own TLS store, but curl-impersonate
+# needs /etc/ssl/certs/ca-certificates.crt on disk (verified by the jik.5
+# container smoke: curl error 77 without it).
 FROM oven/bun:${BUN_VERSION}-debian AS runtime
-RUN mkdir -p /app/data /app/logs /app/caches
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /app/data /app/logs /app/caches
 WORKDIR /app
 ENV NODE_ENV=production \
     QWEN2API_RUNTIME_DIR=/app
