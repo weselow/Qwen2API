@@ -87,3 +87,20 @@ answer against real qwen.ai; instant rollback to the current v1 path via config.
 
 V2_SESSION_MODE=off + COMPLETIONS_TRANSPORT=axios restores today's v1 behavior with a
 config change only; the sidecar can be stopped independently.
+
+## Branch strategy
+
+Integration trunk for the epic: codex/et0-live-integration-20261121 (already holds the
+lab cookie-jar base + both docs). Per-task branches cut FROM the trunk, merged back into it:
+
+- codex/jik1-fe-protocol-sync — merges first (jik.2 shares its files).
+- codex/jik2-impersonate-transport and codex/jik3-signin-worker — cut after jik.1 merges,
+  run in parallel (separate .worktrees/*, mostly disjoint files: request.js/header-profile.js
+  vs new sidecar + token-manager.js).
+- jik.4 branch after jik.3 merges. jik.5 = final PR of the trunk -> main -> production
+  after the live smoke passes.
+
+Order rationale: jik.1 and jik.2 touch the same files (header-profile.js, request.js) and
+must be sequential; jik.3 is mostly new code and is the clean parallel track. jik.3's first
+deliverable (session harvest script) also unlocks manual testing of jik.2 with a live token.
+
