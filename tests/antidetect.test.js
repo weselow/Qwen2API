@@ -8,6 +8,7 @@ const {
 
 const {
   buildRequestHeaders,
+  buildSigninHeaders,
   buildUserAgent,
   platformToSecChUa,
   LEGACY_HEADERS,
@@ -164,5 +165,58 @@ describe('AC7 - ANTIDETECT_TIER1_ENABLED=false fallback', () => {
     } finally {
       config.antidetectTier1Enabled = original
     }
+  })
+})
+
+
+describe('signin browser context', () => {
+  it('keeps UA, client hints and platform consistent across refreshed identities', () => {
+    for (const platform of ['Win32', 'MacIntel', 'Linux x86_64']) {
+      for (const suffix of ['00', '01', '02', '03']) {
+        const fingerprint = { platform, hash: '0'.repeat(30) + suffix, language: 'ru-RU' }
+        const headers = buildSigninHeaders({ fingerprint }, { chatBaseUrl: 'https://chat.qwen.ai/' })
+        const major = headers['user-agent'].match(/Chrome\/(\d+)/)[1]
+        assert.ok(Number(major) >= 154 && Number(major) <= 157)
+        assert.ok(headers['sec-ch-ua'].includes('"Google Chrome";v="' + major + '"'))
+        assert.ok(headers['sec-ch-ua'].includes('"Chromium";v="' + major + '"'))
+        assert.equal(headers['sec-ch-ua-platform'], platformToSecChUa(platform))
+        assert.equal(headers['accept-language'], 'ru-RU,ru;q=0.9')
+        assert.equal(headers.origin, 'https://chat.qwen.ai')
+        assert.equal(headers.referer, 'https://chat.qwen.ai/auth')
+      }
+    }
+  })
+
+  it('has a current consistent fallback and cannot inherit chat secrets or metadata', () => {
+    const account = { token: 'test-only-token', ssxmodItna: 'test-only-cookie' }
+    const headers = buildSigninHeaders(account)
+    assert.match(headers['user-agent'], /Chrome\/157\.0\.0\.0/)
+    assert.equal(headers['sec-ch-ua-platform'], '"Windows"')
+    for (const name of ['cookie', 'authorization', 'version', 'source', 'timezone', 'bx-ua', 'bx-umidtoken', 'accept-encoding', 'host']) {
+      assert.equal(Object.keys(headers).some(key => key.toLowerCase() === name), false, name)
+    }
+    assert.equal(headers['sec-fetch-site'], 'same-origin')
+    assert.equal(headers['sec-fetch-mode'], 'cors')
+    assert.equal(headers['sec-fetch-dest'], 'empty')
+  })
+
+  it('applies the dedicated profile in TokenManager.login without changing its payload or timeout', async (t) => {
+    const axios = require('axios')
+    const { logger } = require('../src/utils/logger')
+    const TokenManager = require('../src/utils/token-manager')
+    const { sha256Encrypt } = require('../src/utils/tools')
+    const { getChatBaseUrl } = require('../src/utils/proxy-helper')
+    t.mock.method(logger, 'success', () => {})
+    let captured
+    t.mock.method(axios, 'post', async (url, data, options) => {
+      captured = { url, data, options }
+      return { data: { token: 'test-only-result' } }
+    })
+    const manager = new TokenManager()
+    assert.equal(await manager.login('fixture@example.invalid', 'fixture-password'), 'test-only-result')
+    assert.equal(captured.url, getChatBaseUrl() + '/api/v1/auths/signin')
+    assert.deepEqual(captured.data, { email: 'fixture@example.invalid', password: sha256Encrypt('fixture-password') })
+    assert.equal(captured.options.timeout, 10000)
+    assert.deepEqual(captured.options.headers, buildSigninHeaders(undefined, { chatBaseUrl: getChatBaseUrl() }))
   })
 })
