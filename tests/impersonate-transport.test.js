@@ -132,6 +132,26 @@ test('impersonate argv carries the chrome116 TLS profile, FE headers over argv a
     call.child.emit('close', 0)
 })
 
+test('plain-http URLs never attempt an h2c upgrade: argv pins HTTP/1.1 (73u)', () => {
+    // --http2 on a plain http URL makes curl open with Connection: Upgrade /
+    // Upgrade: h2c; Bun's http server (the CI smoke stub) never answers that
+    // and the request hangs to --max-time. Only https URLs keep --http2.
+    const httpsArgv = transport.buildImpersonateArgv({ url: URL, headers: FE_HEADERS })
+    assert.ok(httpsArgv.includes('--http2'))
+    assert.ok(httpsArgv.includes('--http2-no-server-push'))
+    assert.ok(!httpsArgv.includes('--http1.1'))
+    const httpArgv = transport.buildImpersonateArgv({
+        url: 'http://127.0.0.1:8099/api/v2/chat/completions?chat_id=x',
+        headers: FE_HEADERS
+    })
+    assert.ok(httpArgv.includes('--http1.1'))
+    assert.ok(!httpArgv.includes('--http2'))
+    assert.ok(!httpArgv.includes('--http2-no-server-push'))
+    // The TLS profile itself is scheme-independent and stays in place.
+    assert.ok(httpArgv.includes('--ciphers'))
+    assert.ok(httpArgv.includes('--tls-permute-extensions'))
+})
+
 test('SSE stdout chunks are piped through the response Readable verbatim', async t => {
     config.curlImpersonateBin = binPath
     const calls = stubSpawn(t)
