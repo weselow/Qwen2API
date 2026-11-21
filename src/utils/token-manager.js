@@ -11,6 +11,10 @@ const { buildSigninHeaders } = require('./header-profile')
  * 负责令牌的获取、验证、刷新等操作
  */
 class TokenManager {
+    constructor(httpClient = axios) {
+        this.httpClient = httpClient
+    }
+
     /**
      * 获取登录端点
      * @returns {string} 登录端点URL
@@ -37,7 +41,7 @@ class TokenManager {
             if (lab.authOrigin) Object.assign(requestConfig, { proxy: false, maxRedirects: 0 })
             else applyProxyToAxiosConfig(requestConfig, account);
 
-            const response = await axios.post(this.loginEndpoint, {
+            const response = await this.httpClient.post(this.loginEndpoint, {
                 email: email,
                 password: sha256Encrypt(password)
             }, requestConfig)
@@ -161,7 +165,7 @@ class TokenManager {
         const cookie = previous.jar.getCookieStringSync(url)
         if (cookie) headers.cookie = cookie
         try {
-            const response = await axios.get(url, { headers, timeout: 10000, proxy: false, maxRedirects: 0 })
+            const response = await this.httpClient.get(url, { headers, timeout: 10000, proxy: false, maxRedirects: 0 })
             const next = lab.authenticatedJar(response, url, previous, token => this.validateToken(token))
             if (lab.sessions.get(account.email) !== previous) return null
             const publish = () => {
