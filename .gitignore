@@ -36,3 +36,6 @@ docs_fork/
 # Локальные настройки Claude Code (разрешения конкретной машины)
 .claude/settings.local.json
 .bce-tool/
+
+# Браузерные профили signin-worker при локальном запуске (секреты сессий)
+signin-worker/profiles/

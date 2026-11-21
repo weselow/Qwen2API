@@ -13,6 +13,7 @@ class UpstreamResponseError extends Error {
 class ChatCreationError extends UpstreamResponseError {
   constructor(code = 'upstream_invalid_response', status = 502) {
     const messages = {
+      lab_session_required: 'Sign in again to establish a session for this Qwen v2 lab account',
       upstream_session_unauthorized: 'Qwen session authorization rejected while creating chat; this is not Qwen2API client authentication',
       upstream_waf_challenge: 'Qwen requires WAF/CAPTCHA verification while creating chat',
       upstream_invalid_response: 'Qwen returned an unrecognized response while creating chat',

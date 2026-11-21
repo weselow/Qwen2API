@@ -4,10 +4,13 @@ const accountManager = require('./account.js')
 const config = require('../config/index.js')
 const { logger } = require('./logger')
 const { getSsxmodForAccount } = require('./ssxmod-manager')
-const { applyProxyToAxiosConfig, getChatBaseUrl } = require('./proxy-helper');
+const { applyProxyToAxiosConfig, getChatBaseUrl, resolveProxyUrl } = require('./proxy-helper');
+const { postCompletions } = require('./impersonate-transport.js')
 const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
+const lab = require('./v2-lab-sessions')
+const sessionPersistence = require('./v2-session-persistence')
 const {
     ContextExternalizationError, isTransportInterruption, assertChatChallengeBreakerClosed,
     bindChatChallengeContext, chatChallengeFrom, isWafChallengeError, releaseChatProbe,
@@ -710,6 +713,12 @@ const sendChatRequest = async (body, options = {}) => {
         return result
     } catch (error) {
         if (error instanceof ChatCreationError || !isWafChallengeError(error)) releaseChatProbe(breakerContext)
+        // jik.4：上游拒绝会话（401 unauthorized）或 punish（WAF challenge）——
+        // 作废 v2 会话并触发 signin-worker 续期。off/lab 模式与无会话时 no-op
+        if (currentAccount &&
+            (error.code === 'upstream_session_unauthorized' || isWafChallengeError(error))) {
+            sessionPersistence.invalidateSession(currentAccount.email, currentAccount, error.code)
+        }
         throw error
     }
 }
@@ -731,14 +740,14 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
         }
     })
 
-    // 构建请求配置（与通义千问 React Web 客户端完全一致，对齐 FE 0.3.19）
+    // 构建请求配置（与通义千问 React Web 客户端完全一致，对齐 FE 0.3.49）
     const requestConfig = {
         headers,
         responseType: 'stream', // Always use streaming (upstream doesn't support stream=false)
         timeout: 10 * 60 * 1000, // Max/thinking models may exceed 60s before answer
     }
 
-    applyProxyToAxiosConfig(requestConfig, currentAccount);
+    if (!lab.authOrigin) applyProxyToAxiosConfig(requestConfig, currentAccount);
 
     const chatType = body.chat_type || body.messages?.[0]?.chat_type || 't2t'
     const chat_id = options.chatId || await generateChatID(currentToken, body.model, currentAccount, chatType)
@@ -755,7 +764,8 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
     // 浏览器 referer 为 /c/<chat_id>（在 chat_id 生成后动态设置）
     requestConfig.headers.referer = `${chatBaseUrl}/c/${chat_id}`
     const url = `${chatBaseUrl}/api/v2/chat/completions?chat_id=` + chat_id
-    // 对齐网页双写 chatId/parentId（FE 0.3.19）
+    lab.prepareChat(requestConfig, url, currentAccount, currentToken)
+    // 对齐网页双写 chatId/parentId（FE 0.3.49）
     const parentId = options.parentId ?? body.parentId ?? body.parent_id ?? null
     const messages = Array.isArray(body.messages)
         ? body.messages.map(message => ({
@@ -800,7 +810,12 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
             if (attempt === 1) {
                 logger.network(`发送聊天请求`, 'REQUEST')
             }
-            const response = await axios.post(url, payload, requestConfig)
+            // completions 唯一的发送点：由 impersonate-transport 按 COMPLETIONS_TRANSPORT
+            // 在 curl-impersonate（Chrome TLS 指纹）与 axios 之间分派。代理的取值与上面
+            // applyProxyToAxiosConfig 的条件保持一致——lab 模式直连。
+            const response = await postCompletions(url, payload, requestConfig, {
+                proxyUrl: lab.authOrigin ? null : resolveProxyUrl(currentAccount)
+            })
             if (response.status === 200) {
                 // 返回 currentAccount——调用方在消费完 stream 后据此累计 stats
                 // 注意：当前实现单次尝试都用同一个 currentAccount（不轮换），
@@ -882,6 +897,10 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
             const status = lastError.response?.status
             logger.error('发送聊天请求失败', 'REQUEST', '', lastError.message)
             accountManager.recordAccountError(currentAccount.email, status)
+            // 401 = 上游拒绝会话/bearer（jik.4）：v2 会话作废并续期；off/lab 模式 no-op
+            if (status === 401) {
+                sessionPersistence.invalidateSession(currentAccount.email, currentAccount, 401)
+            }
         }
     } else if (lastError) {
         logger.error('发送聊天请求失败', 'REQUEST', '', lastError.message)
@@ -927,10 +946,15 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
             headers
         }
 
-        applyProxyToAxiosConfig(requestConfig, account);
+        const url = `${chatBaseUrl}/api/v2/chats/new`
+        // Same shape as the completions site: the v2 session store merges its
+        // jar when a v2 mode is active (lab pins proxy:false; browser keeps the
+        // account proxy applied below).
+        lab.prepareChat(requestConfig, url, account, currentToken)
+        if (!lab.authOrigin) applyProxyToAxiosConfig(requestConfig, account);
 
-        // 对齐 chat.qwen.ai FE 0.3.19：chatId/project_id + normal 模式
-        const response_data = await axios.post(`${chatBaseUrl}/api/v2/chats/new`, {
+        // 对齐 chat.qwen.ai FE 0.3.49：chatId/project_id + normal 模式
+        const response_data = await axios.post(url, {
             chatId: '',
             models: [model],
             project_id: '',
@@ -957,6 +981,12 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
             }
         }
         logger.error(`Qwen chat creation failed: category=${failure.code}, status=${failure.status}`, 'CHAT')
+        // jik.4：会话被上游拒绝（401/punish）——image/video 控制器直接调用
+        // 本函数、不经 sendChatRequest，所以这里也要作废会话
+        if (account &&
+            (failure.code === 'upstream_session_unauthorized' || failure.code === 'upstream_waf_challenge')) {
+            sessionPersistence.invalidateSession(account.email, account, failure.code)
+        }
         throw failure
     }
 }

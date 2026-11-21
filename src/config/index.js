@@ -30,6 +30,41 @@ const parseApiKeys = (apiKeyEnv = process.env.API_KEY) => {
 
 const { apiKeys, adminKey } = parseApiKeys()
 
+/**
+ * 解析 COMPLETIONS_TRANSPORT（completions 的 TLS 传输选择）：
+ * auto（默认，有 curl-impersonate 就用，否则 axios + 一次性警告）|
+ * impersonate（强制，缺二进制直接报错）| axios（纯 Node TLS，旧行为）。
+ * 拼错直接拒绝启动：静默回落到 axios 会把 Baxia 风控带回来且无从排查。
+ * @returns {string}
+ */
+const parseCompletionsTransport = (value = process.env.COMPLETIONS_TRANSPORT) => {
+    const raw = value == null || String(value).trim() === '' ? 'auto' : String(value).trim().toLowerCase()
+    if (!['auto', 'impersonate', 'axios'].includes(raw)) {
+        throw new Error(
+            `COMPLETIONS_TRANSPORT="${value}" 无效：只接受 auto | impersonate | axios。` +
+            'auto = 找到 curl-impersonate 就用 Chrome TLS 指纹，否则 axios；impersonate = 强制；axios = 旧行为。'
+        )
+    }
+    return raw
+}
+
+// V2 session pipeline mode (epic Qwen2API-jik):
+//   off     = v1 path, today's behavior (default);
+//   lab     = .test HTTPS stand via QWEN_LAB_V2_AUTH_ORIGIN (back-compat: that
+//             env alone still selects lab);
+//   browser = sessions acquired/renewed by the Playwright signin-worker sidecar.
+const v2SessionMode = (() => {
+    const raw = (process.env.V2_SESSION_MODE || '').trim().toLowerCase()
+    if (!raw) return process.env.QWEN_LAB_V2_AUTH_ORIGIN ? 'lab' : 'off'
+    if (!['off', 'lab', 'browser'].includes(raw)) {
+        throw new Error(`V2_SESSION_MODE must be off, lab or browser (got "${raw}")`)
+    }
+    if (raw === 'lab' && !process.env.QWEN_LAB_V2_AUTH_ORIGIN) {
+        throw new Error('V2_SESSION_MODE=lab requires QWEN_LAB_V2_AUTH_ORIGIN')
+    }
+    return raw
+})()
+
 const config = {
     dataSaveMode: process.env.DATA_SAVE_MODE || "none",
     apiKeys: apiKeys,
@@ -48,7 +83,13 @@ const config = {
     legacyReasoningInContent: process.env.LEGACY_REASONING_IN_CONTENT === 'true' ? true : false,
     redisURL: process.env.REDIS_URL || null,
     autoRefresh: true,
-    autoRefreshInterval: 6 * 60 * 60,
+    // v2 browser tokens live ~30 min; the 6h v1 cadence would let them die
+    // between sweeps, so browser mode tightens the default unless overridden.
+    autoRefreshInterval: (() => {
+        const raw = parseInt(process.env.AUTO_REFRESH_INTERVAL_SECONDS, 10)
+        if (Number.isFinite(raw) && raw > 0) return raw
+        return v2SessionMode === 'browser' ? 15 * 60 : 6 * 60 * 60
+    })(),
     cacheMode: process.env.CACHE_MODE || "default",
     logLevel: process.env.LOG_LEVEL || "INFO",
     enableFileLog: process.env.ENABLE_FILE_LOG === 'true',
@@ -60,6 +101,10 @@ const config = {
     qwenCliProxyUrl: process.env.QWEN_CLI_PROXY_URL || "https://portal.qwen.ai",
     // 代理配置
     proxyUrl: process.env.PROXY_URL || null,
+    // V2 session pipeline (epic Qwen2API-jik): see v2SessionMode resolution above.
+    v2SessionMode,
+    signinWorkerUrl: process.env.SIGNIN_WORKER_URL || 'http://signin-worker:3100',
+    signinWorkerToken: process.env.SIGNIN_WORKER_TOKEN || null,
     // CLI 账户初始化开关（OAuth 设备授权流程需要人工确认，默认关闭避免初始化失败刷屏）
     cliEnabled: process.env.ENABLE_CLI === 'true',
     // chat 请求重试配置（运行时可被 web UI 覆盖，见 src/utils/data-persistence.js#loadSettings）
@@ -145,6 +190,11 @@ const config = {
     // Antidetect Tier 1: per-account fingerprint & header diversity.
     // Set to 'false' to instantly roll back to legacy static headers.
     antidetectTier1Enabled: process.env.ANTIDETECT_TIER1_ENABLED !== 'false',
+    // completions 传输（src/utils/impersonate-transport.js）：纯 Node TLS 会被
+    // Baxia 风控（2026-11-21 实测），curl-impersonate 的 Chrome 指纹可通过。
+    // curlImpersonateBin 显式指定二进制路径，留空则按 PATH 查找。
+    completionsTransport: parseCompletionsTransport(),
+    curlImpersonateBin: process.env.CURL_IMPERSONATE_BIN || null,
     // Anthropic SSE `ping` cadence during upstream silence. Lower it if a client
     // or reverse proxy gives up sooner than this; the compensation retry can hold
     // the stream for tens of seconds with nothing else to send.
@@ -156,5 +206,6 @@ const config = {
 
 // 暴露解析器本身以便测试空槽位的拒绝逻辑（config 对象是模块级单例，无法重复解析）。
 config.parseApiKeys = parseApiKeys
+config.parseCompletionsTransport = parseCompletionsTransport
 
 module.exports = config
