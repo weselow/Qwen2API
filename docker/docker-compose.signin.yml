@@ -1,0 +1,63 @@
+# Standalone alternative to docker-compose.dev.yml with the v2 session
+# pipeline (epic Qwen2API-jik): Qwen2API + signin-worker sidecar.
+# Coolify: Base Directory /, Compose Location /docker/docker-compose.signin.yml.
+# CLI: docker compose --project-directory . --env-file <private.env> -f docker/docker-compose.signin.yml up -d --build
+services:
+  qwen2api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    restart: always
+    ports:
+      - "${QWEN_PORT_BINDING:-3000:3000}"
+    volumes:
+      - ${QWEN_DATA_DIR:-./data}:/app/data
+      - ${QWEN_LOGS_DIR:-./logs}:/app/logs
+      - ${QWEN_CACHES_DIR:-./caches}:/app/caches
+    environment:
+      - SERVICE_PORT=3000
+      - API_KEY=${API_KEY:?Set the existing API key or a new private key}
+      - LISTEN_ADDRESS=${LISTEN_ADDRESS:-}
+      - SEARCH_INFO_MODE=${SEARCH_INFO_MODE:-table}
+      - OUTPUT_THINK=${OUTPUT_THINK:-true}
+      - SIMPLE_MODEL_MAP=${SIMPLE_MODEL_MAP:-false}
+      - REDIS_URL=${REDIS_URL:-}
+      - DATA_SAVE_MODE=${DATA_SAVE_MODE:-file}
+      - ACCOUNTS=${ACCOUNTS:-}
+      - CACHE_MODE=${CACHE_MODE:-file}
+      # v2 session pipeline: browser sessions come from the sidecar.
+      - V2_SESSION_MODE=${V2_SESSION_MODE:-browser}
+      - SIGNIN_WORKER_URL=http://signin-worker:3100
+      - SIGNIN_WORKER_TOKEN=${SIGNIN_WORKER_TOKEN:-}
+    depends_on:
+      signin-worker:
+        condition: service_healthy
+
+  signin-worker:
+    build:
+      context: ./signin-worker
+    restart: always
+    environment:
+      - SIGNIN_WORKER_TOKEN=${SIGNIN_WORKER_TOKEN:-}
+      - SIGNIN_HEADLESS=${SIGNIN_HEADLESS:-true}
+    # One Chromium profile per account; keep them on a volume so auth.qwen.ai
+    # sessions survive restarts and renewal stays a silent reload.
+    volumes:
+      - ${SIGNIN_PROFILES_DIR:-signin_profiles}:/app/profiles
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3100/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    # No published ports: the API carries credentials and bearer tokens and
+    # must stay on the internal compose network.
+
+volumes:
+  signin_profiles: {}
