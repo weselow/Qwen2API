@@ -76,7 +76,6 @@ function classify(response) {
     const ct = String(response.headers['content-type'] || '')
     const html = /^text\/html\b/i.test(ct)
     const json = /^application\/json\b/i.test(ct)
-    const data = typeof response.data === 'string' || (json && response.data) ? response.data : null
     return { status: response.status, contentType: ct || null, html, json,
         waf: html ? Boolean(detectWafChallenge(response.data)) || /errors\.aliyun\.com|blocked-message|405\.png/i.test(response.data) : false,
         apiError: json && response.data ? (response.data.error || response.data.code || null) : null }
