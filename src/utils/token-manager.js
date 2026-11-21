@@ -2,20 +2,13 @@ const axios = require('axios')
 const { sha256Encrypt, JwtDecode, jitter } = require('./tools')
 const { logger } = require('./logger')
 const { applyProxyToAxiosConfig, getChatBaseUrl } = require('./proxy-helper');
-const { buildUserAgent } = require('./header-profile')
+const { buildSigninHeaders } = require('./header-profile')
 
 /**
  * 令牌管理器
  * 负责令牌的获取、验证、刷新等操作
  */
 class TokenManager {
-    constructor() {
-        // Legacy default; overridden per-account when fingerprint is available
-        this.defaultHeaders = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0'
-        }
-    }
-
     /**
      * 获取登录端点
      * @returns {string} 登录端点URL
@@ -33,10 +26,8 @@ class TokenManager {
      */
     async login(email, password, account) {
         try {
-            // Use per-account fingerprint UA when available; fall back to legacy Edge UA
-            const ua = (account && account.fingerprint) ? buildUserAgent(account.fingerprint) : this.defaultHeaders['User-Agent']
             const requestConfig = {
-                headers: { 'User-Agent': ua },
+                headers: buildSigninHeaders(account, { chatBaseUrl: getChatBaseUrl() }),
                 timeout: 10000 // 10秒超时
             }
 
