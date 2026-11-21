@@ -3,6 +3,7 @@ const DataPersistence = require('./data-persistence')
 const TokenManager = require('./token-manager')
 const lab = require('./v2-lab-sessions')
 const v2sessions = require('./v2-session-store')
+const sessionPersistence = require('./v2-session-persistence')
 const AccountRotator = require('./account-rotator')
 const { logger } = require('./logger')
 const { generateDeterministicFingerprint } = require('./fingerprint')
@@ -131,6 +132,14 @@ class Account {
         try {
             // 加载账户信息
             await this.loadAccountTokens()
+
+            // jik.4：恢复持久化的 v2 浏览器会话（off/lab 模式下 no-op）。
+            // 恢复失败不阻塞启动——会话可再生，首次请求/自动刷新会重建
+            try {
+                await sessionPersistence.restoreSessions()
+            } catch (error) {
+                logger.error('v2 会话恢复失败，继续启动（会话将由登录/刷新重建）', 'ACCOUNT', '', error)
+            }
 
             // 设置定期刷新令牌
             if (config.autoRefresh) {

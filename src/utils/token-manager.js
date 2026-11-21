@@ -1,6 +1,7 @@
 const axios = require('axios')
 const lab = require('./v2-lab-sessions')
 const v2sessions = require('./v2-session-store')
+const sessionPersistence = require('./v2-session-persistence')
 const signinWorker = require('./signin-worker-client')
 const { SigninError } = require('./signin-error')
 const { sha256Encrypt, JwtDecode, jitter } = require('./tools')
@@ -94,7 +95,8 @@ class TokenManager {
         const harvested = await signinWorker.acquireSession(email, password, account)
         const decoded = this.validateToken(harvested.token)
         if (!decoded) throw new SigninError('signin_upstream_error', 502, 'Signin worker returned an invalid token.')
-        v2sessions.setSession(email, {
+        // publishSession = setSession + 持久化（jik.4）：重启后无需重新登录
+        await sessionPersistence.publishSession(email, {
             token: harvested.token,
             expiresAt: decoded.exp,
             jar: harvested.jar
@@ -216,7 +218,9 @@ class TokenManager {
             const previous = v2sessions.sessions.get(account.email)
             const publish = () => {
                 const current = v2sessions.sessions.get(account.email)
-                if (!current || current === previous) v2sessions.setSession(account.email, next)
+                // publishSession 同时写 store 与持久层（jik.4）；
+                // 它不会抛错——此处 fire-and-forget 安全
+                if (!current || current === previous) sessionPersistence.publishSession(account.email, next)
             }
             if (options.afterSave) options.afterSave(publish)
             else publish()

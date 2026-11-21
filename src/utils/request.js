@@ -10,6 +10,7 @@ const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
 const lab = require('./v2-lab-sessions')
+const sessionPersistence = require('./v2-session-persistence')
 const {
     ContextExternalizationError, isTransportInterruption, assertChatChallengeBreakerClosed,
     bindChatChallengeContext, chatChallengeFrom, isWafChallengeError, releaseChatProbe,
@@ -712,6 +713,12 @@ const sendChatRequest = async (body, options = {}) => {
         return result
     } catch (error) {
         if (error instanceof ChatCreationError || !isWafChallengeError(error)) releaseChatProbe(breakerContext)
+        // jik.4：上游拒绝会话（401 unauthorized）或 punish（WAF challenge）——
+        // 作废 v2 会话并触发 signin-worker 续期。off/lab 模式与无会话时 no-op
+        if (currentAccount &&
+            (error.code === 'upstream_session_unauthorized' || isWafChallengeError(error))) {
+            sessionPersistence.invalidateSession(currentAccount.email, currentAccount, error.code)
+        }
         throw error
     }
 }
@@ -890,6 +897,10 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
             const status = lastError.response?.status
             logger.error('发送聊天请求失败', 'REQUEST', '', lastError.message)
             accountManager.recordAccountError(currentAccount.email, status)
+            // 401 = 上游拒绝会话/bearer（jik.4）：v2 会话作废并续期；off/lab 模式 no-op
+            if (status === 401) {
+                sessionPersistence.invalidateSession(currentAccount.email, currentAccount, 401)
+            }
         }
     } else if (lastError) {
         logger.error('发送聊天请求失败', 'REQUEST', '', lastError.message)
@@ -970,6 +981,12 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
             }
         }
         logger.error(`Qwen chat creation failed: category=${failure.code}, status=${failure.status}`, 'CHAT')
+        // jik.4：会话被上游拒绝（401/punish）——image/video 控制器直接调用
+        // 本函数、不经 sendChatRequest，所以这里也要作废会话
+        if (account &&
+            (failure.code === 'upstream_session_unauthorized' || failure.code === 'upstream_waf_challenge')) {
+            sessionPersistence.invalidateSession(account.email, account, failure.code)
+        }
         throw failure
     }
 }

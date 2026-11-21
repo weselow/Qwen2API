@@ -593,6 +593,11 @@ const redisClient = {
     return client.hgetall(key)
   },
 
+  async hdel(key, ...fields) {
+    const client = await ensureConnection()
+    return client.hdel(key, ...fields)
+  },
+
   async exists(key) {
     const client = await ensureConnection()
     return client.exists(key)
