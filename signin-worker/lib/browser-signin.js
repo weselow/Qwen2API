@@ -68,11 +68,17 @@ async function openContext({ dataDir, proxy, headless = true, timeoutMs = 30000 
     })
 }
 
-/** Wait until the FE settles on a stable token (it may rotate it shortly after load). */
+/** Wait until the FE settles on a stable token (it may rotate it shortly
+ *  after load, and post-login redirects can destroy the page's execution
+ *  context mid-read — a destroyed-context read means "not settled yet",
+ *  the next attempt lands on the new document). */
 async function readStableToken(page) {
     let previous = null
-    for (let attempt = 0; attempt < 8; attempt++) {
-        const token = await page.evaluate(() => localStorage.getItem('token'))
+    for (let attempt = 0; attempt < 12; attempt++) {
+        let token = null
+        try {
+            token = await page.evaluate(() => localStorage.getItem('token'))
+        } catch { /* mid-navigation: retry on the next document */ }
         if (token && token === previous) return token
         previous = token || null
         await sleep(500)
