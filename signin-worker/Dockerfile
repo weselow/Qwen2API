@@ -3,7 +3,11 @@
 # auth.qwen.ai sessions across restarts (silent renewal via reload).
 FROM node:20-slim
 
-ENV NODE_ENV=production
+ENV NODE_ENV=production \
+    # Fixed browsers path: the build installs as root, the runtime runs as
+    # USER app — the default ~/.cache location differs between the two and
+    # the runtime would find no browser.
+    PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
 WORKDIR /app
 
 # ca-certificates first so npm and the Playwright download both trust TLS.
@@ -12,9 +16,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package.json ./
-# --with-deps installs the distro libraries headless Chromium needs.
+# --with-deps installs the distro libraries headless Chromium needs;
+# a+rX because the runtime user differs from the install user.
 RUN npm install --omit=dev \
     && npx playwright install --with-deps chromium \
+    && chmod -R a+rX /opt/pw-browsers \
     && rm -rf /var/lib/apt/lists/* /tmp/*
 
 COPY server.js ./
