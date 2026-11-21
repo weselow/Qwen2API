@@ -38,8 +38,15 @@ class TokenManager {
                 timeout: 10000 // 10秒超时
             }
 
-            if (lab.authOrigin) Object.assign(requestConfig, { proxy: false, maxRedirects: 0 })
-            else applyProxyToAxiosConfig(requestConfig, account);
+            let formJar
+            if (lab.authOrigin) {
+                formJar = await lab.openAuthForm(this.httpClient)
+                const cookies = formJar.getCookieStringSync(this.loginEndpoint)
+                if (cookies) requestConfig.headers.Cookie = cookies
+                Object.assign(requestConfig, { proxy: false, maxRedirects: 0 })
+            } else {
+                applyProxyToAxiosConfig(requestConfig, account)
+            }
 
             const response = await this.httpClient.post(this.loginEndpoint, {
                 email: email,
@@ -47,7 +54,7 @@ class TokenManager {
             }, requestConfig)
 
             if (lab.authOrigin) {
-                const session = lab.authenticatedJar(response, this.loginEndpoint, null, token => this.validateToken(token))
+                const session = lab.authenticatedJar(response, this.loginEndpoint, { jar: formJar }, token => this.validateToken(token))
                 lab.sessions.set(email, session)
             }
             if (response.data && response.data.token) {

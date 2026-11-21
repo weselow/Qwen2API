@@ -62,6 +62,10 @@ test('isolated v2 sessions select cookies per account, host and path on the wire
     }))
     records.push({ host: url.hostname, path: url.pathname, method: req.method, fixture, bearer: req.headers.authorization, raw })
     res.setHeader('Content-Type', 'application/json')
+    if (url.pathname === '/auth') {
+      res.setHeader('Content-Type', 'text/html')
+      return res.end('<form></form>')
+    }
     if (url.pathname === signin) {
       const { email } = JSON.parse(raw)
       if (email.startsWith('blocked') || refuse) {

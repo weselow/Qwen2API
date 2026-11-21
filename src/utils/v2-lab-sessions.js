@@ -17,6 +17,27 @@ const authOrigin = process.env.QWEN_LAB_V2_AUTH_ORIGIN && labOrigin(process.env.
 const chatOrigin = authOrigin && labOrigin(config.qwenChatProxyUrl)
 const sessions = new Map()
 
+function readCookies(jar, response, url) {
+    for (const line of [].concat(response.headers['set-cookie'] || [])) {
+        jar.setCookieSync(line, url, { ignoreError: true })
+    }
+}
+
+async function openAuthForm(httpClient) {
+    const url = new URL('/auth', chatOrigin || 'https://chat.qwen.ai').href
+    const response = await httpClient.get(url, {
+        headers: { Accept: 'text/html' },
+        proxy: false, maxRedirects: 0, timeout: 10000, maxContentLength: 2097152
+    })
+    if (response.status !== 200 || !/^text\/html\b/i.test(response.headers['content-type'] || '') ||
+        typeof response.data !== 'string' || !response.data.trim() || detectWafChallenge(response.data)) {
+        throw SigninError.fromResponse(response)
+    }
+    const jar = new CookieJar()
+    readCookies(jar, response, url)
+    return jar
+}
+
 function authenticatedJar(response, url, previous, validateToken) {
     const data = response.data
     if (response.status !== 200 || !/^application\/json\b/i.test(response.headers['content-type'] || '') ||
@@ -24,8 +45,7 @@ function authenticatedJar(response, url, previous, validateToken) {
         throw SigninError.fromResponse(response)
     }
     const jar = previous ? previous.jar.cloneSync() : new CookieJar()
-    const lines = response.headers['set-cookie'] || []
-    for (const line of [].concat(lines)) jar.setCookieSync(line, url, { ignoreError: true })
+    readCookies(jar, response, url)
     return { token: data.token, jar }
 }
 
@@ -49,4 +69,4 @@ function prepareChat(requestConfig, url, account, token) {
     requestConfig.headers.cookie = [...cookies.map(cookie => cookie.cookieString()), ...legacy].join('; ')
 }
 
-module.exports = { authOrigin, sessions, sessionFor, authenticatedJar, prepareChat }
+module.exports = { authOrigin, sessions, sessionFor, openAuthForm, authenticatedJar, prepareChat }
