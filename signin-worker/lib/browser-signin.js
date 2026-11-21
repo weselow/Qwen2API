@@ -109,12 +109,17 @@ async function signin(context, { email, password, chatOrigin = 'https://chat.qwe
     // Already signed in (persisted profile): the FE redirects away from /auth.
     if (!page.url().includes('/auth')) return finish(page, context, chatOrigin)
 
-    // Some FE builds open on a verification-code form; flip to password login when a switch exists.
-    for (const toggle of [page.getByText('password', { exact: false }).first()]) {
-        try {
-            await toggle.click({ timeout: 3000 })
-            break
-        } catch { /* form is already password-mode */ }
+    // Wait for the React form to render before touching the mode toggle:
+    // domcontentloaded fires before the auth widgets mount.
+    await firstVisible(page, EMAIL_INPUT, 20000).catch(() => {
+        throw new BrowserSigninError('form_not_found', 'Email input not found on the auth form.')
+    })
+    // The FE opens on a verification-code form ("Login with verification code");
+    // the live DOM carries a <button>Log in with a password</button> toggle.
+    const passwordToggle = page.locator('button:visible', { hasText: /password/i }).first()
+    if (await passwordToggle.count()) {
+        await passwordToggle.click({ timeout: 5000 })
+            .catch(() => { /* form is already password-mode */ })
     }
 
     try {
@@ -136,7 +141,10 @@ async function signin(context, { email, password, chatOrigin = 'https://chat.qwe
         }
     }
     await typeHuman(passwordField, password)
-    await passwordField.press('Enter')
+    // Submit via the form's primary button when present (more reliable than Enter).
+    const submit = page.locator('button:visible', { hasText: /^(log in|sign in|continue)$/i }).first()
+    if (await submit.count()) await submit.click({ timeout: 5000 }).catch(() => {})
+    else await passwordField.press('Enter')
 
     // Captcha auto-passes in a real context; just wait out the navigation.
     try {

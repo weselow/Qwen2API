@@ -58,6 +58,22 @@ async function main() {
         console.log(`token expires: ${new Date(harvested.exp * 1000).toISOString()}`)
         console.log(`cookies: ${harvested.cookies.map(cookie => cookie.name).sort().join(', ')}`)
         console.log(`session file: ${file}`)
+    } catch (error) {
+        // Debug dump for live-Form tuning: URL, visible inputs and a screenshot
+        // (no credentials ever reach it — only what the page itself shows).
+        const page = context.pages()[0]
+        if (page) {
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+            try {
+                await page.screenshot({ path: path.join(outDir, `harvest-failure-${stamp}.png`), fullPage: true })
+                const inputs = await page.locator('input:visible').evaluateAll(nodes =>
+                    nodes.map(node => ({ type: node.type, name: node.name, placeholder: node.placeholder || null })))
+                console.error(`debug url: ${page.url()}`)
+                console.error(`debug inputs: ${JSON.stringify(inputs)}`)
+                console.error(`debug screenshot: ${path.join(outDir, `harvest-failure-${stamp}.png`)}`)
+            } catch { /* page already gone */ }
+        }
+        throw error
     } finally {
         await context.close().catch(() => {})
     }
