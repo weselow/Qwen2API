@@ -8,9 +8,9 @@ const config = require('../config/index.js')
 const { getTimezoneHeader } = require('./tools')
 
 // chat.qwen.ai 前端版本（FE version）：请求头 Version 必须与线上前端一致，
-// 否则 /api/v2/chat/completions 返回 Bad_Request（2026-10-17 实测线上为 0.3.19）。
-// 前端三天内从 0.3.17 升到 0.3.19，此处过期需同步更新。
-const QWEN_WEB_VERSION = '0.3.19'
+// 否则 /api/v2/chat/completions 返回 Bad_Request（2026-11-21 实测线上为 0.3.49，
+// 见 docs/et0-live-integration-2026-11-21.md；漂移检测：tools/et0-live-probe.js）。
+const QWEN_WEB_VERSION = '0.3.49'
 
 // Refreshed against locally observed Chrome 157 (not a stable-release claim).
 // Keep the existing four-major deterministic profile spread.
@@ -114,6 +114,26 @@ function buildSigninHeaders(account, options = {}) {
 
 
 /**
+ * Build the timezone header in the live FE's format ('Sat Nov 21 2026 19:55:52 GMT+0400')
+ * from a fingerprint timezoneOffset (minutes behind UTC, as Date#getTimezoneOffset).
+ * 2026-11-21 live capture sends this exact shape; the old 'UTC+04' form is not FE-shaped.
+ * @param {number} tzOffset - getTimezoneOffset-style minutes (UTC+4 => -240)
+ * @returns {string}
+ */
+function fingerprintTimezoneHeader(tzOffset) {
+    const shifted = new Date(Date.now() - tzOffset * 60000)
+    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    const pad = n => String(n).padStart(2, '0')
+    const sign = tzOffset <= 0 ? '+' : '-'
+    const hours = Math.abs(tzOffset) / 60
+    const hhmm = `${pad(Math.floor(hours))}${pad(Math.round((hours % 1) * 60))}`
+    return `${days[shifted.getUTCDay()]} ${months[shifted.getUTCMonth()]} ${pad(shifted.getUTCDate())} ` +
+        `${shifted.getUTCFullYear()} ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}:` +
+        `${pad(shifted.getUTCSeconds())} GMT${sign}${hhmm}`
+}
+
+/**
  * Build full request headers for an upstream Qwen API call.
  * @param {Object} account - Account object (must have .fingerprint after ensureAccountFingerprint)
  * @param {Object} options - Additional header overrides or context
@@ -169,9 +189,7 @@ function buildRequestHeaders(account, options = {}) {
     // Derive timezone from fingerprint offset; fall back to server TZ only when missing or invalid
     const rawTz = fp && fp.timezoneOffset != null ? Number(fp.timezoneOffset) : NaN
     const tzOffset = Number.isFinite(rawTz) ? Math.trunc(rawTz) : null
-    const timezone = tzOffset !== null
-        ? `UTC${tzOffset <= 0 ? '+' : '-'}${String(Math.abs(tzOffset) / 60).padStart(2, '0')}`
-        : getTimezoneHeader()
+    const timezone = tzOffset !== null ? fingerprintTimezoneHeader(tzOffset) : getTimezoneHeader()
 
     const headers = {
         'sec-ch-ua-platform': secChPlatform,
@@ -218,6 +236,7 @@ module.exports = {
     buildSecChUa,
     platformToSecChUa,
     pickChromeVersion,
+    fingerprintTimezoneHeader,
     LEGACY_HEADERS,
     LEGACY_UA
 }

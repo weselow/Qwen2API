@@ -11,6 +11,7 @@ const {
   buildSigninHeaders,
   buildUserAgent,
   platformToSecChUa,
+  fingerprintTimezoneHeader,
   LEGACY_HEADERS,
   LEGACY_UA
 } = require('../src/utils/header-profile.js')
@@ -88,6 +89,23 @@ describe('AC2 - header consistency for same account', () => {
     } else if (account.fingerprint.platform.startsWith('Linux')) {
       assert.ok(h['user-agent'].includes('Linux'))
     }
+  })
+
+  it('timezone header matches the live FE date-string format for fingerprint offsets', () => {
+    // 2026-11-21 live capture: 'Sat Nov 21 2026 19:55:52 GMT+0400' (docs/et0-live-integration-2026-11-21.md)
+    const whole = fingerprintTimezoneHeader(-240)
+    assert.match(whole, /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{2} \d{4} \d{2}:\d{2}:\d{2} GMT\+0400$/)
+    const halfHour = fingerprintTimezoneHeader(-330)
+    assert.match(halfHour, /GMT\+0530$/)
+    const west = fingerprintTimezoneHeader(300)
+    assert.match(west, /GMT-0500$/)
+    // The header wiring must actually use it for fingerprinted accounts
+    const account = {
+      email: 'tz@example.com',
+      fingerprint: generateDeterministicFingerprint('tz@example.com')
+    }
+    const wired = buildRequestHeaders(account, {})
+    assert.match(wired.timezone, /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{2} \d{4} \d{2}:\d{2}:\d{2} GMT[+-]\d{4}$/)
   })
 })
 
