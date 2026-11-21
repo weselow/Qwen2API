@@ -57,11 +57,18 @@ const enqueueAccountTask = (key, task) => {
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
+// v2 会话在 Redis 里的家：独立 hash，不进 user:*（getAllAccounts 的 SCAN
+// 靠 user:* 圈定账户，会话混进去会把 bearer token 泄进账户列表）
+const V2_SESSIONS_KEY = 'qwen2api:v2sessions'
+
 class DataPersistence {
   constructor() {
     this.dataFilePath = resolveRuntimePath('data', 'data.json')
     // 最近一次「解析成功」的快照，用于文件损坏时自愈
     this.backupFilePath = `${this.dataFilePath}.bak`
+    // v2 浏览器会话（token + cookie-jar）单独落盘：token 是 bearer 凭据，
+    // 不能混进默认权限的 data.json（Qwen2API-jik.4）
+    this.v2SessionsFilePath = resolveRuntimePath('data', 'v2-sessions.json')
     // 每个 email 的待持久化 stats 与定时器（debounce）
     this._statsPersistTimers = new Map()
     this._statsPendingPayload = new Map()
@@ -136,6 +143,11 @@ class DataPersistence {
           if (timer) clearTimeout(timer)
           this._statsPersistTimers.delete(email)
           this._statsPendingPayload.delete(email)
+          // 账户删除后，其 v2 会话记录（bearer token + jar）不能留在线上：
+          // 删除失败只记日志——账户本体已删，回滚它只会更糟
+          if (!(await this.deleteV2Session(email))) {
+            logger.error(`账户已删除但其 v2 会话记录删除失败 (${email})`, 'DATA')
+          }
         }
         return removed
       } catch (error) {
@@ -171,6 +183,162 @@ class DataPersistence {
       markAccountDeleted(key)
       return true
     })
+  }
+
+  // v2 浏览器会话持久化（Qwen2API-jik.4）。记录对存储层不透明——
+  // {token, expiresAt, jar} 由 v2-session-persistence 序列化/反序列化，
+  // 这里只负责按 backend 落盘；过期裁剪在读取方（restore）做。
+
+  /**
+   * 加载全部 v2 会话记录
+   * @returns {Promise<Object>} { [email]: {token, expiresAt, jar} }
+   */
+  async loadV2Sessions() {
+    try {
+      switch (config.dataSaveMode) {
+        case 'redis': return await this._loadV2SessionsFromRedis()
+        case 'file': return await this._loadV2SessionsFromFile()
+        case 'none': return {}
+        default:
+          logger.error(`不支持的数据保存模式: ${config.dataSaveMode}`, 'DATA')
+          return {}
+      }
+    } catch (error) {
+      logger.error('加载 v2 会话数据失败', 'DATA', '', error)
+      return {}
+    }
+  }
+
+  /**
+   * 保存单个账户的 v2 会话。已删除的账户拒绝恢复写入——
+   * 会话 token 是 bearer 凭据，绝不能因迟到的续期而复活。
+   * @returns {Promise<boolean>} 写入是否成功
+   */
+  async saveV2Session(email, session) {
+    if (!email || !session) return false
+    const key = this._accountKey(email)
+    return enqueueAccountTask(key, async () => {
+      if (deletedAccountKeys.has(key)) return false
+      try {
+        switch (config.dataSaveMode) {
+          case 'redis':
+            await redisClient.hset(V2_SESSIONS_KEY, email, JSON.stringify(session))
+            return true
+          case 'file':
+            return await this._saveV2SessionToFile(email, session)
+          case 'none': return false
+          default: throw new Error(`Unsupported data save mode: ${config.dataSaveMode}`)
+        }
+      } catch (error) {
+        logger.error(`保存 v2 会话失败 (${email})`, 'DATA', '', error)
+        return false
+      }
+    })
+  }
+
+  /**
+   * 删除单个账户的 v2 会话记录（401/punish 失效、账户删除）
+   * @returns {Promise<boolean>} 删除是否成功
+   */
+  async deleteV2Session(email) {
+    if (!email) return false
+    try {
+      switch (config.dataSaveMode) {
+        case 'redis': {
+          await redisClient.hdel(V2_SESSIONS_KEY, email)
+          return true
+        }
+        case 'file': return await this._deleteV2SessionFromFile(email)
+        case 'none': return true
+        default: throw new Error(`Unsupported data save mode: ${config.dataSaveMode}`)
+      }
+    } catch (error) {
+      logger.error(`删除 v2 会话失败 (${email})`, 'DATA', '', error)
+      return false
+    }
+  }
+
+  async _loadV2SessionsFromRedis() {
+    const raw = await redisClient.hgetall(V2_SESSIONS_KEY)
+    const sessions = {}
+    for (const [email, value] of Object.entries(raw || {})) {
+      try {
+        const record = JSON.parse(value)
+        if (record && typeof record === 'object') sessions[email] = record
+      } catch (parseError) {
+        logger.warn(`v2 会话 JSON 损坏，跳过 (${email})`, 'DATA')
+      }
+    }
+    return sessions
+  }
+
+  async _loadV2SessionsFromFile() {
+    return enqueueFileTask(async () => (await this._readV2SessionsFile()).sessions)
+  }
+
+  async _saveV2SessionToFile(email, session) {
+    return enqueueFileTask(async () => {
+      const data = await this._readV2SessionsFile()
+      data.sessions[email] = session
+      await this._writeV2SessionsFile(data)
+      return true
+    })
+  }
+
+  async _deleteV2SessionFromFile(email) {
+    return enqueueFileTask(async () => {
+      const data = await this._readV2SessionsFile()
+      if (!(email in data.sessions)) return true
+      delete data.sessions[email]
+      await this._writeV2SessionsFile(data)
+      return true
+    })
+  }
+
+  /**
+   * 读取 v2-sessions.json；损坏时隔离原件并返回空集——会话可再生
+   * （signin-worker 一次续期即可重建），不值得像 data.json 那样中止启动。
+   * @returns {Promise<{sessions: Object}>}
+   */
+  async _readV2SessionsFile() {
+    let content
+    try {
+      content = await fs.readFile(this.v2SessionsFilePath, 'utf-8')
+    } catch (error) {
+      if (error.code === 'ENOENT') return { sessions: {} }
+      throw error
+    }
+    try {
+      const data = JSON.parse(content)
+      if (data && typeof data === 'object' && !Array.isArray(data) && data.sessions &&
+          typeof data.sessions === 'object' && !Array.isArray(data.sessions)) {
+        return data
+      }
+      throw new Error('unexpected v2 sessions file shape')
+    } catch (parseError) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      const quarantinePath = `${this.v2SessionsFilePath}.corrupt-${stamp}`
+      logger.error(
+        `v2 会话文件损坏 (${this.v2SessionsFilePath})，弃用全部会话并隔离原件: ${quarantinePath}`,
+        'DATA'
+      )
+      try {
+        await fs.rename(this.v2SessionsFilePath, quarantinePath)
+      } catch (renameError) {
+        logger.warn(`损坏 v2 会话文件隔离失败: ${renameError.message}`, 'DATA')
+      }
+      return { sessions: {} }
+    }
+  }
+
+  /**
+   * v2-sessions.json 原子写入，权限 0600——文件里是 bearer token
+   * 与会话 cookie，同目录的 data.json 没有这类凭据，维持默认权限。
+   */
+  async _writeV2SessionsFile(data) {
+    const content = JSON.stringify(data, null, 2)
+    await fs.mkdir(path.dirname(this.v2SessionsFilePath), { recursive: true })
+    await this._writeFileAtomic(this.v2SessionsFilePath, content, 0o600)
   }
 
   /**
@@ -527,13 +695,15 @@ class DataPersistence {
    * 中途崩溃也只会留下临时文件，目标文件保持上一版完整内容
    * @param {string} targetPath - 目标文件路径
    * @param {string} content - 文件内容
+   * @param {number} [mode] - 目标文件权限（POSIX）；chmod 显式设置，不受 umask 影响
    * @private
    */
-  async _writeFileAtomic(targetPath, content) {
+  async _writeFileAtomic(targetPath, content, mode) {
     const tmpPath = `${targetPath}.${process.pid}.${++tmpFileCounter}.tmp`
     let handle = null
     try {
-      handle = await fs.open(tmpPath, 'w')
+      handle = await fs.open(tmpPath, 'w', mode)
+      if (mode !== undefined) await handle.chmod(mode)
       await handle.writeFile(content, 'utf-8')
       // fsync：保证 rename 之后内容确实落盘（掉电 / 容器被杀时才不会拿到空文件）
       await handle.sync()
