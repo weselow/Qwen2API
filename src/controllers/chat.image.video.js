@@ -12,7 +12,7 @@ const { applyProxyToAxiosConfig, getChatBaseUrl } = require('../utils/proxy-help
 const { buildRequestHeaders } = require('../utils/header-profile')
 const {
     assertChatChallengeBreakerClosed, bindChatChallengeContext, chatChallengeFrom,
-    isWafChallengeError, noteChatChallengeAnswer, releaseChatProbe
+    isWafChallengeError, noteChatChallengeAnswer, releaseChatProbe, ChatCreationError
 } = require('../utils/upstream-error.js')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
@@ -694,7 +694,8 @@ const sendOpenAIErrorResponse = (res, error) => {
     return res.status(status).json({
         error: {
             message,
-            type: status >= 500 ? 'server_error' : 'invalid_request_error'
+            type: status >= 500 ? 'server_error' : 'invalid_request_error',
+            ...(error?.code ? { code: error.code } : {})
         }
     })
 }
@@ -1501,6 +1502,10 @@ const generateImageVideoResult = async (payload) => {
 
         throw new Error('不支持的图片/视频类型')
     } catch (error) {
+        if (error instanceof ChatCreationError) {
+            releaseChatProbe(breakerContext)
+            throw { status: error.status, error: error.publicMessage, code: error.code, chatCreation: true }
+        }
         logger.error('图片/视频主流程异常', 'CHAT', '', buildAxiosErrorLog(error))
 
         if (error?.error) {
@@ -1554,6 +1559,17 @@ const handleImageVideoCompletion = async (req, res) => {
         }
 
         logger.error('图片视频资源处理错误', 'CHAT', '', error)
+
+        if (error?.chatCreation) {
+            const failure = { status: error.status, error: error.error, code: error.code }
+            if (!res.headersSent) {
+                res.set({ 'Content-Type': 'application/json' })
+                return sendUpstreamError(res, failure)
+            }
+            // A video's keep-alive may already have committed SSE while creating the chat.
+            res.write(`data: ${JSON.stringify({ error: { message: failure.error, code: failure.code, type: 'server_error' } })}\n\n`)
+            return res.end('data: [DONE]\n\n')
+        }
 
         // chat challenge 且尚未提交：返回真正的 503 + Retry-After（t2v 预设了 text/event-stream，需改回 JSON），
         // 而不是把错误文本当成 200 的流式正文。

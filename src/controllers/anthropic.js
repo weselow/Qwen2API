@@ -147,7 +147,7 @@ const writeAnthropicHttpFailure = (res, failure, message) => {
   if (failure.retryAfter !== null) res.set({ 'Retry-After': String(failure.retryAfter) });
   return res.status(failure.status).json({
     type: 'error',
-    error: { type: errorType, message }
+    error: { type: errorType, message, ...(failure.code ? { code: failure.code } : {}) }
   });
 };
 
