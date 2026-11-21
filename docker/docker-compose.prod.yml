@@ -1,0 +1,138 @@
+# Production stack: Qwen2API (hybrid v2 session pipeline) + signin-worker
+# sidecar + DNS-over-HTTPS sidecar. Merges docker-compose.dns.yml and
+# docker-compose.signin.yml; those files stay standalone dev variants.
+# Coolify: Base Directory /, Compose Location /docker/docker-compose.prod.yml.
+# CLI: docker compose --project-directory . --env-file <private.env> -f docker/docker-compose.prod.yml up -d --build
+services:
+  qwen2api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    restart: always
+    ports:
+      - "${QWEN_PORT_BINDING:-3000:3000}"
+    volumes:
+      - ${QWEN_DATA_DIR:-./data}:/app/data
+      - ${QWEN_LOGS_DIR:-./logs}:/app/logs
+      - ${QWEN_CACHES_DIR:-./caches}:/app/caches
+    environment:
+      - SERVICE_PORT=3000
+      - API_KEY=${API_KEY:?Set the existing API key or a new private key}
+      - LISTEN_ADDRESS=${LISTEN_ADDRESS:-}
+      - SEARCH_INFO_MODE=${SEARCH_INFO_MODE:-table}
+      - OUTPUT_THINK=${OUTPUT_THINK:-true}
+      - SIMPLE_MODEL_MAP=${SIMPLE_MODEL_MAP:-false}
+      - REDIS_URL=${REDIS_URL:-}
+      - DATA_SAVE_MODE=${DATA_SAVE_MODE:-file}
+      - ACCOUNTS=${ACCOUNTS:-}
+      - CACHE_MODE=${CACHE_MODE:-file}
+      # v2 session pipeline: browser sessions come from the sidecar,
+      # completions ride curl-impersonate (auto = binary from the image).
+      # Rollback to the v1 path: set V2_SESSION_MODE=off and
+      # COMPLETIONS_TRANSPORT=axios, redeploy; nothing else changes.
+      - V2_SESSION_MODE=${V2_SESSION_MODE:-browser}
+      - COMPLETIONS_TRANSPORT=${COMPLETIONS_TRANSPORT:-auto}
+      - SIGNIN_WORKER_URL=http://signin-worker:3100
+      - SIGNIN_WORKER_TOKEN=${SIGNIN_WORKER_TOKEN:-}
+    dns:
+      - ${DNS_SIDECAR_IP:?Set an unused IP inside DNS_SUBNET}
+    depends_on:
+      dnsproxy:
+        condition: service_healthy
+      signin-worker:
+        condition: service_healthy
+    networks:
+      - default
+      - dns_sidecar
+
+  signin-worker:
+    build:
+      context: ./signin-worker
+    restart: always
+    environment:
+      - SIGNIN_WORKER_TOKEN=${SIGNIN_WORKER_TOKEN:-}
+      - SIGNIN_HEADLESS=${SIGNIN_HEADLESS:-true}
+    # One Chromium profile per account; keep them on a volume so auth.qwen.ai
+    # sessions survive restarts and renewal stays a silent reload.
+    volumes:
+      - ${SIGNIN_PROFILES_DIR:-signin_profiles}:/app/profiles
+    # The browser must resolve chat.qwen.ai / auth.qwen.ai through the DoH
+    # sidecar like the app does, not through plain host DNS.
+    dns:
+      - ${DNS_SIDECAR_IP:?Set an unused IP inside DNS_SUBNET}
+    depends_on:
+      dnsproxy:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3100/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - default
+      - dns_sidecar
+    # No published ports: the API carries credentials and bearer tokens and
+    # must stay on the internal compose network.
+
+  dnsproxy:
+    image: adguard/dnsproxy:v0.86.0@sha256:4d65bafbf246b206a1af35d4263a86c35451d957458c7836304199f1cd2c1535
+    restart: always
+    # Arguments live here: no repository file mounts or custom entrypoint needed.
+    command:
+      - --listen=0.0.0.0
+      - --port=53
+      - --upstream=${DNS_UPSTREAM:?Set a reachable plain DNS IP:port}
+      # Include the observed CNAME zone for clients that query the target separately.
+      - --upstream=[/chat.qwen.ai/aliyunga0019.com/]https://cloudflare-dns.com/dns-query
+      # Resolve the DoH hostname via an independent IP resolver, never this sidecar.
+      - --bootstrap=${DNS_BOOTSTRAP:?Set an independent plain DNS IP:port}
+      - --cache
+      - --cache-size=1048576
+      - --cache-min-ttl=0
+      - --cache-max-ttl=0
+      - --cache-optimistic=false
+      - --insecure=false
+      - --hosts-file-enabled=false
+      - --timeout=5s
+    healthcheck:
+      test:
+        - CMD-SHELL
+        # BusyBox nslookup can exit 0 for an empty response; require an A answer.
+        - >-
+          nslookup -type=A chat.qwen.ai 127.0.0.1 2>/dev/null |
+          awk '/^Name:/ { a=1 } a && /^Address: / { ok=1 } END { exit !ok }' &&
+          nslookup -type=A example.com 127.0.0.1 2>/dev/null |
+          awk '/^Name:/ { a=1 } a && /^Address: / { ok=1 } END { exit !ok }'
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 15s
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      dns_sidecar:
+        ipv4_address: ${DNS_SIDECAR_IP:?Set an unused IP inside DNS_SUBNET}
+    # No published ports. The bridge must allow egress to DNS and HTTPS upstreams.
+
+networks:
+  default: {}
+  dns_sidecar:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${DNS_SUBNET:?Set a subnet that does not overlap host or Docker networks}
+
+volumes:
+  signin_profiles: {}
