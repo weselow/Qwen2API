@@ -636,14 +636,14 @@ class Account {
      * @param {string} email - 邮箱地址
      * @returns {Promise<boolean>} 刷新是否成功
      */
-    async refreshAccountToken(email) {
-        return this._runAccountMutation(email, () => this._refreshAccountToken(email))
+    async refreshAccountToken(email, options) {
+        return this._runAccountMutation(email, () => this._refreshAccountToken(email, options))
     }
 
-    async _refreshAccountToken(email) {
+    async _refreshAccountToken(email, options) {
         const account = this.accountTokens.find(acc => acc.email === email)
         if (!account) return false
-        const updatedAccount = await this.tokenManager.refreshToken(account)
+        const updatedAccount = await this.tokenManager.refreshToken(account, options)
         if (!updatedAccount) return false
         const saved = await this.dataPersistence.saveAccount(email, {
             password: updatedAccount.password,
@@ -715,9 +715,9 @@ class Account {
      * @param {string} password - 密码
      * @returns {Promise<string|null>} 令牌或null
      */
-    async login(email, password, proxy) {
+    async login(email, password, proxy, options) {
         const accountLike = proxy ? { proxy } : undefined
-        return await this.tokenManager.login(email, password, accountLike)
+        return await this.tokenManager.login(email, password, accountLike, options)
     }
 
     /**

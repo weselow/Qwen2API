@@ -92,6 +92,12 @@
     "zh": "Chinese"
   },
   "msg": {
+    "signin_waf_block": "Qwen’s security service blocked sign-in. Open Qwen Chat to check access.",
+    "signin_verification_required": "Complete the verification in Qwen Chat.",
+    "signin_rejected": "Qwen rejected sign-in.",
+    "signin_upstream_error": "Qwen returned an unexpected sign-in response.",
+    "signin_transport_error": "Could not reach Qwen during sign-in.",
+    "signin_local_error": "The local sign-in request failed.",
     "addFailed": "Failed to add account:",
     "addSuccess": "Account added successfully",
     "allDeleteFailed": "Failed to delete all accounts:",

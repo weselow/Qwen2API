@@ -1,4 +1,5 @@
 const axios = require('axios')
+const { SigninError } = require('./signin-error')
 const { sha256Encrypt, JwtDecode, jitter } = require('./tools')
 const { logger } = require('./logger')
 const { applyProxyToAxiosConfig, getChatBaseUrl } = require('./proxy-helper');
@@ -24,7 +25,7 @@ class TokenManager {
      * @param {Object} [account] - 账户对象（用于解析账号级代理；为空时回退到全局 PROXY_URL）
      * @returns {Promise<string|null>} 令牌或null
      */
-    async login(email, password, account) {
+    async login(email, password, account, options = {}) {
         try {
             const requestConfig = {
                 headers: buildSigninHeaders(account, { chatBaseUrl: getChatBaseUrl() }),
@@ -42,18 +43,13 @@ class TokenManager {
                 // 不记录令牌本身：日志可能落盘或被采集，令牌可直接冒充该账户
                 logger.success(`${email} 登录成功`, 'AUTH')
                 return response.data.token
-            } else {
-                logger.error(`${email} 登录响应缺少令牌`, 'AUTH')
-                return null
             }
+            throw SigninError.fromResponse(response)
         } catch (error) {
-            if (error.response) {
-                logger.error(`${email} 登录失败 (${error.response.status})`, 'AUTH', '', error)
-            } else if (error.request) {
-                logger.error(`${email} 登录失败: 网络请求超时或无响应`, 'AUTH')
-            } else {
-                logger.error(`${email} 登录失败`, 'AUTH', '', error)
-            }
+            const failure = SigninError.fromError(error)
+            // Axios errors can include a reusable password hash, cookies and proxy credentials.
+            logger.error(`Qwen signin: ${failure.code} (upstream HTTP ${failure.upstreamStatus ?? 'none'})`, 'AUTH')
+            if (options.throwOnFailure) throw failure
             return null
         }
     }
@@ -118,9 +114,9 @@ class TokenManager {
      * @param {Object} account - 账户对象 {email, password, token, expires}
      * @returns {Promise<Object|null>} 更新后的账户对象或null
      */
-    async refreshToken(account) {
+    async refreshToken(account, options) {
         try {
-            const newToken = await this.login(account.email, account.password, account)
+            const newToken = await this.login(account.email, account.password, account, options)
             if (!newToken) {
                 return null
             }
@@ -142,6 +138,7 @@ class TokenManager {
 
             return updatedAccount
         } catch (error) {
+            if (error instanceof SigninError) throw error
             logger.error(`刷新令牌失败 (${account.email})`, 'TOKEN', '', error)
             return null
         }
