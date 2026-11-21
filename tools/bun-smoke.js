@@ -74,6 +74,10 @@ async function main() {
       'local-test-signature'
     ].join('.')
   }))
+  let chatCreationFailure = null
+  let chatCreationRequests = 0
+  let signInRequests = 0
+  const refusalSecret = 'private-upstream-refusal-fixture'
   let completionRequests = 0
   let replyDelayMilliseconds = 20
   let failoverMode = false
@@ -83,6 +87,7 @@ async function main() {
     const pathname = new URL(request.url, 'http://localhost').pathname
     response.setHeader('Content-Type', 'application/json')
     if (pathname === '/api/v1/auths/signin') {
+      signInRequests += 1
       let body = ''
       request.setEncoding('utf8')
       request.on('data', chunk => { body += chunk })
@@ -98,6 +103,15 @@ async function main() {
         id: MODEL, name: MODEL, info: { meta: { chat_type: ['t2t'], abilities: {} } }
       }] }))
     } else if (pathname === '/api/v2/chats/new') {
+      chatCreationRequests += 1
+      if (chatCreationFailure) {
+        response.setHeader('Set-Cookie', `private=${refusalSecret}`)
+        if (chatCreationFailure === 'unauthorized') {
+          return response.end(JSON.stringify({ success: false, data: { code: 'unauthorized', details: refusalSecret } }))
+        }
+        response.setHeader('Content-Type', 'text/html')
+        return response.end(`<html><meta name="aliyun_waf_aa" content="${refusalSecret}"></html>`)
+      }
       response.end(JSON.stringify({ data: { id: 'smoke-chat' } }))
     } else if (pathname === '/api/v2/chat/completions') {
       completionRequests += 1
@@ -285,6 +299,35 @@ async function main() {
     const afterUploads = await request('/api/csrf-token')
     assert.equal(typeof (await afterUploads.json()).csrfToken, 'string', 'Server stays responsive after invalid uploads')
     console.log('PASS: upload authentication, malformed multipart, field limits, and responsiveness')
+
+    // Real HTTP against this local stub, with isolated accounts/data: no Qwen traffic.
+    for (const [mode, code, status] of [
+      ['unauthorized', 'upstream_session_unauthorized', 502],
+      ['waf', 'upstream_waf_challenge', 503]
+    ]) {
+      chatCreationFailure = mode
+      for (const route of ['/v1/messages', '/v1/chat/completions']) {
+        for (const stream of [false, true]) {
+          const createsBefore = chatCreationRequests
+          const signInsBefore = signInRequests
+          const refused = await request(route, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
+            body: JSON.stringify({ model: MODEL, max_tokens: 16, stream, messages: [{ role: 'user', content: 'hello' }] })
+          })
+          const text = await refused.text()
+          assert.equal(refused.status, status, `${route} ${mode}: ${text}`)
+          assert.equal(JSON.parse(text).error.code, code)
+          assert.equal(refused.headers.get('retry-after'), null)
+          assert.equal(refused.headers.get('set-cookie'), null)
+          assert.equal(chatCreationRequests, createsBefore + 1, 'chat creation must not retry')
+          assert.equal(signInRequests, signInsBefore, 'a refusal must not trigger login/refresh')
+          assert.equal(completionRequests, 0, 'generation must not start after a refusal')
+          assert.ok(!text.includes(refusalSecret) && !applicationLogs.includes(refusalSecret), 'raw upstream content must stay private')
+        }
+      }
+    }
+    chatCreationFailure = null
+    console.log('PASS: chat creation categories over HTTP, stream/non-stream, safe logs, no retries or login')
 
     for (const route of ['/v1/messages', '/v1/chat/completions']) {
       const unauthorized = await request(route, {

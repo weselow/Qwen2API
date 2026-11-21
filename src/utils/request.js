@@ -11,7 +11,7 @@ const { buildRequestHeaders } = require('./header-profile')
 const {
     ContextExternalizationError, isTransportInterruption, assertChatChallengeBreakerClosed,
     bindChatChallengeContext, chatChallengeFrom, isWafChallengeError, releaseChatProbe,
-    describeUpstreamFailure, unclassifiedFailure
+    describeUpstreamFailure, unclassifiedFailure, ChatCreationError, assertChatCreationResponse
 } = require('./upstream-error.js')
 const { contextPrefixCache, prefixMatches, canonicalHistoryHash } = require('./context-prefix-cache.js')
 const {
@@ -709,7 +709,7 @@ const sendChatRequest = async (body, options = {}) => {
         if (!result.status) releaseChatProbe(breakerContext)
         return result
     } catch (error) {
-        if (!isWafChallengeError(error)) releaseChatProbe(breakerContext)
+        if (error instanceof ChatCreationError || !isWafChallengeError(error)) releaseChatProbe(breakerContext)
         throw error
     }
 }
@@ -903,7 +903,7 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
  * @param {string} currentToken
  * @param {string} model
  * @param {Object} [account] - 当前账户对象（用于解析账号级代理）
- * @returns {Promise<string|null>} 返回生成的chat_id，如果失败则返回null
+ * @returns {Promise<string>} Chat ID; failures throw a sanitized ChatCreationError
  */
 const generateChatID = async (currentToken, model, account, chatType = 't2t') => {
     try {
@@ -939,11 +939,25 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
             chat_mode: 'normal'
         }, requestConfig)
 
-        return response_data.data?.data?.id || null
+        return assertChatCreationResponse(response_data.data)
 
     } catch (error) {
-        logger.error('生成chat_id失败', 'CHAT', '', error.message)
-        return null
+        let failure = error
+        if (!(failure instanceof ChatCreationError)) {
+            // Even a rejected HTTP response may carry a known JSON/HTML refusal.
+            try {
+                if (error.response) assertChatCreationResponse(error.response.data)
+            } catch (classified) {
+                failure = classified
+            }
+            if (!(failure instanceof ChatCreationError)) {
+                failure = error.response
+                    ? new ChatCreationError()
+                    : new ChatCreationError('upstream_transport_error', 503)
+            }
+        }
+        logger.error(`Qwen chat creation failed: category=${failure.code}, status=${failure.status}`, 'CHAT')
+        throw failure
     }
 }
 

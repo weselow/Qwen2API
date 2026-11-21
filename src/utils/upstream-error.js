@@ -8,6 +8,33 @@ class UpstreamResponseError extends Error {
   }
 }
 
+// Chat creation fails before generation starts. Keep only allowlisted categories and
+// fixed messages: an upstream body, Axios config or cause must never escape this seam.
+class ChatCreationError extends UpstreamResponseError {
+  constructor(code = 'upstream_invalid_response', status = 502) {
+    const messages = {
+      upstream_session_unauthorized: 'Qwen session authorization rejected while creating chat; this is not Qwen2API client authentication',
+      upstream_waf_challenge: 'Qwen requires WAF/CAPTCHA verification while creating chat',
+      upstream_invalid_response: 'Qwen returned an unrecognized response while creating chat',
+      upstream_transport_error: 'Qwen chat creation transport failed'
+    };
+    super(messages[code], code);
+    this.name = 'ChatCreationError';
+    this.status = status;
+  }
+}
+
+const assertChatCreationResponse = (payload) => {
+  if (detectWafChallenge(payload)) throw new ChatCreationError('upstream_waf_challenge', 503);
+  if (payload?.success === false &&
+      [payload.code, payload.data?.code, payload.error?.code].some(code => code === 'unauthorized')) {
+    throw new ChatCreationError('upstream_session_unauthorized');
+  }
+  if (payload?.success !== false && !payload?.error &&
+      typeof payload?.data?.id === 'string' && payload.data.id.trim()) return payload.data.id;
+  throw new ChatCreationError();
+};
+
 /**
  * Cuota diaria agotada. Qwen la anuncia con `data.code = 'RateLimited'` y el texto
  * "You've reached the upper limit for today's usage." (observado en vivo en las sesiones
@@ -242,6 +269,9 @@ const rateLimitRetryAfterSeconds = (error) => {
  * @returns {{ rateLimited: boolean, overloaded: boolean, status: number, retryAfter: number|null }}
  */
 const describeUpstreamFailure = (error, fallbackStatus = 502, overloadedStatus = 529) => {
+  if (error instanceof ChatCreationError) {
+    return { ...unclassifiedFailure(error.status), code: error.code };
+  }
   if (isWafChallengeError(error)) {
     return {
       rateLimited: false,
@@ -292,9 +322,9 @@ const openAIErrorShape = (failure, message, fallbackCode = 'upstream_error') => 
   const shape = {
     status: failure.status,
     message,
-    code: failure.rateLimited
+    code: failure.code || (failure.rateLimited
       ? RATE_LIMIT_OPENAI_TYPE
-      : (failure.overloaded ? 'upstream_unavailable' : fallbackCode)
+      : (failure.overloaded ? 'upstream_unavailable' : fallbackCode))
   };
   if (failure.rateLimited) shape.type = RATE_LIMIT_OPENAI_TYPE;
   else if (failure.overloaded) shape.type = 'server_error';
@@ -512,6 +542,8 @@ const assertNoUpstreamFailure = (payload, source) => {
 
 module.exports = {
   UpstreamResponseError,
+  ChatCreationError,
+  assertChatCreationResponse,
   assertNoUpstreamFailure,
   detectWafChallenge,
   isWafChallengeBody,
