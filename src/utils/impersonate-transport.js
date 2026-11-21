@@ -49,10 +49,20 @@ const CHROME116_CIPHERS = [
 ].join(',')
 const CHROME116_TLS_FLAGS = [
     '--ciphers', CHROME116_CIPHERS,
-    '--http2', '--http2-no-server-push', '--compressed',
+    '--compressed',
     '--tlsv1.2', '--alps', '--tls-permute-extensions',
     '--cert-compression', 'brotli'
 ]
+
+// HTTP version flags, chosen per URL scheme. Over https, --http2 rides ALPN
+// exactly like the live-proven capture. Over plain http, --http2 makes curl
+// open with an h2c upgrade (Connection: Upgrade + HTTP2-Settings) that Bun's
+// http server — the basis of the CI smoke stub — never answers, so the request
+// hangs until --max-time (Qwen2API-73u). The real upstream is always https;
+// plain http only ever faces local stubs, and with no TLS layer there is no
+// fingerprint to preserve, so it gets pinned to HTTP/1.1.
+const HTTPS_VERSION_FLAGS = ['--http2', '--http2-no-server-push']
+const HTTP_VERSION_FLAGS = ['--http1.1']
 
 // Hop-by-hop / HTTP/1-only headers that must not ride an HTTP/2 request: the
 // FE header profile sets `connection: keep-alive` for the axios path, but a
@@ -119,7 +129,11 @@ const curlProxyUrl = (proxyUrl) => {
  * @returns {string[]}
  */
 const buildImpersonateArgv = ({ url, headers = {}, maxTimeSeconds = 600, proxyUrl = null }) => {
-    const argv = [...CHROME116_TLS_FLAGS, '-sS', '-i', '-N', '--max-time', String(maxTimeSeconds)]
+    const argv = [
+        ...CHROME116_TLS_FLAGS,
+        ...(/^https:/i.test(String(url)) ? HTTPS_VERSION_FLAGS : HTTP_VERSION_FLAGS),
+        '-sS', '-i', '-N', '--max-time', String(maxTimeSeconds)
+    ]
     // Empty value removes curl's internal Expect header; without it bodies
     // over ~1 KiB get Expect: 100-continue, which Chrome never sends.
     argv.push('-H', 'Expect:')
