@@ -1,5 +1,7 @@
 const axios = require('axios')
 const lab = require('./v2-lab-sessions')
+const v2sessions = require('./v2-session-store')
+const signinWorker = require('./signin-worker-client')
 const { SigninError } = require('./signin-error')
 const { sha256Encrypt, JwtDecode, jitter } = require('./tools')
 const { logger } = require('./logger')
@@ -32,6 +34,18 @@ class TokenManager {
      * @returns {Promise<string|null>} 令牌或null
      */
     async login(email, password, account, options = {}) {
+        // Browser mode: the WAF captcha makes pure-Node sign-in impossible; the
+        // signin worker signs in inside real Chromium and hands back the jar.
+        if (v2sessions.browser) {
+            try {
+                return await this.loginBrowserSession(email, password, account)
+            } catch (error) {
+                const failure = error instanceof SigninError ? error : SigninError.fromError(error)
+                logger.error(`Qwen signin: ${failure.code} (upstream HTTP ${failure.upstreamStatus ?? 'none'})`, 'AUTH')
+                if (options.throwOnFailure) throw failure
+                return null
+            }
+        }
         try {
             const requestConfig = {
                 headers: buildSigninHeaders(account, { chatBaseUrl: getChatBaseUrl() }),
@@ -70,6 +84,24 @@ class TokenManager {
             if (options.throwOnFailure) throw failure
             return null
         }
+    }
+
+    /**
+     * Browser-режим: вход через signin-worker и сохранение сессии (token + jar).
+     * @returns {Promise<string>} 令牌
+     */
+    async loginBrowserSession(email, password, account) {
+        const harvested = await signinWorker.acquireSession(email, password, account)
+        const decoded = this.validateToken(harvested.token)
+        if (!decoded) throw new SigninError('signin_upstream_error', 502, 'Signin worker returned an invalid token.')
+        v2sessions.setSession(email, {
+            token: harvested.token,
+            expiresAt: decoded.exp,
+            jar: harvested.jar
+        })
+        // 不记录令牌本身：日志可能落盘或被采集，令牌可直接冒充该账户
+        logger.success(`${email} 登录成功`, 'AUTH')
+        return harvested.token
     }
 
     /**
@@ -134,6 +166,7 @@ class TokenManager {
      */
     async refreshToken(account, options) {
         try {
+            if (v2sessions.browser) return await this.refreshBrowserSession(account, options)
             if (lab.authOrigin) return await this.refreshLabSession(account, options)
             const newToken = await this.login(account.email, account.password, account, options)
             if (!newToken) {
@@ -159,6 +192,39 @@ class TokenManager {
         } catch (error) {
             if (error instanceof SigninError) throw error
             logger.error(`刷新令牌失败 (${account.email})`, 'TOKEN', '', error)
+            return null
+        }
+    }
+
+    /**
+     * Browser-режим: обновление = попросить воркер тихо перезагрузить профиль
+     * (v2 refresh endpoint доступен только Electron-FE). Мёртвый профиль
+     * (sessionLost) откатывается на полный вход с паролем.
+     */
+    async refreshBrowserSession(account, options = {}) {
+        try {
+            let harvested
+            try {
+                harvested = await signinWorker.renewSession(account.email, account)
+            } catch (error) {
+                if (!error.sessionLost) throw error
+                harvested = await signinWorker.acquireSession(account.email, account.password, account)
+            }
+            const decoded = this.validateToken(harvested.token)
+            if (!decoded) throw new SigninError('signin_upstream_error', 502, 'Signin worker returned an invalid token.')
+            const next = { token: harvested.token, expiresAt: decoded.exp, jar: harvested.jar }
+            const previous = v2sessions.sessions.get(account.email)
+            const publish = () => {
+                const current = v2sessions.sessions.get(account.email)
+                if (!current || current === previous) v2sessions.setSession(account.email, next)
+            }
+            if (options.afterSave) options.afterSave(publish)
+            else publish()
+            return { ...account, token: next.token, expires: decoded.exp }
+        } catch (error) {
+            const failure = error instanceof SigninError ? error : SigninError.fromError(error)
+            logger.error(`Browser session refresh: ${failure.code}`, 'AUTH')
+            if (options.throwOnFailure) throw failure
             return null
         }
     }

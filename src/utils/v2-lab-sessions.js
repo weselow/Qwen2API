@@ -1,7 +1,8 @@
 const { CookieJar } = require('tough-cookie')
 const { SigninError } = require('./signin-error')
-const { ChatCreationError, detectWafChallenge } = require('./upstream-error')
+const { detectWafChallenge } = require('./upstream-error')
 const config = require('../config')
+const store = require('./v2-session-store')
 
 function labOrigin(value) {
     const url = new URL(value)
@@ -12,10 +13,14 @@ function labOrigin(value) {
     return url.origin
 }
 
+// The lab HTTP flow only exists in lab mode; an explicit V2_SESSION_MODE wins
+// over a stray QWEN_LAB_V2_AUTH_ORIGIN. Session state lives in the shared
+// per-account store (same Map identity re-exported below for compatibility).
 // No cookies are loaded from account storage or exposed on account records.
-const authOrigin = process.env.QWEN_LAB_V2_AUTH_ORIGIN && labOrigin(process.env.QWEN_LAB_V2_AUTH_ORIGIN)
+const authOrigin = config.v2SessionMode === 'lab' && process.env.QWEN_LAB_V2_AUTH_ORIGIN
+    ? labOrigin(process.env.QWEN_LAB_V2_AUTH_ORIGIN)
+    : null
 const chatOrigin = authOrigin && labOrigin(config.qwenChatProxyUrl)
-const sessions = new Map()
 
 function readCookies(jar, response, url) {
     for (const line of [].concat(response.headers['set-cookie'] || [])) {
@@ -49,24 +54,13 @@ function authenticatedJar(response, url, previous, validateToken) {
     return { token: data.token, jar }
 }
 
-function sessionFor(email, token) {
-    const session = sessions.get(email)
-    return session && session.token === token ? session : null
+module.exports = {
+    authOrigin,
+    // Shared per-account v2 session store (browser mode fills it via the
+    // signin worker; lab via authenticatedJar above).
+    sessions: store.sessions,
+    sessionFor: store.sessionFor,
+    prepareChat: store.prepareChat,
+    openAuthForm,
+    authenticatedJar
 }
-
-function prepareChat(requestConfig, url, account, token) {
-    if (!authOrigin) return
-    if (new URL(url).origin !== chatOrigin) throw new Error('Unexpected v2 lab chat origin')
-    Object.assign(requestConfig, { proxy: false, maxRedirects: 0 })
-    const session = sessionFor(account?.email, token)
-    if (!session) throw new ChatCreationError('lab_session_required', 409)
-    const cookies = session.jar.getCookiesSync(url)
-    if (!cookies.length) return
-    // Preserve existing app cookies except where the server supplied the same name for this URL.
-    const scopedNames = new Set(cookies.map(cookie => cookie.key))
-    const legacy = (requestConfig.headers.cookie || '').split(/;\s*/).filter(pair =>
-        pair && !scopedNames.has(pair.split('=', 1)[0]))
-    requestConfig.headers.cookie = [...cookies.map(cookie => cookie.cookieString()), ...legacy].join('; ')
-}
-
-module.exports = { authOrigin, sessions, sessionFor, openAuthForm, authenticatedJar, prepareChat }
