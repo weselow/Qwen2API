@@ -2,6 +2,7 @@ const config = require('../config/index.js')
 const DataPersistence = require('./data-persistence')
 const TokenManager = require('./token-manager')
 const lab = require('./v2-lab-sessions')
+const v2sessions = require('./v2-session-store')
 const AccountRotator = require('./account-rotator')
 const { logger } = require('./logger')
 const { generateDeterministicFingerprint } = require('./fingerprint')
@@ -645,7 +646,9 @@ class Account {
         const account = this.accountTokens.find(acc => acc.email === email)
         if (!account) return false
         let publishSession
-        const refreshOptions = lab.authOrigin ? { ...options, afterSave: fn => { publishSession = fn } } : options
+        // Publish the rotated v2 session (lab and browser modes) only after storage
+        // accepted the new token, keeping requests off a token that is not durable.
+        const refreshOptions = v2sessions.active ? { ...options, afterSave: fn => { publishSession = fn } } : options
         const updatedAccount = await this.tokenManager.refreshToken(account, refreshOptions)
         if (!updatedAccount) return false
         const saved = await this.dataPersistence.saveAccount(email, {

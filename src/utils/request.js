@@ -936,8 +936,11 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
         }
 
         const url = `${chatBaseUrl}/api/v2/chats/new`
-        if (lab.authOrigin) lab.prepareChat(requestConfig, url, account, currentToken)
-        else applyProxyToAxiosConfig(requestConfig, account);
+        // Same shape as the completions site: the v2 session store merges its
+        // jar when a v2 mode is active (lab pins proxy:false; browser keeps the
+        // account proxy applied below).
+        lab.prepareChat(requestConfig, url, account, currentToken)
+        if (!lab.authOrigin) applyProxyToAxiosConfig(requestConfig, account);
 
         // 对齐 chat.qwen.ai FE 0.3.49：chatId/project_id + normal 模式
         const response_data = await axios.post(url, {

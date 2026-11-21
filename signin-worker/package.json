@@ -1,0 +1,16 @@
+{
+  "name": "qwen2api-signin-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sidecar: browser-acquired chat.qwen.ai sessions (Playwright + Chromium) for Qwen2API v2 pipeline",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "playwright": "1.65.1"
+  }
+}

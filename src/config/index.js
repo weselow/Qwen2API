@@ -48,6 +48,23 @@ const parseCompletionsTransport = (value = process.env.COMPLETIONS_TRANSPORT) =>
     return raw
 }
 
+// V2 session pipeline mode (epic Qwen2API-jik):
+//   off     = v1 path, today's behavior (default);
+//   lab     = .test HTTPS stand via QWEN_LAB_V2_AUTH_ORIGIN (back-compat: that
+//             env alone still selects lab);
+//   browser = sessions acquired/renewed by the Playwright signin-worker sidecar.
+const v2SessionMode = (() => {
+    const raw = (process.env.V2_SESSION_MODE || '').trim().toLowerCase()
+    if (!raw) return process.env.QWEN_LAB_V2_AUTH_ORIGIN ? 'lab' : 'off'
+    if (!['off', 'lab', 'browser'].includes(raw)) {
+        throw new Error(`V2_SESSION_MODE must be off, lab or browser (got "${raw}")`)
+    }
+    if (raw === 'lab' && !process.env.QWEN_LAB_V2_AUTH_ORIGIN) {
+        throw new Error('V2_SESSION_MODE=lab requires QWEN_LAB_V2_AUTH_ORIGIN')
+    }
+    return raw
+})()
+
 const config = {
     dataSaveMode: process.env.DATA_SAVE_MODE || "none",
     apiKeys: apiKeys,
@@ -66,7 +83,13 @@ const config = {
     legacyReasoningInContent: process.env.LEGACY_REASONING_IN_CONTENT === 'true' ? true : false,
     redisURL: process.env.REDIS_URL || null,
     autoRefresh: true,
-    autoRefreshInterval: 6 * 60 * 60,
+    // v2 browser tokens live ~30 min; the 6h v1 cadence would let them die
+    // between sweeps, so browser mode tightens the default unless overridden.
+    autoRefreshInterval: (() => {
+        const raw = parseInt(process.env.AUTO_REFRESH_INTERVAL_SECONDS, 10)
+        if (Number.isFinite(raw) && raw > 0) return raw
+        return v2SessionMode === 'browser' ? 15 * 60 : 6 * 60 * 60
+    })(),
     cacheMode: process.env.CACHE_MODE || "default",
     logLevel: process.env.LOG_LEVEL || "INFO",
     enableFileLog: process.env.ENABLE_FILE_LOG === 'true',
@@ -78,6 +101,10 @@ const config = {
     qwenCliProxyUrl: process.env.QWEN_CLI_PROXY_URL || "https://portal.qwen.ai",
     // 代理配置
     proxyUrl: process.env.PROXY_URL || null,
+    // V2 session pipeline (epic Qwen2API-jik): see v2SessionMode resolution above.
+    v2SessionMode,
+    signinWorkerUrl: process.env.SIGNIN_WORKER_URL || 'http://signin-worker:3100',
+    signinWorkerToken: process.env.SIGNIN_WORKER_TOKEN || null,
     // CLI 账户初始化开关（OAuth 设备授权流程需要人工确认，默认关闭避免初始化失败刷屏）
     cliEnabled: process.env.ENABLE_CLI === 'true',
     // chat 请求重试配置（运行时可被 web UI 覆盖，见 src/utils/data-persistence.js#loadSettings）
