@@ -113,6 +113,8 @@ async function start(t, options) {
   const server = createServer({
     dataDir, token: 'secret', timeoutMs: 120000, maxPages: 16,
     minRenewDelayMs: 60000, keepAliveMs: 60000, drainMs: 1000, backstopMs: 5000,
+    // Login pacing is signin-worker-pacing.test.js's subject.
+    minLoginIntervalMs: 1,
     ...options
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -598,8 +600,10 @@ test('sign-in and renewal reuse the resident page instead of launching on the lo
   assert.equal(opens(), 1)
   assert.equal(closes(), 0)
 
-  // A full sign-in lands on the same page: one load of qwen.ai, not a relaunch.
-  const signedIn = await post('/session', { email, password: 'pw' })
+  // A full sign-in lands on the same page: one load of qwen.ai, not a
+  // relaunch. (Without force the live session from the lazy open would
+  // answer from the cache, and no sign-in would run at all.)
+  const signedIn = await post('/session', { email, password: 'pw', force: true })
   assert.equal(signedIn.status, 200)
   assert.equal(signer.calls.find(call => call.op === 'signin').page, context.page)
   assert.equal(opens(), 1)

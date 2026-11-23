@@ -10,6 +10,7 @@ const { deleteAccount, saveAccounts } = require('../utils/setting')
 const { parseAccountLine } = require('../utils/account-parser')
 const { isValidProxyUrl } = require('../utils/proxy-helper')
 const { DEFAULT_CLI_QUOTA_LIMIT, getAccountCliState } = require('../utils/cli-support')
+const v2sessions = require('../utils/v2-session-store')
 
 // 仅在 proxy 字段存在时触发；空字符串/null 一律视为"清除代理"，无需校验
 const PROXY_FORMAT_ERROR = '代理 URL 格式无效，应以 http://、https://、socks5:// 或 socks5h:// 开头'
@@ -17,6 +18,16 @@ const PROXY_FORMAT_ERROR = '代理 URL 格式无效，应以 http://、https://�
 const batchAccountTasks = new Map()
 const BATCH_TASK_RETENTION_MS = 1000 * 60 * 30
 const BATCH_TASK_RESULT_LIMIT = 12
+
+/**
+ * 批量添加的并发数
+ * 浏览器模式下完整登录由 signin-worker 排队放行（Qwen2API-43a）：并发条目只会在那边
+ * 干等或被拒（signin_paced），所以一次只登录一个账号，节奏交给 worker。
+ * @returns {number}
+ */
+const batchLoginConcurrency = () => (v2sessions.browser
+  ? 1
+  : Math.max(1, parseInt(config.batchLoginConcurrency) || 5))
 
 /**
  * 生成批量任务 ID
@@ -82,7 +93,7 @@ const parseBatchAccountsText = (accountsText) => {
  * @returns {object} 任务对象
  */
 const createBatchAccountTask = (total, valid, skipped, invalid) => {
-  const concurrency = Math.max(1, parseInt(config.batchLoginConcurrency) || 5)
+  const concurrency = batchLoginConcurrency()
   const task = {
     id: generateBatchTaskId(),
     status: 'pending',

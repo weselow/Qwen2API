@@ -34,6 +34,8 @@ services:
       - COMPLETIONS_TRANSPORT=${COMPLETIONS_TRANSPORT:-auto}
       - SIGNIN_WORKER_URL=http://signin-worker:3100
       - SIGNIN_WORKER_TOKEN=${SIGNIN_WORKER_TOKEN:-}
+      # Must stay above the worker's SIGNIN_LOGIN_MAX_WAIT_MS + SIGNIN_TIMEOUT_MS.
+      - SIGNIN_WORKER_TIMEOUT_MS=${SIGNIN_WORKER_TIMEOUT_MS:-240000}
     dns:
       - ${DNS_SIDECAR_IP:?Set an unused IP inside DNS_SUBNET}
     depends_on:
@@ -58,6 +60,10 @@ services:
       - MAX_RESIDENT_PAGES=${MAX_RESIDENT_PAGES:-16}
       - RESIDENT_KEEPALIVE_MS=${RESIDENT_KEEPALIVE_MS:-300000}
       - SIGNIN_EGRESS_MAX_TIMEOUT_MS=${SIGNIN_EGRESS_MAX_TIMEOUT_MS:-600000}
+      # Full logins go one at a time, this far apart (+ up to the same again
+      # as jitter): batched sign-ins from one IP feed the Baxia score.
+      - SIGNIN_LOGIN_MIN_INTERVAL_MS=${SIGNIN_LOGIN_MIN_INTERVAL_MS:-30000}
+      - SIGNIN_LOGIN_MAX_WAIT_MS=${SIGNIN_LOGIN_MAX_WAIT_MS:-120000}
     # One Chromium profile per account; keep them on a volume so auth.qwen.ai
     # sessions survive restarts and renewal stays a silent reload.
     volumes:

@@ -4,7 +4,7 @@
  * Signin worker sidecar (jik.3): acquires and silently renews chat.qwen.ai
  * sessions in a real Chromium via Playwright.
  *
- *   POST /session {email, password, proxy?} -> {token, expiresAt, cookies[]}
+ *   POST /session {email, password, proxy?, force?} -> {token, expiresAt, cookies[]}
  *   POST /renew   {email, proxy?}            -> {token, expiresAt, cookies[]}
  *   GET  /health                             -> {ok, sessions, residentPages}
  *
@@ -13,6 +13,13 @@
  * Tokens live in memory only; passwords are never stored or logged. The
  * worker must stay on an internal network (optionally guarded by
  * SIGNIN_WORKER_TOKEN as a shared bearer secret).
+ *
+ * Full logins are the risky part: batched ones from one IP feed the Baxia
+ * score (Qwen2API-43a). So /session hands a live harvested session back
+ * instead of logging in again, joins concurrent sign-ins of one account into
+ * one, and every sign-in that does run takes a slot from the login pacer
+ * (lib/login-pacer.js). `force` asks for a real sign-in all the same, for a
+ * cached session that was just refused upstream.
  *
  * Since Qwen2API-3ue.1 it is also the egress service: a resident page per
  * active account carries qwen.ai API calls as in-page fetches, so upstream
@@ -30,11 +37,13 @@ const crypto = require('node:crypto')
 const { WorkerError, STATUS_FOR_CODE } = require('./lib/worker-errors')
 const { normalizeEgress } = require('./lib/egress-fetch')
 const { createResidents } = require('./lib/resident-pages')
+const { createLoginPacer } = require('./lib/login-pacer')
 
 const envInt = (name, fallback) => {
     const raw = parseInt(process.env[name], 10)
     return Number.isFinite(raw) && raw > 0 ? raw : fallback
 }
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 const REQUEST_BODY_LIMIT = 131072
 // Egress relays request bodies built by the app (agent contexts, images).
@@ -51,6 +60,11 @@ function createServer(overrides = {}) {
         renewFraction: overrides.renewFraction ?? 0.6,
         minRenewDelayMs: overrides.minRenewDelayMs ?? envInt('SIGNIN_MIN_RENEW_DELAY_MS', 30000),
         minCacheSeconds: overrides.minCacheSeconds ?? 120,
+        // Full logins start at least this far apart, plus up to the same
+        // again as jitter; 1 turns pacing off. A /session that would wait
+        // longer than maxLoginWaitMs for its slot is refused (signin_paced).
+        minLoginIntervalMs: overrides.minLoginIntervalMs ?? envInt('SIGNIN_LOGIN_MIN_INTERVAL_MS', 30000),
+        maxLoginWaitMs: overrides.maxLoginWaitMs ?? envInt('SIGNIN_LOGIN_MAX_WAIT_MS', 120000),
         // Shared bearer secret; empty = no auth (internal network only).
         token: overrides.token !== undefined ? overrides.token : (process.env.SIGNIN_WORKER_TOKEN || ''),
         // Resident pages (Qwen2API-3ue.1). ~200-300 MB of Chromium each.
@@ -72,6 +86,13 @@ function createServer(overrides = {}) {
     const sessions = new Map()
     // Chromium locks a profile directory: serialize every launch per account.
     const locks = new Map()
+    // email -> the full sign-in now running for it. A /session that lands on
+    // an account whose sign-in is already in flight takes that result.
+    const logins = new Map()
+    const pacer = createLoginPacer({
+        minIntervalMs: config.minLoginIntervalMs,
+        maxWaitMs: config.maxLoginWaitMs
+    })
 
     const log = (event, extra) => console.log(`${new Date().toISOString()} ${event}${extra ? ' ' + extra : ''}`)
     const profileDir = email => path.join(config.dataDir,
@@ -207,18 +228,61 @@ function createServer(overrides = {}) {
         return proxy || null
     }
 
+    // The session is live for as long as /renew would answer from the cache.
+    const fresh = email => {
+        const entry = sessions.get(email)
+        return entry && entry.exp - now() > config.minCacheSeconds ? entry : undefined
+    }
+
+    /** One real sign-in: in line for a slot first, the browser flow under the account lock. */
+    async function fullLogin(email, password, proxy, force) {
+        const slot = pacer.admit()
+        if (slot.waitMs > 0) {
+            log('session', `queued (${Math.ceil(slot.waitMs)}ms)`)
+            await sleep(slot.waitMs)
+        }
+        const harvested = await withBrowserContext(email, proxy, async context => {
+            // The wait above is long enough for a lazy page open or a silent
+            // renewal to have produced the session asked for here.
+            if (!force && fresh(email)) return null
+            await pacer.enter(slot)
+            return signer.signin(context, { email, password, chatOrigin: config.chatOrigin, timeoutMs: config.timeoutMs })
+        })
+        if (!harvested) {
+            log('session', 'cached')
+            return shape(sessions.get(email))
+        }
+        const entry = remember(email, harvested, proxy)
+        log('session', `acquired (${sessions.size} sessions)`)
+        return shape(entry)
+    }
+
     async function handleSession(body) {
         const email = parseEmail(body)
         const { password } = body
         if (typeof password !== 'string' || !password || password.length > 1024) {
             throw new WorkerError('invalid_request', 'A password is required.')
         }
+        if (body.force !== undefined && typeof body.force !== 'boolean') {
+            throw new WorkerError('invalid_request', 'force must be a boolean.')
+        }
         const proxy = parseProxy(body)
-        const harvested = await withBrowserContext(email, proxy,
-            context => signer.signin(context, { email, password, chatOrigin: config.chatOrigin, timeoutMs: config.timeoutMs }))
-        remember(email, harvested, proxy)
-        log('session', `acquired (${sessions.size} sessions)`)
-        return shape(sessions.get(email))
+        // A live session answers for the password. One "add account" is one
+        // login, however many /session calls the app makes of it.
+        const live = body.force ? undefined : fresh(email)
+        if (live) {
+            log('session', 'cached')
+            return shape(live)
+        }
+        const running = logins.get(email)
+        if (running) {
+            log('session', 'joined')
+            return running
+        }
+        const login = fullLogin(email, password, proxy, body.force)
+        const tracked = login.finally(() => { if (logins.get(email) === tracked) logins.delete(email) })
+        logins.set(email, tracked)
+        return tracked
     }
 
     async function handleRenew(body) {
@@ -289,7 +353,10 @@ function createServer(overrides = {}) {
             .catch(error => {
                 const code = error.code && STATUS_FOR_CODE[error.code] ? error.code : 'browser_error'
                 const status = STATUS_FOR_CODE[code] || 500
-                send(res, status, { code, message: error.message || 'Signin worker failure.' })
+                send(res, status, {
+                    code, message: error.message || 'Signin worker failure.',
+                    ...(Number.isFinite(error.retryAfterMs) ? { retryAfterMs: Math.ceil(error.retryAfterMs) } : {})
+                })
             })
             .finally(() => {
                 if (req.url !== '/health') {

@@ -1,6 +1,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const http = require('node:http')
+const axios = require('axios')
 
 // A loopback fake signin-worker exercises the client's HTTP contract: request
 // shape, auth header, response parsing and error-code mapping. The client
@@ -8,7 +9,8 @@ const http = require('node:http')
 // controlled SIGNIN_WORKER_URL.
 function freshClient(env) {
   const saved = {}
-  const keys = ['SIGNIN_WORKER_URL', 'SIGNIN_WORKER_TOKEN', 'V2_SESSION_MODE', 'QWEN_CHAT_PROXY_URL', 'PROXY_URL', 'API_KEY']
+  const keys = ['SIGNIN_WORKER_URL', 'SIGNIN_WORKER_TOKEN', 'SIGNIN_WORKER_TIMEOUT_MS', 'V2_SESSION_MODE',
+    'QWEN_CHAT_PROXY_URL', 'PROXY_URL', 'API_KEY']
   for (const key of keys) {
     saved[key] = process.env[key]
     if (env[key] === undefined) delete process.env[key]
@@ -52,6 +54,9 @@ test('signin worker client maps worker responses onto sessions and sign-in error
       }
       if (req.url === '/session' && behavior === 'bad_credentials') {
         return reply(res, 401, { code: 'invalid_credentials', message: 'Qwen rejected the credentials.' })
+      }
+      if (req.url === '/session' && behavior === 'paced') {
+        return reply(res, 429, { code: 'signin_paced', message: 'Too many sign-ins are waiting; retry later.', retryAfterMs: 45000 })
       }
       if (req.url === '/renew' && behavior === 'no_profile') {
         return reply(res, 404, { code: 'no_profile', message: 'No persisted profile for this account.' })
@@ -109,6 +114,24 @@ test('signin worker client maps worker responses onto sessions and sign-in error
     behavior = 'malformed'
     await assert.rejects(client.acquireSession('a@example.invalid', 'pw123', null),
       { code: 'signin_upstream_error' })
+
+    // force is what asks the worker for a real sign-in; nothing else changes the body.
+    behavior = 'ok'
+    await client.acquireSession('a@example.invalid', 'pw123', null, { force: true })
+    assert.deepEqual(requests.at(-1).body, { email: 'a@example.invalid', password: 'pw123', proxy: null, force: true })
+
+    // The worker paces full logins (Qwen2API-43a). A refused slot is a
+    // retryable "busy": not a dead worker and not a lost profile, so no
+    // caller falls back to another full sign-in over it.
+    behavior = 'paced'
+    await assert.rejects(client.acquireSession('a@example.invalid', 'pw123', null), error => {
+      assert.equal(error.code, 'signin_busy')
+      assert.equal(error.status, 429)
+      assert.equal(error.upstreamStatus, 429)
+      assert.equal(error.sessionLost, false)
+      assert.equal(error.retryAfterMs, 45000)
+      return true
+    })
   } finally {
     restore()
   }
@@ -126,5 +149,28 @@ test('signin worker client maps worker responses onto sessions and sign-in error
       { code: 'signin_transport_error' })
   } finally {
     second()
+  }
+})
+
+test('a worker call waits in the worker’s login line: the budget is SIGNIN_WORKER_TIMEOUT_MS', async t => {
+  // 240 s covers the worker's longest sign-in wait (120 s) plus the browser
+  // flow (120 s); below that the app gives up on a sign-in the worker still runs.
+  const defaults = freshClient({ API_KEY: 'offline' })
+  try {
+    assert.equal(require('../src/config').signinWorkerTimeoutMs, 240000)
+  } finally {
+    defaults()
+  }
+
+  const restore = freshClient({ API_KEY: 'offline', SIGNIN_WORKER_TIMEOUT_MS: '9000' })
+  try {
+    const post = t.mock.method(axios, 'post',
+      async () => ({ status: 200, data: { token: 'worker-token', expiresAt: 1893456000, cookies } }))
+    const client = require('../src/utils/signin-worker-client')
+    await client.acquireSession('a@example.invalid', 'pw123', null)
+    await client.renewSession('a@example.invalid', null)
+    assert.deepEqual(post.mock.calls.map(call => call.arguments[2].timeout), [9000, 9000])
+  } finally {
+    restore()
   }
 })

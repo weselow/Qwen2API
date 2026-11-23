@@ -160,18 +160,24 @@ test('signin worker serializes browser launches per account profile', async t =>
     },
     async renew() { return { token: 'serial', exp: Math.floor(Date.now() / 1000) + 3600, cookies: [] } }
   }
-  const server = createServer({ signer, dataDir, minRenewDelayMs: 60000 })
+  // Two /session for one account would just join into one sign-in (that is
+  // signin-worker-pacing.test.js's subject), so the lock is raced with the
+  // other flow that launches on the profile: a live renewal. Login pacing is
+  // off, leaving the bare rule.
+  const email = 'same@example.invalid'
+  const profileHash = crypto.createHash('sha256').update(email).digest('hex').slice(0, 32)
+  const expectedDir = path.join(dataDir, 'account-' + profileHash)
+  fs.mkdirSync(expectedDir, { recursive: true })
+  const server = createServer({ signer, dataDir, minRenewDelayMs: 60000, minLoginIntervalMs: 1 })
   const api = await listen(server)
   t.after(() => new Promise(resolve => server.close(resolve)))
 
-  const [, second] = await Promise.all([
-    api.post('/session', { email: 'same@example.invalid', password: 'pw' }),
-    api.post('/session', { email: 'same@example.invalid', password: 'pw' })
+  const [signedIn, renewed] = await Promise.all([
+    api.post('/session', { email, password: 'pw', force: true }),
+    api.post('/renew', { email })
   ])
-  assert.equal(second.status, 200)
+  assert.deepEqual([signedIn.status, renewed.status], [200, 200])
   // Chromium locks a profile directory: the two launches must not overlap.
   assert.equal(maxConcurrent, 1)
-  const profileHash = crypto.createHash('sha256').update('same@example.invalid').digest('hex').slice(0, 32)
-  const expectedDir = path.join(dataDir, 'account-' + profileHash)
   assert.deepEqual(launches, [expectedDir, expectedDir])
 })
