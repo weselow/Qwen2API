@@ -4,6 +4,7 @@ const { setResponseHeaders } = require('./chat.js')
 const accountManager = require('../utils/account.js')
 const { sleep } = require('../utils/tools.js')
 const { generateChatID } = require('../utils/request.js')
+const sessionPersistence = require('../utils/v2-session-persistence.js')
 const { uploadFileToQwenOss } = require('../utils/upload.js')
 const { parserModel } = require('../utils/chat-helpers.js')
 const { getDefaultModelByChatType } = require('../models/models-map.js')
@@ -1286,7 +1287,8 @@ const generateImageVideoResult = async (payload) => {
     const { model, messages, size, chat_type } = payload
     // 一次取出账户对象，确保 token 与 proxy 走同一个账号
     const account = accountManager.getAccount()
-    const token = account ? account.token : null
+    // May move below: the chat can be created on a recovered session.
+    let token = account ? account.token : null
     let breakerContext = null
 
     try {
@@ -1328,6 +1330,10 @@ const generateImageVideoResult = async (payload) => {
         if (!chatID) {
             throw new Error('生成 chat_id 失败')
         }
+
+        // Creating the chat may have recovered the session and rotated its
+        // token (Qwen2API-3ue.2): the generation rides the token the store holds.
+        token = sessionPersistence.sessionToken(account, token)
 
         reqBody.chat_id = chatID
 

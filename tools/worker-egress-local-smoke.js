@@ -105,8 +105,8 @@ async function main() {
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
     const { port } = server.address()
     const worker = `http://127.0.0.1:${port}`
-    const call = async (route, payload) => {
-        const response = await fetch(worker + route, {
+    const call = async (route, payload, base = worker) => {
+        const response = await fetch(base + route, {
             method: 'POST',
             headers: { 'content-type': 'application/json', authorization: 'Bearer secret' },
             body: JSON.stringify(payload)
@@ -116,8 +116,9 @@ async function main() {
     const health = async () => (await fetch(`${worker}/health`)).json()
 
     const email = 'smoke@example.invalid'
-    const profile = path.join(dataDir,
+    const profileDirOf = dir => path.join(dir,
         'account-' + crypto.createHash('sha256').update(email).digest('hex').slice(0, 32))
+    const profile = profileDirOf(dataDir)
     const egress = extra => call('/egress', {
         email, url: '/api/echo', method: 'POST',
         headers: {
@@ -224,6 +225,33 @@ async function main() {
         const stores = ['Default/Network/Cookies', 'Default/Cookies'].map(file => path.join(profile, file))
         assert.ok(stores.some(file => fs.existsSync(file)), 'Chromium must flush its cookie store on close')
         console.log('ok shutdown: the browser closed cleanly and flushed the profile to disk')
+
+        // An explicit invalidation (Qwen2API-3ue.2) on a worker whose cache is
+        // FRESH: a plain /renew answers from the cache, force reloads the page.
+        // The smoke's own worker above keeps its cache permanently stale, so
+        // this runs on a second one with the default freshness window.
+        const freshDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwen-worker-smoke-force-'))
+        const fresh = createServer({ dataDir: freshDir, token: 'secret', chatOrigin: standIn.origin, keepAliveMs: 200 })
+        await new Promise(resolve => fresh.listen(0, '127.0.0.1', resolve))
+        const freshUrl = `http://127.0.0.1:${fresh.address().port}`
+        const onFresh = (route, payload) => call(route, payload, freshUrl)
+        try {
+            fs.mkdirSync(profileDirOf(freshDir))
+            assert.equal((await onFresh('/egress', { email, url: '/api/echo', method: 'GET', timeoutMs: 30000 })).status, 200)
+            const loads = standIn.pageLoads()
+            const plain = await onFresh('/renew', { email })
+            assert.equal(plain.status, 200, JSON.stringify(plain.body))
+            assert.equal(standIn.pageLoads(), loads, 'a fresh cache answers without a reload')
+            const forced = await Promise.all([1, 2, 3].map(() => onFresh('/renew', { email, force: true })))
+            assert.deepEqual(forced.map(answer => answer.status), [200, 200, 200])
+            assert.equal(new Set(forced.map(answer => answer.body.token)).size, 1)
+            assert.equal(standIn.pageLoads(), loads + 1, 'three forced renewals, one reload')
+            console.log('ok forced renewal: /renew {force} reloads despite a fresh cache; a burst shares one reload')
+        } finally {
+            await fresh.workerShutdown()
+            await new Promise(resolve => fresh.close(resolve))
+            fs.rmSync(freshDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 })
+        }
 
         console.log('SMOKE OK — real worker, real Chromium, stand-in origin; qwen.ai was not contacted')
     } finally {

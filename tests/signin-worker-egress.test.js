@@ -624,6 +624,144 @@ test('sign-in and renewal reuse the resident page instead of launching on the lo
   assert.equal((await health()).residentPages, 0)
 })
 
+test('an explicit invalidation (/renew with force) is answered live although the cache is fresh', async t => {
+  const signer = fakeBrowser()
+  const { post, health, dataDir } = await start(t, { signer })
+  const email = 'forced@example.invalid'
+  withProfile(dataDir, email)
+  // The lazy open caches a session, the way a sign-in or any renewal does.
+  await (await egress(post, email)).json()
+  const renews = () => signer.calls.filter(call => call.op === 'renew').length
+  assert.equal(renews(), 1)
+
+  // Fresh cache: a plain /renew answers from it, as before.
+  const cached = await (await post('/renew', { email })).json()
+  assert.equal(cached.token, 'token-renew-1')
+  assert.equal(renews(), 1)
+
+  // The same request with force is a live reload. Answering it from the cache
+  // is the no-op that replayed one refused jar for hours on prod (23.11).
+  const forced = await post('/renew', { email, force: true })
+  assert.equal(forced.status, 200)
+  assert.equal((await forced.json()).token, 'token-renew-2')
+  assert.equal(renews(), 2)
+  // On the resident page: no second launch on the locked profile.
+  assert.equal(signer.calls.filter(call => call.op === 'open').length, 1)
+  assert.deepEqual(await health(), { ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16 })
+
+  // Another explicit invalidation is another reload; an explicit false is a plain renew.
+  assert.equal((await (await post('/renew', { email, force: true })).json()).token, 'token-renew-3')
+  assert.equal((await (await post('/renew', { email, force: false })).json()).token, 'token-renew-3')
+  assert.equal(renews(), 3)
+
+  // Anything but a boolean is refused before the cache or a browser is touched.
+  for (const force of ['yes', 1, {}, []]) {
+    const refused = await post('/renew', { email, force })
+    assert.equal(refused.status, 400, `${JSON.stringify(force)} must be refused`)
+    assert.equal((await refused.json()).code, 'invalid_request')
+  }
+  assert.equal(renews(), 3)
+  assert.equal((await (await post('/renew', { email })).json()).token, 'token-renew-3')
+})
+
+test('a forced reload that fails leaves nothing behind to hand the refused session out again', async t => {
+  const signer = fakeBrowser()
+  const { post, health, dataDir } = await start(t, { signer })
+  const email = 'refused@example.invalid'
+  withProfile(dataDir, email)
+  await (await egress(post, email)).json()
+  signer.script.renew = () => {
+    const error = new Error('The persisted profile no longer authenticates.')
+    error.code = 'session_expired'
+    throw error
+  }
+
+  const dead = await post('/renew', { email, force: true })
+  assert.equal(dead.status, 422)
+  assert.equal((await dead.json()).code, 'session_expired')
+  // The refused entry is gone: a plain /renew no longer answers with the old
+  // token — it has to go live, and fails the same way.
+  const again = await post('/renew', { email })
+  assert.equal(again.status, 422)
+  assert.equal((await again.json()).code, 'session_expired')
+  assert.equal((await health()).sessions, 0)
+})
+
+// Resolves once every request of this route has been read by the worker:
+// whatever its handler is going to do, it is doing it by then.
+const received = (server, route) => {
+  let seen = 0
+  server.on('request', req => { if (req.url === route) req.on('end', () => { seen++ }) })
+  return () => seen
+}
+
+test('forced renewals that overlap share one reload', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir, server } = await start(t, { signer })
+  const email = 'storm@example.invalid'
+  withProfile(dataDir, email)
+  await (await egress(post, email)).json()
+
+  // Hold every reload the way a real page load would.
+  const releases = []
+  signer.script.renew = () => new Promise(resolve => {
+    releases.push(() => resolve({ token: 'token-live', exp: Math.floor(Date.now() / 1000) + 3600, cookies: [] }))
+  })
+  const renewsReceived = received(server, '/renew')
+  const asked = [
+    post('/renew', { email, force: true }), post('/renew', { email, force: true }),
+    post('/renew', { email }), post('/renew', { email, force: true })
+  ]
+  await until(() => renewsReceived() === 4)
+  await until(() => releases.length === 1)
+  // Keep letting reloads land until all four are answered: a regression that
+  // starts a reload per request then fails on the count, not on a hang.
+  const answers = await (async () => {
+    for (;;) {
+      for (const release of releases.splice(0)) release()
+      const settled = await Promise.race([Promise.all(asked), new Promise(resolve => setTimeout(() => resolve(null), 20))])
+      if (settled) return settled
+    }
+  })()
+  assert.deepEqual(answers.map(response => response.status), [200, 200, 200, 200])
+  assert.deepEqual((await Promise.all(answers.map(response => response.json()))).map(body => body.token),
+    ['token-live', 'token-live', 'token-live', 'token-live'])
+  // The lazy open, then ONE reload for all four: a burst of failures on one
+  // account is not a burst of page loads.
+  assert.equal(signer.calls.filter(call => call.op === 'renew').length, 2)
+  assert.equal(signer.calls.filter(call => call.op === 'open').length, 1)
+})
+
+test('a forced /renew joins the silent renewal the timer already started for the account', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { post, health, dataDir, server } = await start(t, { signer, minRenewDelayMs: 20, renewFraction: 0.5 })
+  const email = 'warm@example.invalid'
+  withProfile(dataDir, email)
+  // The lazy open harvests a token that is about to expire: the silent timer
+  // fires right behind it.
+  let reloads = 0
+  let release
+  signer.script.renew = () => {
+    reloads++
+    if (reloads === 1) return { token: 'token-short', exp: Math.floor(Date.now() / 1000) + 1, cookies: [] }
+    return new Promise(resolve => {
+      release = () => resolve({ token: 'token-silent', exp: Math.floor(Date.now() / 1000) + 3600, cookies: [] })
+    })
+  }
+  await (await egress(post, email)).json()
+  await until(() => reloads === 2) // the timer's reload is running, held
+
+  const renewsReceived = received(server, '/renew')
+  const forced = post('/renew', { email, force: true })
+  await until(() => renewsReceived() === 1)
+  release()
+  const answer = await forced
+  assert.equal(answer.status, 200)
+  assert.equal((await answer.json()).token, 'token-silent')
+  assert.equal(reloads, 2, 'the forced /renew joined the silent reload: no second page load')
+  assert.equal((await health()).residentPages, 1)
+})
+
 test('a dead session found on the lazy open surfaces as session_expired and leaves no page behind', async t => {
   const signer = fakeBrowser()
   const { post, health, dataDir } = await start(t, { signer })

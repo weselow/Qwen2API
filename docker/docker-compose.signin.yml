@@ -27,6 +27,13 @@ services:
       - CACHE_MODE=${CACHE_MODE:-file}
       # v2 session pipeline: browser sessions come from the sidecar.
       - V2_SESSION_MODE=${V2_SESSION_MODE:-browser}
+      # chats/new through the worker's resident page (docs/browser-egress-
+      # design.md). Ships OFF: browser egress is switched on explicitly
+      # (CHAT_CREATION_TRANSPORT=browser) and rolled back the same way.
+      # Session recovery throttles; 0 disables either.
+      - CHAT_CREATION_TRANSPORT=${CHAT_CREATION_TRANSPORT:-direct}
+      - V2_SESSION_RECOVERY_MIN_INTERVAL_MS=${V2_SESSION_RECOVERY_MIN_INTERVAL_MS:-30000}
+      - V2_SESSION_RELOGIN_MIN_INTERVAL_MS=${V2_SESSION_RELOGIN_MIN_INTERVAL_MS:-60000}
       - SIGNIN_WORKER_URL=http://signin-worker:3100
       - SIGNIN_WORKER_TOKEN=${SIGNIN_WORKER_TOKEN:-}
       # Must stay above the worker's SIGNIN_LOGIN_MAX_WAIT_MS + SIGNIN_TIMEOUT_MS.
