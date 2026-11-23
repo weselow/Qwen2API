@@ -17,6 +17,8 @@ const STATUS_FOR_CODE = {
     form_not_found: 502,
     signin_timeout: 504,
     browser_error: 500,
+    // Full logins are paced (Qwen2API-43a): retry after retryAfterMs
+    signin_paced: 429,
     // Egress (Qwen2API-3ue.1)
     page_closed: 502,
     egress_failed: 502,
