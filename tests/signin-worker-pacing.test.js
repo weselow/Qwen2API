@@ -1,5 +1,6 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -45,7 +46,8 @@ function fakeSigner(script = {}) {
     },
     async renew() {
       calls.push({ op: 'renew', at: Date.now() })
-      return { token: 'token-renewed', exp: Math.floor(Date.now() / 1000) + 3600, cookies: [] }
+      return script.renew ? script.renew()
+        : { token: 'token-renewed', exp: Math.floor(Date.now() / 1000) + 3600, cookies: [] }
     }
   }
 }
@@ -91,20 +93,25 @@ test('login pacer hands out slots one interval apart, plus jitter', () => {
 })
 
 test('a slot that would be waited for longer than the budget is refused at once and stays free', () => {
+  // Slots are compared by their moments, never by waitMs: a millisecond that
+  // ticks between two calls shaves it off the wait and nothing else.
   const pacer = createLoginPacer({ minIntervalMs: 1000, maxWaitMs: 1500, random: () => 0 })
-  pacer.admit()
-  assert.equal(pacer.admit().waitMs, 1000)
+  const first = pacer.admit()
+  assert.equal(pacer.admit().at - first.at, 1000)
   // Third in line: 2000 ms. Refused, and told when a slot would be theirs.
-  assert.equal(refusals(pacer).code, 'signin_paced')
-  assert.equal(refusals(pacer).retryAfterMs, 2000)
+  const refused = refusals(pacer)
+  assert.equal(refused.code, 'signin_paced')
+  assert.ok(refused.retryAfterMs > 1900 && refused.retryAfterMs <= 2000)
   // The refusal reserved nothing: the next request finds the same slot, not
   // one pushed out by a sign-in that will never run.
-  assert.equal(refusals(pacer).retryAfterMs, 2000)
+  assert.ok(Math.abs(refusals(pacer).retryAfterMs - refused.retryAfterMs) <= 10)
 
   const roomier = createLoginPacer({ minIntervalMs: 1000, maxWaitMs: 2500, random: () => 0 })
-  assert.deepEqual([roomier.admit(), roomier.admit(), roomier.admit()].map(slot => slot.waitMs), [0, 1000, 2000])
+  const base = roomier.admit()
+  assert.deepEqual([roomier.admit(), roomier.admit()].map(slot => slot.at - base.at), [1000, 2000])
   const unbounded = createLoginPacer({ minIntervalMs: 1000, maxWaitMs: 0, random: () => 0 })
-  assert.equal([unbounded.admit(), unbounded.admit(), unbounded.admit()].at(-1).waitMs, 2000)
+  const start = unbounded.admit()
+  assert.equal([unbounded.admit(), unbounded.admit()].at(-1).at - start.at, 2000)
 })
 
 test('pacing off: every sign-in may start at once', async () => {
@@ -119,14 +126,15 @@ test('a sign-in holds when the one before it began later than its own slot', asy
   const pacer = createLoginPacer({ minIntervalMs: 200, random: () => 0 })
   const first = pacer.admit()
   const second = pacer.admit()
-  assert.equal(second.waitMs, 200)
-  // The first launches its browser before its flow reaches the page.
-  await sleep(100)
+  assert.equal(second.at - first.at, 200)
+  // The first launches its browser before its flow reaches the page: by then
+  // its own slot, and the second's, are both in the past.
+  await sleep(300)
   await pacer.enter(first)
   const held = Date.now()
   await pacer.enter(second)
-  // Second's slot was at +200; the first began at +100, so it waits until +300.
-  assert.ok(Date.now() - held >= 100 - SLOP)
+  // The first began at +300, so the second waits until +500.
+  assert.ok(Date.now() - held >= 200 - SLOP)
 })
 
 test('/session answers from the live harvested session instead of signing in again', async t => {
@@ -286,6 +294,55 @@ test('a sign-in that would wait past the budget is refused as signin_paced and s
   const retried = await post('/session', { email: 'third@example.invalid', password: 'pw' })
   assert.equal(retried.status, 200)
   assert.equal(signer.calls.filter(call => call.op === 'signin').length, 2)
+})
+
+test('a session that turned live while the request waited for its slot answers without a sign-in', async t => {
+  const signer = fakeSigner()
+  const { post, dataDir } = await start(t, { signer, minLoginIntervalMs: 300, maxLoginWaitMs: 1000 })
+  await (await post('/session', { email: 'first@example.invalid', password: 'pw' })).json()
+  const email = 'waiting@example.invalid'
+  // A persisted profile is what authorizes /renew without a password.
+  const hash = crypto.createHash('sha256').update(email).digest('hex').slice(0, 32)
+  fs.mkdirSync(path.join(dataDir, 'account-' + hash), { recursive: true })
+
+  // In line behind the first sign-in...
+  const waiting = post('/session', { email, password: 'pw' })
+  // ...and while it waits, a live renewal of the same account settles a session.
+  const renewed = await post('/renew', { email })
+  assert.equal(renewed.status, 200)
+
+  const answered = await waiting
+  assert.equal(answered.status, 200)
+  assert.equal((await answered.json()).token, 'token-renewed')
+  assert.equal(signer.calls.filter(call => call.op === 'signin').length, 1)
+})
+
+test('the interval holds between real starts: a sign-in delayed by its profile still spaces the next one', async t => {
+  const release = []
+  const signer = fakeSigner({
+    renew: () => new Promise(resolve => { release.push(() => resolve({ token: 'renewed', exp: Math.floor(Date.now() / 1000) + 3600, cookies: [] })) })
+  })
+  const { post, dataDir } = await start(t, { signer, minLoginIntervalMs: 300, maxLoginWaitMs: 1000 })
+  const delayed = 'delayed@example.invalid'
+  const hash = crypto.createHash('sha256').update(delayed).digest('hex').slice(0, 32)
+  fs.mkdirSync(path.join(dataDir, 'account-' + hash), { recursive: true })
+
+  // A renewal holds the account's profile...
+  const renewing = post('/renew', { email: delayed })
+  await until(() => release.length === 1)
+  // ...so its sign-in, admitted at once, cannot reach the page for a while.
+  const held = post('/session', { email: delayed, password: 'pw', force: true })
+  await sleep(450)
+  const following = post('/session', { email: 'following@example.invalid', password: 'pw' })
+  for (const finish of release) finish()
+
+  const answers = await Promise.all([held, following, renewing])
+  assert.deepEqual(answers.map(response => response.status), [200, 200, 200])
+  const starts = signer.calls.filter(call => call.op === 'signin').map(call => call.at).sort((a, b) => a - b)
+  assert.equal(starts.length, 2)
+  // Spaced from the delayed sign-in's real start, not from the slot it was
+  // handed half a second earlier.
+  assert.ok(starts[1] - starts[0] >= 300 - SLOP, `${starts[1] - starts[0]}ms between the real starts`)
 })
 
 test('a rejected sign-in takes a slot too: failed attempts are what the WAF counts', async t => {
