@@ -13,8 +13,6 @@ const { resolveProxyUrl } = require('./proxy-helper')
  * never logged: error paths log worker status codes, never payloads.
  */
 
-const WORKER_TIMEOUT_MS = 150000 // the browser flow (captcha auto-pass) can take a while
-
 // Worker error codes -> public sign-in error codes.
 const CODE_FOR_WORKER_CODE = {
     invalid_credentials: 'signin_rejected',
@@ -22,6 +20,8 @@ const CODE_FOR_WORKER_CODE = {
     form_not_found: 'signin_verification_required',
     signin_timeout: 'signin_transport_error',
     browser_error: 'signin_upstream_error',
+    // The worker paces full sign-ins; retryAfterMs says when it has a slot.
+    signin_paced: 'signin_busy',
     no_profile: 'signin_session_lost',
     session_expired: 'signin_session_lost'
 }
@@ -41,7 +41,7 @@ async function callWorker(path, payload) {
     try {
         response = await axios.post(`${config.signinWorkerUrl}${path}`, payload, {
             headers: workerHeaders(),
-            timeout: WORKER_TIMEOUT_MS,
+            timeout: config.signinWorkerTimeoutMs,
             maxRedirects: 0
         })
     } catch (error) {
@@ -54,6 +54,9 @@ async function callWorker(path, payload) {
                 error.response.status
             )
             failure.sessionLost = SESSION_LOST_CODES.has(code)
+            if (Number.isFinite(error.response.data?.retryAfterMs)) {
+                failure.retryAfterMs = error.response.data.retryAfterMs
+            }
             throw failure
         }
         throw new SigninError('signin_transport_error', 502, 'Signin worker unreachable.')
@@ -66,12 +69,18 @@ async function callWorker(path, payload) {
     return { token, expiresAt, cookies }
 }
 
-/** Full interactive sign-in; returns a jar-backed session for the store. */
-async function acquireSession(email, password, account) {
+/**
+ * Full interactive sign-in; returns a jar-backed session for the store.
+ * The worker answers from the session it already holds while that one is
+ * live; `force` asks for a real sign-in regardless (Qwen2API-43a), for a
+ * session that was just refused upstream.
+ */
+async function acquireSession(email, password, account, { force = false } = {}) {
     const harvested = await callWorker('/session', {
         email,
         password,
-        proxy: resolveProxyUrl(account)
+        proxy: resolveProxyUrl(account),
+        ...(force ? { force: true } : {})
     })
     return { token: harvested.token, expiresAt: harvested.expiresAt, jar: store.jarFromCookies(harvested.cookies) }
 }

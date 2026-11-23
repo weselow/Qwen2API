@@ -378,7 +378,7 @@
                   {{ t('dash.cancel') }}
                 </button>
                 <button @click="addToken"
-                        :disabled="!newAccountProxyValid"
+                        :disabled="!newAccountProxyValid || isAddingAccount"
                         class="px-4 py-2 rounded-xl bg-black text-white hover:bg-white hover:text-black transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed">
                   {{ t('dash.add') }}
                 </button>
@@ -574,6 +574,9 @@ const newAccount = ref({
 const showEditProxyModal = ref(false)
 const editProxy = ref({ email: '', proxy: '' })
 const isSavingProxy = ref(false)
+// 添加账号的登录可能持续半分钟；期间再点一次「添加」会再发一个 /setAccount，
+// 也就是又一次完整的 qwen.ai 登录（Qwen2API-43a）
+const isAddingAccount = ref(false)
 
 // 与后端 src/utils/proxy-helper.js#PROXY_URL_REGEX 保持一致
 const PROXY_URL_REGEX = /^(https?|socks5h?):\/\/[^\s]+$/i
@@ -1045,6 +1048,8 @@ const signinFailureMessage = error => {
 }
 
 const addToken = async () => {
+  if (isAddingAccount.value) return
+  isAddingAccount.value = true
   try {
     const payload = {
       email: newAccount.value.email,
@@ -1060,6 +1065,8 @@ const addToken = async () => {
     showToast(t('msg.addSuccess'))
   } catch (error) {
     showToast(t('msg.addFailed') + signinFailureMessage(error), 'error')
+  } finally {
+    isAddingAccount.value = false
   }
 }
 

@@ -93,6 +93,7 @@
     "signin_upstream_error": "Qwen 返回了异常登录响应。",
     "signin_transport_error": "登录时无法收到 Qwen 响应。",
     "signin_local_error": "本地登录请求失败。",
+    "signin_busy": "短时间内的登录太多，正在按间隔逐个进行。请稍等片刻再试。",
     "batchComplete": "批量添加完成: 成功{n}个",
     "batchFailed": "失败{n}个",
     "batchSkipped": "跳过{n}个",

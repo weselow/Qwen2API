@@ -245,21 +245,33 @@ class Account {
      * @private
      */
     async _loginEnvironmentAccounts() {
-        const loginPromises = this.accountTokens.map(async (account) => {
-            if (!account.token && account.email && account.password) {
-                const token = await this.tokenManager.login(account.email, account.password, account)
-                if (token) {
-                    const decoded = this.tokenManager.validateToken(token)
-                    if (decoded) {
-                        account.token = token
-                        account.expires = decoded.exp
-                    }
+        // 浏览器模式下 signin-worker 给完整登录排队（Qwen2API-43a）：并发登录只会在那边
+        // 排队或被拒（signin_paced），所以逐个登录。
+        if (v2sessions.browser) {
+            for (const account of this.accountTokens) await this._loginEnvironmentAccount(account)
+            return
+        }
+        this.accountTokens = await Promise.all(this.accountTokens.map(account => this._loginEnvironmentAccount(account)))
+    }
+
+    /**
+     * 环境变量账户尚未持有令牌时登录一次
+     * @param {Object} account - 账户对象（就地写入 token / expires）
+     * @returns {Promise<Object>} 同一账户对象
+     * @private
+     */
+    async _loginEnvironmentAccount(account) {
+        if (!account.token && account.email && account.password) {
+            const token = await this.tokenManager.login(account.email, account.password, account)
+            if (token) {
+                const decoded = this.tokenManager.validateToken(token)
+                if (decoded) {
+                    account.token = token
+                    account.expires = decoded.exp
                 }
             }
-            return account
-        })
-
-        this.accountTokens = await Promise.all(loginPromises)
+        }
+        return account
     }
 
     /**
@@ -829,77 +841,6 @@ class Account {
      */
     resetAccountFailures(email) {
         this.accountRotator.resetFailures(email)
-    }
-
-    /**
-     * 添加新账户
-     * @param {string} email - 邮箱
-     * @param {string} password - 密码
-     * @param {string|null} [proxy] - 账号专属代理 URL（HTTP/HTTPS/SOCKS5）
-     * @returns {Promise<boolean>} 添加是否成功
-     */
-    async addAccount(email, password, proxy = null) {
-        return this._runAccountMutation(email, () => this._addAccount(email, password, proxy))
-    }
-
-    async _addAccount(email, password, proxy = null) {
-        try {
-            // 检查账户是否已存在
-            const existingAccount = this.accountTokens.find(acc => acc.email === email)
-            if (existingAccount) {
-                logger.warn(`账户 ${email} 已存在`, 'ACCOUNT')
-                return false
-            }
-
-            // 尝试登录获取令牌
-            const token = await this.tokenManager.login(email, password, proxy ? { proxy } : undefined)
-            if (!token) {
-                logger.error(`账户 ${email} 登录失败，无法添加`, 'ACCOUNT')
-                return false
-            }
-
-            const decoded = this.tokenManager.validateToken(token)
-            if (!decoded) {
-                logger.error(`账户 ${email} 令牌无效，无法添加`, 'ACCOUNT')
-                return false
-            }
-
-            const newAccount = {
-                email,
-                password,
-                token,
-                expires: decoded.exp,
-                proxy: (typeof proxy === 'string' && proxy.trim()) ? proxy.trim() : null,
-                stats: createDefaultStats()
-            }
-
-            // 添加到内存
-            this.accountTokens.push(newAccount)
-
-            // 保存到持久化存储
-            const saved = await this.dataPersistence.saveAccount(email, newAccount, { allowCreate: true })
-            if (!saved) {
-                const insertedIndex = this.accountTokens.indexOf(newAccount)
-                if (insertedIndex !== -1) this.accountTokens.splice(insertedIndex, 1)
-                this.accountRotator.setAccounts(this.accountTokens)
-                logger.error(`账户 ${email} 持久化失败，已回滚内存数据`, 'ACCOUNT')
-                return false
-            }
-
-            // 更新轮询器
-            this.accountRotator.setAccounts(this.accountTokens)
-
-            // 后台初始化 CLI
-            this._initializeCliAccount(newAccount).catch(err => {
-                logger.error(`新账户 CLI 初始化失败: ${email}`, 'ACCOUNT', '', err)
-            })
-
-            logger.success(`成功添加账户: ${email}`, 'ACCOUNT')
-            return true
-        } catch (error) {
-            logger.error(`添加账户失败 (${email})`, 'ACCOUNT', '', error)
-            return false
-        }
     }
 
     /**

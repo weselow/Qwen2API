@@ -238,7 +238,7 @@ function createServer(overrides = {}) {
     async function fullLogin(email, password, proxy, force) {
         const slot = pacer.admit()
         if (slot.waitMs > 0) {
-            log('session', `queued (${slot.waitMs}ms)`)
+            log('session', `queued (${Math.ceil(slot.waitMs)}ms)`)
             await sleep(slot.waitMs)
         }
         const harvested = await withBrowserContext(email, proxy, async context => {

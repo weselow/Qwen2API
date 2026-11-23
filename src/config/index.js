@@ -105,6 +105,10 @@ const config = {
     v2SessionMode,
     signinWorkerUrl: process.env.SIGNIN_WORKER_URL || 'http://signin-worker:3100',
     signinWorkerToken: process.env.SIGNIN_WORKER_TOKEN || null,
+    // signin-worker 调用预算。worker 给完整登录排队（Qwen2API-43a）：/session 先等自己的
+    // 名额再做浏览器流程，所以这里必须大于 worker 的 SIGNIN_LOGIN_MAX_WAIT_MS + SIGNIN_TIMEOUT_MS，
+    // 否则应用放弃了 worker 仍在执行的登录。
+    signinWorkerTimeoutMs: Math.max(1000, parseInt(process.env.SIGNIN_WORKER_TIMEOUT_MS, 10) || 240000),
     // CLI 账户初始化开关（OAuth 设备授权流程需要人工确认，默认关闭避免初始化失败刷屏）
     cliEnabled: process.env.ENABLE_CLI === 'true',
     // chat 请求重试配置（运行时可被 web UI 覆盖，见 src/utils/data-persistence.js#loadSettings）

@@ -7,8 +7,10 @@
  * headless Chromium — against a stand-in for chat.qwen.ai on 127.0.0.1.
  *
  * qwen.ai is never contacted: run this freely, it is not a live probe. Use it
- * after touching signin-worker/lib/resident-pages.js or egress-fetch.js; the
- * tests in tests/ run a fake Playwright, this one does not.
+ * after touching the worker's browser paths: signin-worker/server.js (the
+ * sign-in path), lib/login-pacer.js, lib/resident-pages.js,
+ * lib/egress-fetch.js. The tests in tests/ run a fake Playwright, this one
+ * does not.
  *
  *   bunx playwright install chromium     # once
  *   node tools/worker-egress-local-smoke.js
@@ -39,6 +41,15 @@ function startStandIn() {
             res.writeHead(200, { 'content-type': 'text/html', 'set-cookie': 'standin=1; Path=/' })
             return res.end(`<html><body>stand-in<script>localStorage.setItem('token', '${
                 tokenExpiringIn(3600)}')</script></body></html>`)
+        }
+        if (req.url === '/auth' && req.method === 'GET') {
+            // What the chat FE does on /auth for a profile that is signed in:
+            // it settles a token right there. Long-lived, so the worker's
+            // session cache counts it as live next to the smoke's minCacheSeconds.
+            pageLoads++
+            res.writeHead(200, { 'content-type': 'text/html', 'set-cookie': 'standin=1; Path=/' })
+            return res.end(`<html><body>auth stand-in<script>localStorage.setItem('token', '${
+                tokenExpiringIn(30 * 86400)}')</script></body></html>`)
         }
         if (req.url === '/api/slow') {
             // Longer than the timeout the smoke asks for.
@@ -86,6 +97,9 @@ async function main() {
         keepAliveMs: 200,
         // Forces the live path on /renew: the smoke wants a real reload.
         minCacheSeconds: 7200,
+        // Short enough for a smoke, long enough to be seen: the second full
+        // sign-in below has to wait for its slot.
+        minLoginIntervalMs: 5000,
         egressMaxBytes: 4096
     })
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -176,6 +190,33 @@ async function main() {
         assert.equal(standIn.pageLoads(), beforeRenewal + 1)
         assert.equal((await health()).residentPages, 1)
         console.log('ok renewal: the live /renew reloaded the resident page (no second launch on the profile)')
+
+        // Full sign-ins are deduplicated and paced (Qwen2API-43a). With the
+        // resident page up, a sign-in runs on that very page.
+        const signIn = extra => call('/session', { email, password: 'pw', ...extra })
+        const beforeSignIn = standIn.pageLoads()
+        const signedIn = await signIn({ force: true })
+        assert.equal(signedIn.status, 200, JSON.stringify(signedIn.body))
+        assert.equal(standIn.pageLoads(), beforeSignIn + 1)
+        assert.equal((await health()).residentPages, 1)
+        console.log('ok sign-in: the full sign-in ran on the resident page (no second launch on the profile)')
+
+        // That session is live: the next /session is answered from it, and
+        // no page is loaded for it.
+        const cached = await signIn()
+        assert.equal(cached.status, 200)
+        assert.equal(cached.body.token, signedIn.body.token)
+        assert.equal(standIn.pageLoads(), beforeSignIn + 1)
+        console.log('ok dedup: /session answered from the live session without loading a page')
+
+        // A sign-in that does run takes its slot: not before the pacing gap.
+        const slotAsked = Date.now()
+        const spaced = await signIn({ force: true })
+        assert.equal(spaced.status, 200, JSON.stringify(spaced.body))
+        assert.notEqual(spaced.body.token, signedIn.body.token)
+        assert.equal(standIn.pageLoads(), beforeSignIn + 2)
+        assert.ok(Date.now() - slotAsked >= 5000, 'the second sign-in ran before its slot')
+        console.log(`ok pacing: the next full sign-in waited for its slot (${Date.now() - slotAsked} ms in total)`)
 
         // A clean stop closes the browser, which flushes the profile.
         await server.workerShutdown()
