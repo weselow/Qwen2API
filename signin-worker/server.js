@@ -6,43 +6,39 @@
  *
  *   POST /session {email, password, proxy?} -> {token, expiresAt, cookies[]}
  *   POST /renew   {email, proxy?}            -> {token, expiresAt, cookies[]}
- *   GET  /health                             -> {ok, sessions}
+ *   GET  /health                             -> {ok, sessions, residentPages}
  *
  * One persistent context (userDataDir) per account on the SIGNIN_DATA_DIR
  * volume: auth cookies survive restarts and renewal is a silent reload.
  * Tokens live in memory only; passwords are never stored or logged. The
  * worker must stay on an internal network (optionally guarded by
  * SIGNIN_WORKER_TOKEN as a shared bearer secret).
+ *
+ * Since Qwen2API-3ue.1 it is also the egress service: a resident page per
+ * active account carries qwen.ai API calls as in-page fetches, so upstream
+ * sees the browser's TLS and its live cookies.
+ *
+ *   POST /egress {email, url, method, headers, body, timeoutMs, proxy?}
+ *                                          -> {status, headers, body, cookies[]}
+ *
+ * Design: docs/browser-egress-design.md.
  */
 const http = require('node:http')
 const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
+const { WorkerError, STATUS_FOR_CODE } = require('./lib/worker-errors')
+const { normalizeEgress } = require('./lib/egress-fetch')
+const { createResidents } = require('./lib/resident-pages')
 
 const envInt = (name, fallback) => {
     const raw = parseInt(process.env[name], 10)
     return Number.isFinite(raw) && raw > 0 ? raw : fallback
 }
 
-// Error codes -> HTTP statuses; unknown browser failures land on 500.
-const STATUS_FOR_CODE = {
-    invalid_request: 400,
-    unauthorized: 401,
-    invalid_credentials: 401,
-    no_profile: 404,
-    session_expired: 422,
-    captcha_stuck: 502,
-    form_not_found: 502,
-    signin_timeout: 504,
-    browser_error: 500
-}
-
-class WorkerError extends Error {
-    constructor(code, message) {
-        super(message)
-        this.code = code
-    }
-}
+const REQUEST_BODY_LIMIT = 131072
+// Egress relays request bodies built by the app (agent contexts, images).
+const EGRESS_BODY_LIMIT = 32 * 1024 * 1024
 
 function createServer(overrides = {}) {
     const signer = overrides.signer || require('./lib/browser-signin')
@@ -56,7 +52,18 @@ function createServer(overrides = {}) {
         minRenewDelayMs: overrides.minRenewDelayMs ?? envInt('SIGNIN_MIN_RENEW_DELAY_MS', 30000),
         minCacheSeconds: overrides.minCacheSeconds ?? 120,
         // Shared bearer secret; empty = no auth (internal network only).
-        token: overrides.token !== undefined ? overrides.token : (process.env.SIGNIN_WORKER_TOKEN || '')
+        token: overrides.token !== undefined ? overrides.token : (process.env.SIGNIN_WORKER_TOKEN || ''),
+        // Resident pages (Qwen2API-3ue.1). ~200-300 MB of Chromium each.
+        maxPages: overrides.maxPages ?? envInt('MAX_RESIDENT_PAGES', 16),
+        keepAliveMs: overrides.keepAliveMs ?? envInt('RESIDENT_KEEPALIVE_MS', 300000),
+        // An /egress timeoutMs is clamped to this; unset, it is config.timeoutMs.
+        egressMaxTimeoutMs: overrides.egressMaxTimeoutMs ?? envInt('SIGNIN_EGRESS_MAX_TIMEOUT_MS', 600000),
+        egressMaxBytes: overrides.egressMaxBytes ?? 8 * 1024 * 1024,
+        // Grace periods, all bounded so a wedged browser cannot stall a request.
+        drainMs: overrides.drainMs ?? 5000,
+        backstopMs: overrides.backstopMs ?? 5000,
+        closeMs: overrides.closeMs ?? 5000,
+        shutdownMs: overrides.shutdownMs ?? 8000
     }
 
     fs.mkdirSync(config.dataDir, { recursive: true })
@@ -118,6 +125,32 @@ function createServer(overrides = {}) {
         return entry
     }
 
+    // The live page is the source of truth for the jar: what the browser holds
+    // now replaces the cached cookies, so a cached /renew never hands out a
+    // jar the browser has already rotated away from.
+    const syncCookies = (email, cookies) => {
+        const cached = sessions.get(email)
+        if (cached && Array.isArray(cookies)) cached.cookies = cookies
+    }
+
+    // email -> resident page on chat.qwen.ai; fetches run inside it.
+    const residents = createResidents({
+        signer,
+        profileDir,
+        chatOrigin: config.chatOrigin,
+        headless: config.headless,
+        openTimeoutMs: config.timeoutMs,
+        maxPages: config.maxPages,
+        keepAliveMs: config.keepAliveMs,
+        maxBytes: config.egressMaxBytes,
+        drainMs: config.drainMs,
+        backstopMs: config.backstopMs,
+        closeMs: config.closeMs,
+        log,
+        onHarvest: remember,
+        onCookies: syncCookies
+    })
+
     async function silentRenew(email) {
         try {
             const harvested = await liveRenew(email, null)
@@ -144,41 +177,76 @@ function createServer(overrides = {}) {
     }
 
     async function withBrowserContext(email, proxy, operation) {
-        return serialized(email, () => withBrowser(email, proxy, operation))
+        return serialized(email, async () => {
+            // A resident page owns the profile directory (Chromium locks it):
+            // sign-in and renewal run on that page instead of a second launch.
+            // A null proxy means "whatever the account already uses".
+            const resident = residents.get(email)
+            const wanted = proxy ?? resident?.proxy ?? null
+            if (resident && resident.proxy === wanted) return residents.exclusive(resident, operation)
+            if (resident) await residents.close(resident, 'proxy_changed')
+            // The page may still be closing (crash, eviction): its browser
+            // holds the profile lock until it is gone.
+            await residents.whenClosed(email)
+            return withBrowser(email, proxy, operation)
+        })
     }
 
-    async function handleSession(body) {
-        const { email, password, proxy } = body
-        if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(email) || email.length > 254) {
+    const parseEmail = body => {
+        if (typeof body.email !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(body.email) || body.email.length > 254) {
             throw new WorkerError('invalid_request', 'A valid email is required.')
         }
-        if (typeof password !== 'string' || !password || password.length > 1024) {
-            throw new WorkerError('invalid_request', 'A password is required.')
-        }
+        return body.email
+    }
+
+    const parseProxy = body => {
+        const { proxy } = body
         if (proxy !== undefined && proxy !== null && (typeof proxy !== 'string' || proxy.length > 2048)) {
             throw new WorkerError('invalid_request', 'Invalid proxy URL.')
         }
-        const harvested = await withBrowserContext(email, proxy || null,
+        return proxy || null
+    }
+
+    async function handleSession(body) {
+        const email = parseEmail(body)
+        const { password } = body
+        if (typeof password !== 'string' || !password || password.length > 1024) {
+            throw new WorkerError('invalid_request', 'A password is required.')
+        }
+        const proxy = parseProxy(body)
+        const harvested = await withBrowserContext(email, proxy,
             context => signer.signin(context, { email, password, chatOrigin: config.chatOrigin, timeoutMs: config.timeoutMs }))
-        remember(email, harvested, proxy || null)
+        remember(email, harvested, proxy)
         log('session', `acquired (${sessions.size} sessions)`)
         return shape(sessions.get(email))
     }
 
     async function handleRenew(body) {
-        const { email, proxy } = body
-        if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(email) || email.length > 254) {
-            throw new WorkerError('invalid_request', 'A valid email is required.')
-        }
-        if (proxy !== undefined && proxy !== null && (typeof proxy !== 'string' || proxy.length > 2048)) {
-            throw new WorkerError('invalid_request', 'Invalid proxy URL.')
-        }
+        const email = parseEmail(body)
+        const proxy = parseProxy(body)
         const cached = sessions.get(email)
         if (cached && cached.exp - now() > config.minCacheSeconds) return shape(cached)
-        const harvested = await liveRenew(email, proxy || null)
-        remember(email, harvested, proxy || null)
+        const harvested = await liveRenew(email, proxy)
+        remember(email, harvested, proxy)
         log('renew', `ok (${sessions.size} sessions)`)
         return shape(sessions.get(email))
+    }
+
+    async function handleEgress(body) {
+        const email = parseEmail(body)
+        const proxy = parseProxy(body)
+        const request = normalizeEgress(body, {
+            chatOrigin: config.chatOrigin,
+            defaultTimeoutMs: config.timeoutMs,
+            maxTimeoutMs: config.egressMaxTimeoutMs
+        })
+        // The lock covers finding or opening the page only; the fetch itself
+        // runs free, so calls on one page stay concurrent.
+        const entry = await serialized(email, () => residents.acquire(email,
+            proxy ?? residents.get(email)?.proxy ?? sessions.get(email)?.proxy ?? null))
+        const result = await residents.fetch(entry, request)
+        log('egress', `${new URL(request.url).pathname} -> ${result.status} (${residents.stats().residentPages}/${config.maxPages} pages)`)
+        return result
     }
 
     function authorized(req) {
@@ -194,20 +262,25 @@ function createServer(overrides = {}) {
         res.end(body)
     }
 
-    async function readJson(req) {
+    async function readJson(req, limit) {
         const chunks = []
         let size = 0
         for await (const chunk of req) {
             size += chunk.length
-            if (size > 131072) throw new WorkerError('invalid_request', 'Request body too large.')
+            if (size > limit) throw new WorkerError('invalid_request', 'Request body too large.')
             chunks.push(chunk)
         }
         if (!chunks.length) return {}
+        let parsed
         try {
-            return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+            parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'))
         } catch {
             throw new WorkerError('invalid_request', 'Request body must be JSON.')
         }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new WorkerError('invalid_request', 'Request body must be a JSON object.')
+        }
+        return parsed
     }
 
     const server = http.createServer((req, res) => {
@@ -227,25 +300,58 @@ function createServer(overrides = {}) {
 
     async function handle(req, res) {
         if (req.method === 'GET' && req.url === '/health') {
-            return send(res, 200, { ok: true, sessions: sessions.size })
+            return send(res, 200, { ok: true, sessions: sessions.size, ...residents.stats() })
         }
         if ((req.method === 'POST' && req.url === '/session') || (req.method === 'POST' && req.url === '/renew')) {
             if (!authorized(req)) throw new WorkerError('unauthorized', 'Invalid worker token.')
-            const body = await readJson(req)
+            const body = await readJson(req, REQUEST_BODY_LIMIT)
             return send(res, 200, req.url === '/session' ? await handleSession(body) : await handleRenew(body))
+        }
+        if (req.method === 'POST' && req.url === '/egress') {
+            if (!authorized(req)) throw new WorkerError('unauthorized', 'Invalid worker token.')
+            const body = await readJson(req, EGRESS_BODY_LIMIT)
+            return send(res, 200, await handleEgress(body))
         }
         throw new WorkerError('invalid_request', 'Unknown route.')
     }
 
     server.workerConfig = config
+    server.workerShutdown = () => residents.shutdown(config.shutdownMs)
     return server
 }
 
-module.exports = { createServer, WorkerError }
+/**
+ * Handler for a stop signal (container stop).
+ *
+ * Node runs as PID 1 in the container, where a signal without a handler is
+ * ignored altogether — and the SIGKILL 10 s later would skip the clean
+ * browser close that flushes every profile (auth cookies) to disk.
+ *
+ * @param {http.Server} server created by createServer()
+ * @param {(code: number) => void} [exit]
+ * @returns {(signal: string) => void}
+ */
+function shutdownHandler(server, exit = code => process.exit(code)) {
+    let stopping = false
+    return signal => {
+        // A second signal means "now": do not wait for the first to finish.
+        if (stopping) return exit(0)
+        stopping = true
+        console.log(`${new Date().toISOString()} stopping on ${signal}`)
+        server.close()
+        // Either way the process goes: a shutdown that failed has nothing left to say.
+        server.workerShutdown().then(() => exit(0), () => exit(0))
+    }
+}
+
+module.exports = { createServer, WorkerError, shutdownHandler }
 
 if (require.main === module) {
     const server = createServer()
     server.listen(server.workerConfig.port, () => {
         console.log(`${new Date().toISOString()} signin-worker listening on :${server.workerConfig.port}`)
     })
+    const stop = shutdownHandler(server)
+    process.on('SIGTERM', () => stop('SIGTERM'))
+    process.on('SIGINT', () => stop('SIGINT'))
 }
