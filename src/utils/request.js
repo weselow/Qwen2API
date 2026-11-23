@@ -6,6 +6,7 @@ const { logger } = require('./logger')
 const { getSsxmodForAccount } = require('./ssxmod-manager')
 const { applyProxyToAxiosConfig, getChatBaseUrl, resolveProxyUrl } = require('./proxy-helper');
 const { postCompletions } = require('./impersonate-transport.js')
+const browserEgress = require('./browser-egress.js')
 const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
@@ -714,8 +715,10 @@ const sendChatRequest = async (body, options = {}) => {
     } catch (error) {
         if (error instanceof ChatCreationError || !isWafChallengeError(error)) releaseChatProbe(breakerContext)
         // jik.4：上游拒绝会话（401 unauthorized）或 punish（WAF challenge）——
-        // 作废 v2 会话并触发 signin-worker 续期。off/lab 模式与无会话时 no-op
-        if (currentAccount &&
+        // 作废 v2 会话并触发 signin-worker 续期。off/lab 模式与无会话时 no-op。
+        // Through the worker egress the session is recovered inside chats/new
+        // and never dropped (Qwen2API-3ue.2).
+        if (!browserEgress.enabled() && currentAccount &&
             (error.code === 'upstream_session_unauthorized' || isWafChallengeError(error))) {
             sessionPersistence.invalidateSession(currentAccount.email, currentAccount, error.code)
         }
@@ -728,7 +731,8 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
 
     // Antidetect: per-account fingerprint headers replace static block
     const ssxmod = getSsxmodForAccount(currentAccount)
-    const headers = buildRequestHeaders(currentAccount, {
+    // Built again if the session's token rotates while the chat is created.
+    const requestHeaders = () => buildRequestHeaders(currentAccount, {
         chatBaseUrl,
         token: currentToken,
         ssxmodItna: ssxmod.ssxmod_itna,
@@ -742,7 +746,7 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
 
     // 构建请求配置（与通义千问 React Web 客户端完全一致，对齐 FE 0.3.49）
     const requestConfig = {
-        headers,
+        headers: requestHeaders(),
         responseType: 'stream', // Always use streaming (upstream doesn't support stream=false)
         timeout: 10 * 60 * 1000, // Max/thinking models may exceed 60s before answer
     }
@@ -760,6 +764,13 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
             // no es "vuelve en un rato" sino "el upstream contesto algo que no entendemos".
             failure: unclassifiedFailure(502)
         }
+    }
+    // The chat may have been created on a recovered session (Qwen2API-3ue.2):
+    // the generation rides the token the session store holds now.
+    const liveToken = sessionPersistence.sessionToken(currentAccount, currentToken)
+    if (liveToken !== currentToken) {
+        currentToken = liveToken
+        requestConfig.headers = requestHeaders()
     }
     // 浏览器 referer 为 /c/<chat_id>（在 chat_id 生成后动态设置）
     requestConfig.headers.referer = `${chatBaseUrl}/c/${chat_id}`
@@ -816,6 +827,8 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
             const response = await postCompletions(url, payload, requestConfig, {
                 proxyUrl: lab.authOrigin ? null : resolveProxyUrl(currentAccount)
             })
+            // Browser mode: the jar follows what qwen.ai set on this direct call too (Qwen2API-3ue.2)
+            sessionPersistence.readSetCookies(currentAccount?.email, response.headers, url)
             if (response.status === 200) {
                 // 返回 currentAccount——调用方在消费完 stream 后据此累计 stats
                 // 注意：当前实现单次尝试都用同一个 currentAccount（不轮换），
@@ -844,6 +857,7 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
             lastError.response = { status: response.status }
             break
         } catch (error) {
+            sessionPersistence.readSetCookies(currentAccount?.email, error.response?.headers, url)
             if (isWafChallengeError(error)) throw error
             lastError = error
             if (isRetryableNetworkError(error) && attempt < totalAttempts) {
@@ -897,8 +911,10 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
             const status = lastError.response?.status
             logger.error('发送聊天请求失败', 'REQUEST', '', lastError.message)
             accountManager.recordAccountError(currentAccount.email, status)
-            // 401 = 上游拒绝会话/bearer（jik.4）：v2 会话作废并续期；off/lab 模式 no-op
-            if (status === 401) {
+            // 401 = 上游拒绝会话/bearer（jik.4）：v2 会话作废并续期；off/lab 模式 no-op。
+            // In egress mode chats/new just accepted this session, and a
+            // refusal of a direct completions call says nothing about it.
+            if (status === 401 && !browserEgress.enabled()) {
                 sessionPersistence.invalidateSession(currentAccount.email, currentAccount, 401)
             }
         }
@@ -927,6 +943,19 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
 const generateChatID = async (currentToken, model, account, chatType = 't2t') => {
     try {
         const chatBaseUrl = getChatBaseUrl()
+        const url = `${chatBaseUrl}/api/v2/chats/new`
+        // 对齐 chat.qwen.ai FE 0.3.49：chatId/project_id + normal 模式
+        const body = {
+            chatId: '',
+            models: [model],
+            project_id: '',
+            timestamp: Date.now(),
+            chat_type: chatType || 't2t',
+            chat_mode: 'normal'
+        }
+        // From inside the account's resident page, with recovery (Qwen2API-3ue.2):
+        // the worker's answer is classified exactly like the direct one below.
+        if (browserEgress.enabled()) return await browserEgress.createChat({ account, url, body })
 
         // Antidetect: per-account fingerprint headers replace static block
         const ssxmod = getSsxmodForAccount(account)
@@ -946,26 +975,21 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
             headers
         }
 
-        const url = `${chatBaseUrl}/api/v2/chats/new`
         // Same shape as the completions site: the v2 session store merges its
         // jar when a v2 mode is active (lab pins proxy:false; browser keeps the
         // account proxy applied below).
         lab.prepareChat(requestConfig, url, account, currentToken)
         if (!lab.authOrigin) applyProxyToAxiosConfig(requestConfig, account);
 
-        // 对齐 chat.qwen.ai FE 0.3.49：chatId/project_id + normal 模式
-        const response_data = await axios.post(url, {
-            chatId: '',
-            models: [model],
-            project_id: '',
-            timestamp: Date.now(),
-            chat_type: chatType || 't2t',
-            chat_mode: 'normal'
-        }, requestConfig)
+        const response_data = await axios.post(url, body, requestConfig)
+        // Browser mode: the jar follows what qwen.ai set on this direct call too (Qwen2API-3ue.2)
+        sessionPersistence.readSetCookies(account?.email, response_data.headers, url)
 
         return assertChatCreationResponse(response_data.data)
 
     } catch (error) {
+        // A rejected direct call rotated cookies as well.
+        if (error.response) sessionPersistence.readSetCookies(account?.email, error.response.headers, error.response.config?.url)
         let failure = error
         if (!(failure instanceof ChatCreationError)) {
             // Even a rejected HTTP response may carry a known JSON/HTML refusal.
@@ -982,8 +1006,10 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
         }
         logger.error(`Qwen chat creation failed: category=${failure.code}, status=${failure.status}`, 'CHAT')
         // jik.4：会话被上游拒绝（401/punish）——image/video 控制器直接调用
-        // 本函数、不经 sendChatRequest，所以这里也要作废会话
-        if (account &&
+        // 本函数、不经 sendChatRequest，所以这里也要作废会话。
+        // Through the worker egress the session is recovered inside the call
+        // instead, and a session that recovery could not replace stays.
+        if (!browserEgress.enabled() && account &&
             (failure.code === 'upstream_session_unauthorized' || failure.code === 'upstream_waf_challenge')) {
             sessionPersistence.invalidateSession(account.email, account, failure.code)
         }

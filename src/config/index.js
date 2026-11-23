@@ -48,6 +48,25 @@ const parseCompletionsTransport = (value = process.env.COMPLETIONS_TRANSPORT) =>
     return raw
 }
 
+/**
+ * Разбор CHAT_CREATION_TRANSPORT — каким путём идёт chats/new (Qwen2API-3ue.2):
+ * auto (по умолчанию: браузерные сессии + задан SIGNIN_WORKER_URL → изнутри
+ * резидентной страницы воркера, иначе axios) | browser (принудительно) |
+ * direct (axios, прежнее поведение). Опечатка так же отвергает запуск.
+ * @returns {string}
+ */
+const parseChatCreationTransport = (value = process.env.CHAT_CREATION_TRANSPORT) => {
+    const raw = value == null || String(value).trim() === '' ? 'auto' : String(value).trim().toLowerCase()
+    if (!['auto', 'browser', 'direct'].includes(raw)) {
+        throw new Error(
+            `CHAT_CREATION_TRANSPORT="${value}" недействителен: только auto | browser | direct. ` +
+            'auto = через /egress воркера, когда V2_SESSION_MODE=browser и задан SIGNIN_WORKER_URL, иначе axios; ' +
+            'browser = принудительно; direct = прежнее поведение.'
+        )
+    }
+    return raw
+}
+
 // V2 session pipeline mode (epic Qwen2API-jik):
 //   off     = v1 path, today's behavior (default);
 //   lab     = .test HTTPS stand via QWEN_LAB_V2_AUTH_ORIGIN (back-compat: that
@@ -109,6 +128,29 @@ const config = {
     // 名额再做浏览器流程，所以这里必须大于 worker 的 SIGNIN_LOGIN_MAX_WAIT_MS + SIGNIN_TIMEOUT_MS，
     // 否则应用放弃了 worker 仍在执行的登录。
     signinWorkerTimeoutMs: Math.max(1000, parseInt(process.env.SIGNIN_WORKER_TIMEOUT_MS, 10) || 240000),
+    // У signinWorkerUrl есть значение по умолчанию, поэтому «воркер задан» видно
+    // только по самому env: auto-транспорт включает egress лишь там, где воркер
+    // действительно описан.
+    signinWorkerConfigured: Boolean(process.env.SIGNIN_WORKER_URL),
+    // Транспорт chats/new (src/utils/browser-egress.js): чистый Node TLS с
+    // egress-IP Baxia не пускает (23.11), проходит только изнутри браузера воркера.
+    chatCreationTransport: parseChatCreationTransport(),
+    // Дроссель восстановления v2-сессии (src/utils/v2-session-persistence.js,
+    // Qwen2API-3ue.2): отклонённая сессия не должна перезагружать страницу
+    // аккаунта на каждый неудачный запрос. 0 отключает.
+    sessionRecoveryMinIntervalMs: (() => {
+        const raw = parseInt(process.env.V2_SESSION_RECOVERY_MIN_INTERVAL_MS, 10)
+        return Number.isFinite(raw) && raw >= 0 ? raw : 30000
+    })(),
+    // Полный вход по паролю кормит скор Baxia (21.11: 9 входов за 3 минуты →
+    // блок IP), поэтому у него свой интервал на аккаунт. Каждая попытка, не
+    // давшая принятой сессии (вход провалился или его сессию снова отклонили),
+    // удваивает ожидание следующей — до каденса авто-refresh (15 мин), чтобы
+    // аккаунт, которому не помочь, не входил вечно. 0 отключает.
+    sessionReloginMinIntervalMs: (() => {
+        const raw = parseInt(process.env.V2_SESSION_RELOGIN_MIN_INTERVAL_MS, 10)
+        return Number.isFinite(raw) && raw >= 0 ? raw : 60000
+    })(),
     // CLI 账户初始化开关（OAuth 设备授权流程需要人工确认，默认关闭避免初始化失败刷屏）
     cliEnabled: process.env.ENABLE_CLI === 'true',
     // chat 请求重试配置（运行时可被 web UI 覆盖，见 src/utils/data-persistence.js#loadSettings）
@@ -209,7 +251,14 @@ const config = {
 }
 
 // 暴露解析器本身以便测试空槽位的拒绝逻辑（config 对象是模块级单例，无法重复解析）。
+// A forced browser transport has no sessions to carry without browser mode:
+// refuse at startup rather than answer every chat creation with session_lost.
+if (config.chatCreationTransport === 'browser' && v2SessionMode !== 'browser') {
+    throw new Error('CHAT_CREATION_TRANSPORT=browser requires V2_SESSION_MODE=browser')
+}
+
 config.parseApiKeys = parseApiKeys
 config.parseCompletionsTransport = parseCompletionsTransport
+config.parseChatCreationTransport = parseChatCreationTransport
 
 module.exports = config

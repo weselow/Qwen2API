@@ -5,7 +5,7 @@
  * sessions in a real Chromium via Playwright.
  *
  *   POST /session {email, password, proxy?, force?} -> {token, expiresAt, cookies[]}
- *   POST /renew   {email, proxy?}            -> {token, expiresAt, cookies[]}
+ *   POST /renew   {email, proxy?, force?}   -> {token, expiresAt, cookies[]}
  *   GET  /health                             -> {ok, sessions, residentPages}
  *
  * One persistent context (userDataDir) per account on the SIGNIN_DATA_DIR
@@ -19,7 +19,9 @@
  * instead of logging in again, joins concurrent sign-ins of one account into
  * one, and every sign-in that does run takes a slot from the login pacer
  * (lib/login-pacer.js). `force` asks for a real sign-in all the same, for a
- * cached session that was just refused upstream.
+ * cached session that was just refused upstream. /renew takes the same flag
+ * (Qwen2API-3ue.2): the same explicit invalidation, answered with a live page
+ * reload.
  *
  * Since Qwen2API-3ue.1 it is also the egress service: a resident page per
  * active account carries qwen.ai API calls as in-page fetches, so upstream
@@ -84,6 +86,9 @@ function createServer(overrides = {}) {
 
     // email -> {token, exp, cookies, proxy, timer}; tokens stay in RAM only.
     const sessions = new Map()
+    // email -> the live renewal in flight; every caller of one moment shares
+    // one page reload.
+    const renewing = new Map()
     // Chromium locks a profile directory: serialize every launch per account.
     const locks = new Map()
     // email -> the full sign-in now running for it. A /session that lands on
@@ -146,6 +151,12 @@ function createServer(overrides = {}) {
         return entry
     }
 
+    // Drop the cached session together with its silent-renew timer.
+    const forget = email => {
+        clearTimeout(sessions.get(email)?.timer)
+        sessions.delete(email)
+    }
+
     // The live page is the source of truth for the jar: what the browser holds
     // now replaces the cached cookies, so a cached /renew never hands out a
     // jar the browser has already rotated away from.
@@ -174,14 +185,14 @@ function createServer(overrides = {}) {
 
     async function silentRenew(email) {
         try {
-            const harvested = await liveRenew(email, null)
-            remember(email, harvested, null)
+            // Shared like any other renewal: a forced /renew that lands while
+            // the timer's reload is running joins it, not a second reload.
+            await liveRenewShared(email, null, false, true)
             log('silent-renew', `ok (${sessions.size} sessions)`)
-            return harvested
+            return null
         } catch (error) {
             // Drop the cache; the app re-logins with the password via /session.
-            clearTimeout(sessions.get(email)?.timer)
-            sessions.delete(email)
+            forget(email)
             log('silent-renew', `failed (${error.code || 'error'})`)
             return null
         }
@@ -257,19 +268,29 @@ function createServer(overrides = {}) {
         return shape(entry)
     }
 
+    /**
+     * `force` on /session and /renew is the explicit invalidation: the
+     * caller's session was refused upstream, so the answer has to be live
+     * even while the cache looks fresh.
+     */
+    const parseForce = body => {
+        if (body.force !== undefined && typeof body.force !== 'boolean') {
+            throw new WorkerError('invalid_request', 'force must be a boolean.')
+        }
+        return body.force === true
+    }
+
     async function handleSession(body) {
         const email = parseEmail(body)
         const { password } = body
         if (typeof password !== 'string' || !password || password.length > 1024) {
             throw new WorkerError('invalid_request', 'A password is required.')
         }
-        if (body.force !== undefined && typeof body.force !== 'boolean') {
-            throw new WorkerError('invalid_request', 'force must be a boolean.')
-        }
+        const force = parseForce(body)
         const proxy = parseProxy(body)
         // A live session answers for the password. One "add account" is one
         // login, however many /session calls the app makes of it.
-        const live = body.force ? undefined : fresh(email)
+        const live = force ? undefined : fresh(email)
         if (live) {
             log('session', 'cached')
             return shape(live)
@@ -279,21 +300,47 @@ function createServer(overrides = {}) {
             log('session', 'joined')
             return running
         }
-        const login = fullLogin(email, password, proxy, body.force)
+        const login = fullLogin(email, password, proxy, force)
         const tracked = login.finally(() => { if (logins.get(email) === tracked) logins.delete(email) })
         logins.set(email, tracked)
         return tracked
     }
 
+    /**
+     * One live renewal per account: callers that arrive while one is running
+     * share its result instead of queueing a reload of their own.
+     * @param {boolean} [forced] - The caller that starts it invalidated the session
+     * @param {boolean} [quiet] - The caller reports the outcome in its own words
+     */
+    function liveRenewShared(email, proxy, forced = false, quiet = false) {
+        if (!renewing.has(email)) {
+            const task = liveRenew(email, proxy).then(harvested => {
+                remember(email, harvested, proxy)
+                // One line per reload: the callers that joined it do not log
+                // their own, or a burst would read as a burst of reloads.
+                if (!quiet) log('renew', `ok${forced ? ' (forced)' : ''} (${sessions.size} sessions)`)
+                return shape(sessions.get(email))
+            }).finally(() => { renewing.delete(email) })
+            renewing.set(email, task)
+        }
+        return renewing.get(email)
+    }
+
+    /**
+     * `force` is the explicit invalidation (Qwen2API-3ue.2): the caller's
+     * session was refused upstream, so the answer has to be a live reload
+     * even while the cached token still has TTL left. Answering from the
+     * cache here is what made "unauthorized → renew" replay the refused jar
+     * for as long as that lasted. The refused entry is dropped first, so a
+     * reload that fails leaves nothing behind to hand it out again.
+     */
     async function handleRenew(body) {
         const email = parseEmail(body)
         const proxy = parseProxy(body)
-        const cached = sessions.get(email)
-        if (cached && cached.exp - now() > config.minCacheSeconds) return shape(cached)
-        const harvested = await liveRenew(email, proxy)
-        remember(email, harvested, proxy)
-        log('renew', `ok (${sessions.size} sessions)`)
-        return shape(sessions.get(email))
+        const force = parseForce(body)
+        if (force) forget(email)
+        else if (fresh(email)) return shape(fresh(email))
+        return liveRenewShared(email, proxy, force)
     }
 
     async function handleEgress(body) {

@@ -16,7 +16,7 @@ function freshClient(env) {
     if (env[key] === undefined) delete process.env[key]
     else process.env[key] = env[key]
   }
-  for (const mod of ['../src/config', '../src/utils/v2-session-store', '../src/utils/signin-worker-client']) {
+  for (const mod of ['../src/config', '../src/utils/proxy-helper', '../src/utils/v2-session-store', '../src/utils/signin-worker-client']) {
     delete require.cache[require.resolve(mod)]
   }
   return () => {
@@ -24,7 +24,7 @@ function freshClient(env) {
       if (saved[key] === undefined) delete process.env[key]
       else process.env[key] = saved[key]
     }
-    for (const mod of ['../src/config', '../src/utils/v2-session-store', '../src/utils/signin-worker-client']) {
+    for (const mod of ['../src/config', '../src/utils/proxy-helper', '../src/utils/v2-session-store', '../src/utils/signin-worker-client']) {
       delete require.cache[require.resolve(mod)]
     }
   }
@@ -170,6 +170,105 @@ test('a worker call waits in the worker’s login line: the budget is SIGNIN_WOR
     await client.acquireSession('a@example.invalid', 'pw123', null)
     await client.renewSession('a@example.invalid', null)
     assert.deepEqual(post.mock.calls.map(call => call.arguments[2].timeout), [9000, 9000])
+  } finally {
+    restore()
+  }
+})
+
+test('signin worker client carries egress calls and the forced renewal (Qwen2API-3ue.2)', async t => {
+  const requests = []
+  let scripted = { status: 200, body: {} }
+  const server = http.createServer((req, res) => {
+    let raw = ''
+    req.on('data', chunk => { raw += chunk })
+    req.on('end', () => {
+      requests.push({ url: req.url, auth: req.headers.authorization, body: JSON.parse(raw) })
+      reply(res, scripted.status, scripted.body)
+    })
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise(resolve => server.close(resolve)))
+
+  const restore = freshClient({
+    API_KEY: 'offline',
+    V2_SESSION_MODE: 'browser',
+    QWEN_CHAT_PROXY_URL: 'https://chat.qwen.ai',
+    PROXY_URL: 'http://global:8080',
+    SIGNIN_WORKER_URL: `http://127.0.0.1:${server.address().port}`,
+    SIGNIN_WORKER_TOKEN: 'shared-secret'
+  })
+  const realPost = axios.post
+  let config
+  axios.post = async (url, payload, requestConfig) => {
+    config = requestConfig
+    return realPost(url, payload, requestConfig)
+  }
+  t.after(() => { axios.post = realPost })
+  try {
+    const client = require('../src/utils/signin-worker-client')
+    const email = 'a@example.invalid'
+
+    // The call as the page runs it; the account's proxy opens the page.
+    scripted = { status: 200, body: {
+      status: 401, headers: { 'content-type': 'application/json' }, body: '{"success":false}',
+      url: 'https://chat.qwen.ai/api/v2/chats/new', redirected: false, cookies
+    } }
+    const result = await client.egress(email, { proxy: 'http://p:8080' }, {
+      url: '/api/v2/chats/new', headers: { 'content-type': 'application/json' }, body: '{"chatId":""}', timeoutMs: 5000
+    })
+    assert.deepEqual(result, scripted.body, "qwen.ai's status and body come back as they are")
+    assert.deepEqual(requests.at(-1), {
+      url: '/egress', auth: 'Bearer shared-secret', body: {
+        email, url: '/api/v2/chats/new', method: 'POST', headers: { 'content-type': 'application/json' },
+        body: '{"chatId":""}', timeoutMs: 5000, proxy: 'http://p:8080'
+      }
+    })
+    // The HTTP budget is the call, the worker's own budget (which covers a
+    // sign-in the account's call may wait behind) and the page's open.
+    const { signinWorkerTimeoutMs } = require('../src/config')
+    assert.equal(config.timeout, 5000 + signinWorkerTimeoutMs + client.EGRESS_OPEN_MARGIN_MS)
+    assert.ok(signinWorkerTimeoutMs >= 120000 + 120000, 'the worker budget covers its longest sign-in wait plus the sign-in itself')
+
+    // No account proxy: the global one applies, as for every worker call.
+    await client.egress(email, null, { url: '/api/v2/models', method: 'GET', timeoutMs: 1000 })
+    assert.equal(requests.at(-1).body.proxy, 'http://global:8080')
+    assert.equal(requests.at(-1).body.method, 'GET')
+
+    // A forced renewal asks the worker for a live reload; the plain one is unchanged.
+    scripted = { status: 200, body: { token: 'renewed-token', expiresAt: 1893456000, cookies } }
+    const renewed = await client.renewSession(email, null, { force: true })
+    assert.equal(renewed.token, 'renewed-token')
+    assert.deepEqual(requests.at(-1), { url: '/renew', auth: 'Bearer shared-secret', body: { email, proxy: 'http://global:8080', force: true } })
+    await client.renewSession(email, null)
+    assert.deepEqual(requests.at(-1).body, { email, proxy: 'http://global:8080' })
+
+    // Worker-side failures keep the worker's own code for the log.
+    for (const [status, code, expected] of [
+      [504, 'egress_timeout', { code: 'signin_upstream_error', status: 502, workerCode: 'egress_timeout', sessionLost: false }],
+      [502, 'page_closed', { code: 'signin_upstream_error', status: 502, workerCode: 'page_closed', sessionLost: false }],
+      [422, 'session_expired', { code: 'signin_session_lost', status: 422, workerCode: 'session_expired', sessionLost: true }]
+    ]) {
+      scripted = { status, body: { code, message: 'scripted' } }
+      await assert.rejects(client.egress(email, null, { url: '/api/v2/chats/new' }), error => {
+        for (const [key, value] of Object.entries(expected)) assert.equal(error[key], value, `${code}: ${key}`)
+        return true
+      })
+    }
+
+    // An answer that is not an egress result is the worker's fault, not an empty upstream body.
+    for (const body of [{ status: 200, body: {} }, { status: '200', body: '', cookies: [] }, { status: 200, body: '' }, { status: 200, body: '', cookies: 'jar' }]) {
+      scripted = { status: 200, body }
+      await assert.rejects(client.egress(email, null, { url: '/api/v2/chats/new' }), { code: 'signin_upstream_error', status: 502 })
+    }
+
+    // A worker that is up but has not answered yet is not "unreachable": the
+    // code is the same, the log line is not.
+    axios.post = async () => { throw Object.assign(new Error('timeout of 1ms exceeded'), { code: 'ECONNABORTED' }) }
+    await assert.rejects(client.egress(email, null, { url: '/api/v2/chats/new' }),
+      { code: 'signin_transport_error', status: 502, message: 'Signin worker did not answer in time.' })
+    axios.post = async () => { throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }) }
+    await assert.rejects(client.egress(email, null, { url: '/api/v2/chats/new' }),
+      { code: 'signin_transport_error', status: 502, message: 'Signin worker unreachable.' })
   } finally {
     restore()
   }

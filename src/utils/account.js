@@ -689,6 +689,25 @@ class Account {
     }
 
     /**
+     * A session recovered outside the refresh flow rotated the account token
+     * with it (Qwen2API-3ue.2). The record follows IN PLACE: every holder of
+     * the account object — rotation, a request already in flight — sees the
+     * live token, which is what the v2 session store now accepts.
+     * @param {string} email - 邮箱地址
+     * @param {{token: string, expiresAt: number}} session - The renewed session
+     * @returns {Promise<boolean|null>} null: no such account; false: storage refused the token
+     */
+    async adoptSessionToken(email, session) {
+        const account = this.accountTokens.find(acc => acc.email === email)
+        if (!account) return null
+        if (account.token === session.token) return true
+        account.token = session.token
+        account.expires = session.expiresAt
+        if (config.dataSaveMode === 'none') return true
+        return this.dataPersistence.saveAccount(email, { token: session.token, expires: session.expiresAt })
+    }
+
+    /**
      * 生成 Markdown 表格
      * @param {Array} websites - 网站信息数组
      * @param {string} mode - 模式 ('table' 或 'text')
