@@ -42,9 +42,11 @@
  * What it does on the network: one page load of the chat root and at most two
  * POST /api/v2/chats/new from inside the page (the second only when the first
  * got no HTTP status, nothing showed a verification and the page is still
- * responsive; never earlier than a minute after the first). This script
- * requests nothing else. Tokens and cookies are never printed: URLs are cut to
- * host and path, console text is masked and cut, secret headers by name only.
+ * responsive — or when qwen.ai answered the first but refused its session;
+ * never earlier than a minute after the first). This script requests nothing
+ * else. Tokens and cookies are never printed: URLs are cut to host and path,
+ * console text is masked and cut, secret headers by name only, the page's
+ * token by a fingerprint (length, hash, expiry).
  *
  * Dry run first, without any network: tools/egress-page-diag-stub.js serves a
  * stub chat site on the loopback interface, and --loopback-only=1 aborts every
@@ -264,6 +266,27 @@ const alive = pid => {
     }
 }
 
+/**
+ * Runs INSIDE the page: a fingerprint of the page's session token — its
+ * length, a hash and the token's own expiry — never the token. The token
+ * rotates as the page boots; when it does is part of whether the page is
+ * ready for a call.
+ */
+function pageTokenFingerprint() {
+    const token = localStorage.getItem('token')
+    if (!token) return null
+    let hash = 0x811c9dc5
+    for (let at = 0; at < token.length; at++) {
+        hash ^= token.charCodeAt(at)
+        hash = Math.imul(hash, 0x01000193) >>> 0
+    }
+    let exp = null
+    try {
+        exp = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).exp
+    } catch { /* not a JWT as the page writes it: no expiry to read */ }
+    return `${token.length}:${hash.toString(16)}:${exp}`
+}
+
 /** Chromium's own processes in this container: state and CPU ticks per type. */
 function chromiumProcesses() {
     const out = []
@@ -430,6 +453,25 @@ async function main() {
     // The same channel the worker exposes before the first navigation.
     await page.exposeFunction(egress.STREAM_CHANNEL, () => {})
 
+    // The page's token, watched from before its first load: when the page
+    // boots it rotates it, and a call made before that is refused.
+    let tokenNow
+    const tokenWatch = setInterval(async () => {
+        let seen
+        try {
+            seen = await page.evaluate(pageTokenFingerprint)
+        } catch {
+            return // mid-navigation: the next look lands on the new document
+        }
+        if (seen === tokenNow) return
+        const firstSight = tokenNow === undefined
+        tokenNow = seen
+        const [length, hash, exp] = seen ? seen.split(':') : [null, null, null]
+        const left = Number.isFinite(Number(exp)) && exp !== 'null' ? `exp in ${Math.round((Number(exp) * 1000 - Date.now()) / 1000)} s` : 'no expiry read'
+        log('token', `${firstSight ? 'the page has' : 'the page changed'} its token: ${seen ? `${length} chars, ${hash}, ${left}` : 'none'}`)
+    }, 250)
+    tokenWatch.unref?.()
+
     const tRenewStart = ms()
     let harvested
     try {
@@ -491,6 +533,9 @@ async function main() {
         // "Answered" means qwen.ai's status came back; a call the page itself
         // cut, or one the page never reported on, is not an answer.
         result.answered = Boolean(first.outcome && typeof first.outcome.status === 'number')
+        // Answered, and the answer refuses the session of the call (status 200, a JSON envelope).
+        result.sessionRefused = Boolean(first.outcome && typeof first.outcome.body === 'string' &&
+            /"code":\s*"unauthorized"/.test(first.outcome.body))
         if (first.backstop) {
             // What the worker saw: no answer at all, not even from the page's own timer.
             result.outcome = 'no answer from the page (the worker closes it here)'
@@ -593,10 +638,25 @@ async function main() {
             } else {
                 log('call-2', 'skipped: the page still answers nothing')
             }
+        } else if (first.sessionRefused) {
+            // qwen.ai answered at once but refused the session of the call:
+            // the page may not have been ready that early (24.11, the first
+            // call 0.3 s after the page opened; the same call later passed).
+            // The page is left alone for the runbook's pause, then asked once more.
+            const wait = MIN_BETWEEN_CALLS_MS - (Date.now() - T0 - first.at)
+            if (wait > 0) await sleep(wait)
+            const verification = events.findIndex(event => event.kind === 'verification' && event.t >= first.at)
+            if (verification !== -1) {
+                out.verificationAt = events[verification].t
+                log('call-2', 'skipped: the page is showing a verification (a puzzle captcha) for the first call')
+            } else {
+                out.call2 = await attempt('call-2')
+            }
         } else {
             await sleep(15000)
         }
     }
+    clearInterval(tokenWatch)
 
     out.screenshotEnd = await shot('end.png')
     out.factsEnd = await facts()
