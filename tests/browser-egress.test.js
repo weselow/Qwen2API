@@ -622,6 +622,33 @@ test('adoption is in memory first: storage that refuses the token costs a warnin
     })
 })
 
+test('the renewed session still takes the account record with it where account.js is not a file: the compiled binary', async t => {
+    // Production runs the app as a compiled Bun binary: there are no sources on
+    // disk, and a lookup of account.js by its path throws. 24.11, prod: every
+    // recovery renewed the session at the worker, was reported MODULE_NOT_FOUND,
+    // and the request was never retried.
+    const Module = require('node:module')
+    const resolveFilename = Module._resolveFilename
+    Module._resolveFilename = function (request, ...rest) {
+        if (request === './account.js') {
+            throw Object.assign(new Error("Cannot find module './account.js'"), { code: 'MODULE_NOT_FOUND' })
+        }
+        return resolveFilename.call(this, request, ...rest)
+    }
+    t.after(() => { Module._resolveFilename = resolveFilename })
+    const account = givenAccount()
+    accountManager.accountTokens = [account]
+    const renewed = harvested('renewed')
+    const replies = [unauthorized(), egress(chat('chat-after-reload'))]
+    worker.script.egress = () => replies.shift()
+    worker.script.renew = () => ok(renewed)
+
+    assert.equal(await generateChatID(account.token, MODEL, account), 'chat-after-reload', 'the recovery must not be what the request fails on')
+    assert.equal(account.token, renewed.token)
+    assert.equal(worker.count('/renew'), 1)
+    assert.ok(!logs.some(args => args[1] === 'V2SESSION' && /续期失败/.test(String(args[0]))), 'the renewal is not reported as failed')
+})
+
 test('a generation that began on the refused token continues on the renewed one', async () => {
     const account = givenAccount()
     const renewed = harvested('renewed')
