@@ -206,7 +206,10 @@ async function renew(email, account, reason, refused) {
     try {
         let harvested
         let relogged = false
-        if (reloginNeeded.has(email) && reloginAllowed(email)) {
+        // An account waiting for its next sign-in gets it — unless what was
+        // refused is a WAF challenge: that is not a verdict on the session,
+        // and never earns a password (whatever state the account is in).
+        if (reason !== WAF_CHALLENGE && reloginNeeded.has(email) && reloginAllowed(email)) {
             harvested = await relogin(email, account)
             relogged = Boolean(harvested)
         } else {
