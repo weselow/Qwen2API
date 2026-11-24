@@ -533,7 +533,9 @@ test('a streaming /egress relays the answer as it arrives: the head, every chunk
   assert.equal(text(await opened.next()), 'data: [DONE]\n\n')
   assert.deepEqual(await opened.next(), { type: 'end', cookies: [cookie('cna', 'live')] })
   assert.equal((await opened.next()).type, 'eof')
-  assert.deepEqual(await health(), { ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16 })
+  assert.deepEqual(await health(), {
+    ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell'
+  })
 })
 
 test('the stream flag is validated, and off it is the whole-answer call', async t => {

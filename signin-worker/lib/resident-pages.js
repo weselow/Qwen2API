@@ -38,6 +38,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
  * @param {(email: string) => string} options.profileDir email -> userDataDir
  * @param {(email: string, harvested: object, proxy: ?string) => void} options.onHarvest a lazy open rotated the session
  * @param {(email: string, cookies: object[]) => void} options.onCookies the live jar, after a fetch or a keep-alive poll
+ * @param {string} [options.headlessMode] which headless browser opens a page (lib/browser-identity.js)
  * @param {number} [options.maxStreamBytes] - Cap on a streamed body. 0, the default, is none
  */
 function createResidents({
@@ -45,6 +46,7 @@ function createResidents({
     profileDir,
     chatOrigin = 'https://chat.qwen.ai',
     headless = true,
+    headlessMode = 'shell',
     openTimeoutMs = 120000,
     maxPages = 16,
     keepAliveMs = 5 * 60 * 1000,
@@ -211,7 +213,7 @@ function createResidents({
         }
         pages.set(email, entry)
         try {
-            entry.context = await signer.openContext({ dataDir: profileDir(email), proxy, headless })
+            entry.context = await signer.openContext({ dataDir: profileDir(email), proxy, headless, headlessMode })
             // Dropped while the browser was launching: never bring the page
             // back from under that.
             if (pages.get(email) !== entry) {

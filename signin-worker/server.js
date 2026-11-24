@@ -6,7 +6,7 @@
  *
  *   POST /session {email, password, proxy?, force?} -> {token, expiresAt, cookies[]}
  *   POST /renew   {email, proxy?, force?}   -> {token, expiresAt, cookies[]}
- *   GET  /health                             -> {ok, sessions, residentPages}
+ *   GET  /health                             -> {ok, sessions, residentPages, headlessMode}
  *
  * One persistent context (userDataDir) per account on the SIGNIN_DATA_DIR
  * volume: auth cookies survive restarts and renewal is a silent reload.
@@ -44,6 +44,7 @@ const { WorkerError, STATUS_FOR_CODE } = require('./lib/worker-errors')
 const { normalizeEgress } = require('./lib/egress-fetch')
 const { createResidents } = require('./lib/resident-pages')
 const { createLoginPacer } = require('./lib/login-pacer')
+const { parseHeadlessMode } = require('./lib/browser-identity')
 
 const envInt = (name, fallback) => {
     const raw = parseInt(process.env[name], 10)
@@ -86,6 +87,10 @@ function createServer(overrides = {}) {
         port: overrides.port ?? envInt('PORT', 3100),
         dataDir: overrides.dataDir || process.env.SIGNIN_DATA_DIR || path.join(__dirname, 'profiles'),
         headless: overrides.headless ?? process.env.SIGNIN_HEADLESS !== 'false',
+        // Which headless browser that is (Qwen2API-3ue.4): the shell, or the
+        // full Chromium presenting as one with a window. Nothing when headed.
+        // Strict: createServer throws on a value it does not know.
+        headlessMode: overrides.headlessMode ?? parseHeadlessMode(process.env.SIGNIN_HEADLESS_MODE),
         chatOrigin: overrides.chatOrigin || process.env.SIGNIN_CHAT_ORIGIN || 'https://chat.qwen.ai',
         timeoutMs: overrides.timeoutMs ?? envInt('SIGNIN_TIMEOUT_MS', 120000),
         renewFraction: overrides.renewFraction ?? 0.6,
@@ -148,7 +153,9 @@ function createServer(overrides = {}) {
     }
 
     async function withBrowser(email, proxy, operation) {
-        const context = await signer.openContext({ dataDir: profileDir(email), proxy, headless: config.headless })
+        const context = await signer.openContext({
+            dataDir: profileDir(email), proxy, headless: config.headless, headlessMode: config.headlessMode
+        })
         try {
             return await operation(context)
         } finally {
@@ -205,6 +212,7 @@ function createServer(overrides = {}) {
         profileDir,
         chatOrigin: config.chatOrigin,
         headless: config.headless,
+        headlessMode: config.headlessMode,
         openTimeoutMs: config.timeoutMs,
         maxPages: config.maxPages,
         keepAliveMs: config.keepAliveMs,
@@ -529,7 +537,12 @@ function createServer(overrides = {}) {
 
     async function handle(req, res) {
         if (req.method === 'GET' && req.url === '/health') {
-            return send(res, 200, { ok: true, sessions: sessions.size, ...residents.stats() })
+            // The headless mode is here to be checked after a flip, before the
+            // first request that depends on it.
+            return send(res, 200, {
+                ok: true, sessions: sessions.size, ...residents.stats(),
+                headless: config.headless, headlessMode: config.headless ? config.headlessMode : null
+            })
         }
         if ((req.method === 'POST' && req.url === '/session') || (req.method === 'POST' && req.url === '/renew')) {
             if (!authorized(req)) throw new WorkerError('unauthorized', 'Invalid worker token.')
@@ -580,7 +593,9 @@ module.exports = { createServer, WorkerError, shutdownHandler, relayWriter }
 if (require.main === module) {
     const server = createServer()
     server.listen(server.workerConfig.port, () => {
-        console.log(`${new Date().toISOString()} signin-worker listening on :${server.workerConfig.port}`)
+        const { headless, headlessMode } = server.workerConfig
+        console.log(`${new Date().toISOString()} signin-worker listening on :${server.workerConfig.port}` +
+            ` (browser: ${headless ? `headless ${headlessMode}` : 'headed'})`)
     })
     const stop = shutdownHandler(server)
     process.on('SIGTERM', () => stop('SIGTERM'))

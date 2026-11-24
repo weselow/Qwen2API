@@ -63,6 +63,10 @@ services:
     environment:
       - SIGNIN_WORKER_TOKEN=${SIGNIN_WORKER_TOKEN:-}
       - SIGNIN_HEADLESS=${SIGNIN_HEADLESS:-true}
+      # Which headless browser: the shell, as before, or the full Chromium
+      # presenting as one with a window (docs/browser-egress-design.md,
+      # "HeadlessChrome"). The latter takes about twice the memory.
+      - SIGNIN_HEADLESS_MODE=${SIGNIN_HEADLESS_MODE:-shell}
       # Resident pages for browser egress (docs/browser-egress-design.md).
       # ~200-300 MB of Chromium each: keep the cap above the number of
       # accounts that generate at the same time.

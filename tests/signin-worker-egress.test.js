@@ -218,7 +218,9 @@ test('egress opens a resident page on first use and runs the call as an in-page 
   assert.equal(signer.calls.filter(call => call.op === 'renew').length, 1)
   assert.equal(context.page.evaluations.length, 2)
 
-  assert.deepEqual(await health(), { ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16 })
+  assert.deepEqual(await health(), {
+    ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell'
+  })
 
   // Opening the page IS a renewal: the session cache holds what it settled on.
   const cached = await (await post('/renew', { email })).json()
@@ -650,7 +652,9 @@ test('an explicit invalidation (/renew with force) is answered live although the
   assert.equal(renews(), 2)
   // On the resident page: no second launch on the locked profile.
   assert.equal(signer.calls.filter(call => call.op === 'open').length, 1)
-  assert.deepEqual(await health(), { ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16 })
+  assert.deepEqual(await health(), {
+    ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell'
+  })
 
   // Another explicit invalidation is another reload; an explicit false is a plain renew.
   assert.equal((await (await post('/renew', { email, force: true })).json()).token, 'token-renew-3')

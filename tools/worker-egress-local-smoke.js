@@ -4,7 +4,9 @@
 /**
  * Local end-to-end smoke for the signin worker's resident egress
  * (Qwen2API-3ue.1): the REAL worker, the REAL browser-signin and a REAL
- * headless Chromium — against a stand-in for chat.qwen.ai on 127.0.0.1.
+ * headless Chromium — against a stand-in for chat.qwen.ai on 127.0.0.1. The
+ * headless mode `chrome` (Qwen2API-3ue.4) runs here too: what the stand-in
+ * sees of the full Chromium against what it saw of the shell.
  *
  * qwen.ai is never contacted: run this freely, it is not a live probe. Use it
  * after touching the worker's browser paths: signin-worker/server.js (the
@@ -49,7 +51,11 @@ function startStandIn() {
     const server = http.createServer((req, res) => {
         if (req.url === '/' && req.method === 'GET') {
             pageLoads++
-            res.writeHead(200, { 'content-type': 'text/html', 'set-cookie': 'standin=1; Path=/' })
+            res.writeHead(200, {
+                'content-type': 'text/html', 'set-cookie': 'standin=1; Path=/',
+                // So that the calls the page makes carry the hints a guard can ask for.
+                'accept-ch': 'Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List'
+            })
             return res.end(`<html><body>stand-in<script>localStorage.setItem('token', '${
                 tokenExpiringIn(3600)}')</script></body></html>`)
         }
@@ -84,7 +90,10 @@ function startStandIn() {
                     cookie: req.headers.cookie || null,
                     authorization: req.headers.authorization || null,
                     requestId: req.headers['x-request-id'] || null,
-                    userAgent: req.headers['user-agent'] || null
+                    userAgent: req.headers['user-agent'] || null,
+                    secChUa: req.headers['sec-ch-ua'] || null,
+                    platformVersion: req.headers['sec-ch-ua-platform-version'] ?? null,
+                    fullVersionList: req.headers['sec-ch-ua-full-version-list'] ?? null
                 }))
             })
         }
@@ -228,6 +237,12 @@ async function main() {
         const echo = JSON.parse(first.body.body)
         console.log(`ok lazy open + in-page fetch: ${Date.now() - started} ms, ${standIn.pageLoads()} page load(s)`)
         console.log(`   upstream saw User-Agent: ${echo.userAgent}`)
+        // What the headless shell says about itself — and what the chrome mode
+        // further down has to change, and only that.
+        assert.match(echo.userAgent, /HeadlessChrome\/[\d.]+/)
+        assert.match(echo.secChUa || '', /"HeadlessChrome"/)
+        assert.match(echo.fullVersionList || '', /"HeadlessChrome"/)
+        const shell = { userAgent: echo.userAgent, hints: echo.secChUa, platformVersion: echo.platformVersion }
 
         assert.equal(echo.method, 'POST')
         assert.equal(echo.body, '{"hello":"world"}')
@@ -419,6 +434,64 @@ async function main() {
             await fresh.workerShutdown()
             await new Promise(resolve => fresh.close(resolve))
             fs.rmSync(freshDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 })
+        }
+
+        // The headless mode `chrome` (Qwen2API-3ue.4, lib/browser-identity.js):
+        // the full Chromium, presenting as a browser with a window. On the
+        // profile the shell wrote at the start of this run — what it started,
+        // the full Chromium must resume — and on a worker that has not been
+        // told anything else. The stand-in shows what reached it.
+        const presented = createServer({
+            dataDir, token: 'secret', chatOrigin: standIn.origin, headlessMode: 'chrome', keepAliveMs: 200
+        })
+        await new Promise(resolve => presented.listen(0, '127.0.0.1', resolve))
+        const presentedUrl = `http://127.0.0.1:${presented.address().port}`
+        const onPresented = (route, payload) => call(route, payload, presentedUrl)
+        try {
+            // The first call pays for the browser, the identity read and the page load.
+            const chromeStarted = Date.now()
+            const asChrome = await onPresented('/egress', {
+                email, url: '/api/echo', method: 'POST', headers: { 'content-type': 'application/json' }, timeoutMs: 30000
+            })
+            assert.equal(asChrome.status, 200, JSON.stringify(asChrome.body))
+            const seen = JSON.parse(asChrome.body.body)
+            const state = await (await fetch(`${presentedUrl}/health`)).json()
+            assert.equal(state.headlessMode, 'chrome')
+            assert.equal(state.residentPages, 1)
+            console.log(`ok chrome mode: resident page up in ${Date.now() - chromeStarted} ms; health says ${JSON.stringify(
+                { residentPages: state.residentPages, headless: state.headless, headlessMode: state.headlessMode })}`)
+            console.log(`   upstream saw User-Agent: ${seen.userAgent}`)
+            console.log(`   upstream saw sec-ch-ua: ${seen.secChUa}`)
+
+            // The profile the shell wrote is the one this browser resumed.
+            assert.match(seen.cookie || '', /(^|;\s*)standin=1/)
+            // One word of the User-Agent changed: the same string, as the full
+            // Chromium reports it (the version reduced), with "Headless" gone.
+            const major = /HeadlessChrome\/(\d+)/.exec(shell.userAgent)?.[1]
+            assert.ok(major, shell.userAgent)
+            assert.equal(seen.userAgent,
+                shell.userAgent.replace(/HeadlessChrome\/[\d.]+/, `Chrome/${major}.0.0.0`))
+            assert.doesNotMatch(seen.userAgent, /headless/i)
+            // ...and the hints are the browser's own, not a made-up set: the
+            // full Chromium's brands, and the platform version the shell reports.
+            assert.doesNotMatch(seen.secChUa || '', /headless/i)
+            assert.match(seen.secChUa || '', new RegExp(`"Chromium";v="${major}"`))
+            assert.doesNotMatch(seen.fullVersionList || '', /headless/i)
+            assert.equal(seen.platformVersion, shell.platformVersion)
+
+            // A reload (a live renewal) is a navigation: the identity must survive it.
+            const reloaded = await onPresented('/renew', { email, force: true })
+            assert.equal(reloaded.status, 200, JSON.stringify(reloaded.body))
+            const afterReload = await onPresented('/egress', {
+                email, url: '/api/echo', method: 'POST', headers: { 'content-type': 'application/json' }
+            })
+            assert.equal(afterReload.status, 200, JSON.stringify(afterReload.body))
+            assert.equal(JSON.parse(afterReload.body.body).userAgent, seen.userAgent)
+            console.log('ok chrome mode: the profile the shell wrote is resumed, "Headless" is gone from the User-Agent' +
+                ' and from the hints, the hints are the browser\'s own, and a reload keeps it so')
+        } finally {
+            await presented.workerShutdown()
+            await new Promise(resolve => presented.close(resolve))
         }
 
         console.log('SMOKE OK — real worker, real Chromium, stand-in origin; qwen.ai was not contacted')
