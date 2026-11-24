@@ -26,7 +26,7 @@
 | Переменная | Назначение |
 | --- | --- |
 | `V2_SESSION_MODE` | `browser` (дефолт этого Compose) — сессии из sidecar; `off` — v1-путь |
-| `COMPLETIONS_TRANSPORT` | `auto` (дефолт): impersonate, если бинаррь есть, иначе axios; `axios` — принудительно v1-транспорт |
+| `COMPLETIONS_TRANSPORT` | `auto` (дефолт): impersonate, если бинаррь есть, иначе axios; `axios` — принудительно v1-транспорт; `browser` — completions стримятся из резидентной страницы signin-worker (Qwen2API-3ue.3, `docs/browser-egress-design.md`); включать только явно, после `CHAT_CREATION_TRANSPORT=browser` |
 | `CHAT_CREATION_TRANSPORT` | `direct` (дефолт Compose, Qwen2API-3ue.2): `chats/new` из Node, как раньше. `browser` — изнутри резидентной страницы воркера (`/egress`); включать явно, одной пробой. Подробности и откат — `docs/browser-egress-design.md` |
 | `SIGNIN_WORKER_TOKEN` | Общий bearer приложение → воркер; пусто = без авторизации (только внутренняя сеть) |
 | `SIGNIN_PROFILES_DIR` | Каталог профилей Chromium; по умолчанию named volume `signin_profiles` |

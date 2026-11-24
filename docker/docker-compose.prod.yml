@@ -28,6 +28,8 @@ services:
       - CACHE_MODE=${CACHE_MODE:-file}
       # v2 session pipeline: browser sessions come from the sidecar,
       # completions ride curl-impersonate (auto = binary from the image).
+      # browser = completions streamed from the worker's resident page
+      # (Qwen2API-3ue.3): switched on explicitly, never by auto.
       # Rollback to the v1 path: set V2_SESSION_MODE=off and
       # COMPLETIONS_TRANSPORT=axios, redeploy; nothing else changes.
       - V2_SESSION_MODE=${V2_SESSION_MODE:-browser}
@@ -67,6 +69,8 @@ services:
       - MAX_RESIDENT_PAGES=${MAX_RESIDENT_PAGES:-16}
       - RESIDENT_KEEPALIVE_MS=${RESIDENT_KEEPALIVE_MS:-300000}
       - SIGNIN_EGRESS_MAX_TIMEOUT_MS=${SIGNIN_EGRESS_MAX_TIMEOUT_MS:-600000}
+      # 0 = no cap: a streamed answer is relayed, not buffered.
+      - SIGNIN_EGRESS_MAX_STREAM_BYTES=${SIGNIN_EGRESS_MAX_STREAM_BYTES:-0}
       # Full logins go one at a time, this far apart (+ up to the same again
       # as jitter): batched sign-ins from one IP feed the Baxia score.
       - SIGNIN_LOGIN_MIN_INTERVAL_MS=${SIGNIN_LOGIN_MIN_INTERVAL_MS:-30000}
