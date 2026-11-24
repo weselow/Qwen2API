@@ -121,7 +121,7 @@ async function start(t, options) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwen-signin-egress-'))
   const server = createServer({
     dataDir, token: 'secret', timeoutMs: 120000, maxPages: 16,
-    minRenewDelayMs: 60000, keepAliveMs: 60000, drainMs: 1000, backstopMs: 5000, frontEndMs: 100,
+    minRenewDelayMs: 60000, keepAliveMs: 60000, drainMs: 1000, backstopMs: 5000, frontEndMs: 100, settleStableMs: 40, settlePollMs: 10, settleTimeoutMs: 300,
     // Login pacing is signin-worker-pacing.test.js's subject.
     minLoginIntervalMs: 1,
     ...options
@@ -753,6 +753,87 @@ test('the front end is read for a log line only: a page that cannot be asked sti
   assert.equal((await health()).residentPages, 1)
 })
 
+test('a page is not handed to a call until its token has stopped changing', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, settleStableMs: 60, settlePollMs: 10 })
+  const email = 'settling@example.invalid'
+  withProfile(dataDir, email)
+  // The page's token as a real one boots (24.11, prod): the old one, then
+  // one for 30 days, then one for 15 minutes — within about a second.
+  signer.script.pageToken = 'old'
+  const started = Date.now()
+  const changes = [[20, 'for-30-days'], [40, 'for-15-minutes']]
+    .map(([ms, token]) => setTimeout(() => { signer.script.pageToken = token }, ms))
+  t.after(() => { for (const timer of changes) clearTimeout(timer) })
+  const sent = []
+  signer.script.fetch = async (url, init) => {
+    sent.push({ at: Date.now() - started, authorization: init.headers.authorization })
+    return jsonResponse({ success: true })
+  }
+
+  const answer = await (await egress(post, email)).json()
+  assert.equal(answer.status, 200)
+  assert.equal(sent.length, 1)
+  // The call went out on the token the page settled on, not before.
+  assert.equal(sent[0].authorization, 'Bearer for-15-minutes')
+  assert.ok(sent[0].at >= 40 + 60, `the call went out ${sent[0].at} ms after the page began to open`)
+  // And what the renewal harvested is untouched by the wait: the first stable token, as before.
+  assert.equal((await (await post('/renew', { email })).json()).token, 'token-renew-1')
+})
+
+test('a page that has just been reloaded is not handed to a call before its token has settled either', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  // minCacheSeconds forces the live path on /renew.
+  const { post, dataDir } = await start(t, { signer, minCacheSeconds: 7200, settleStableMs: 60, settlePollMs: 10 })
+  const email = 'reloaded-settle@example.invalid'
+  withProfile(dataDir, email)
+  signer.script.pageToken = 'before'
+  await (await egress(post, email)).json()
+  let tokenChanges
+  signer.script.renew = async () => {
+    signer.script.pageToken = 'reloaded-1'
+    tokenChanges = setTimeout(() => { signer.script.pageToken = 'reloaded-2' }, 30)
+    return { token: 'token-renew-2', exp: Math.floor(Date.now() / 1000) + 3600, cookies: [] }
+  }
+  const sent = []
+  signer.script.fetch = async (url, init) => {
+    sent.push(init.headers.authorization)
+    return jsonResponse({ success: true })
+  }
+
+  // A reload (what the app asks for on a refused session), then the app's retry.
+  const since = Date.now()
+  const renewed = await post('/renew', { email, force: true })
+  assert.equal(renewed.status, 200)
+  assert.ok(Date.now() - since >= 30 + 60, `/renew answered ${Date.now() - since} ms after it was asked: before the token settled`)
+  clearTimeout(tokenChanges)
+  assert.equal((await (await egress(post, email)).json()).status, 200)
+  // The retry after the reload went out on the token the reloaded page settled on.
+  assert.deepEqual(sent, ['Bearer reloaded-2'])
+})
+
+test('a page that cannot be asked, or does not answer, holds nothing up', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, settleStableMs: 60, settlePollMs: 10, settleTimeoutMs: 300 })
+  const email = 'unasked-settle@example.invalid'
+  withProfile(dataDir, email)
+
+  // No token to read: not waited for.
+  signer.script.pageToken = undefined
+  const since = Date.now()
+  assert.equal((await (await egress(post, email)).json()).status, 200)
+  assert.ok(Date.now() - since < 250, `a page without a token took ${Date.now() - since} ms`)
+
+  // A page that answers nothing at all: the wait ends with its budget (not
+  // never), the call then meets the backstop, and the page is dropped as before.
+  const hungSince = Date.now()
+  signer.script.evaluate = () => new Promise(() => {})
+  const hung = await post('/egress', { email, url: `${CHAT}/api/v2/chats/new`, method: 'POST', body: '{"x":1}', timeoutMs: 200 })
+  assert.equal(hung.status, 504)
+  // The backstop alone is timeoutMs + 5 s; the waits at the opening added no more than their 300 ms.
+  assert.ok(Date.now() - hungSince < 200 + 5000 + 300 + 1500, `a page that answers nothing took ${Date.now() - hungSince} ms`)
+})
+
 test('a stalled upstream is aborted inside the page and the page stays usable', async t => {
   const signer = fakeBrowser()
   const { post, health, dataDir } = await start(t, { signer })
@@ -856,11 +937,11 @@ test('a crashed or closed page is dropped and reopened on the next call', async 
   assert.equal(live.closed, false)
 
   // A call in flight when its page dies ends as page_closed, not as a hang.
-  // (That page's evaluations: the front end's version at its opening, the
-  // call above, and the one in flight.)
+  // (Of that page's evaluations, the calls are the ones given a request:
+  // the call above, and the one in flight.)
   signer.script.fetch = () => new Promise(() => {})
   const inflight = egress(post, email, { timeoutMs: 60000 })
-  await until(() => live.page.evaluations.length === 3)
+  await until(() => live.page.evaluations.filter(arg => arg?.url).length === 2)
   live.page.emit('crash')
   const failed = await inflight
   assert.equal(failed.status, 502)

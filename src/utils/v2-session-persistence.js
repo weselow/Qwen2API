@@ -151,10 +151,12 @@ async function publishSession(email, session) {
 /**
  * The account record follows a session that rotated the token. Only a manager
  * that is already loaded can follow: this module must not be what pulls
- * account.js (and its timers) in.
+ * account.js (and its timers) in. The manager says of itself where it loads
+ * (account-registry.js): a lookup of account.js by its path on disk does not
+ * work in the compiled binary the app runs as in production.
  */
 async function adoptToken(email, session) {
-    const manager = require.cache[require.resolve('./account.js')]?.exports
+    const manager = require('./account-registry').manager
     const saved = manager ? await manager.adoptSessionToken(email, session) : null
     if (saved === false) {
         logger.warn(`v2 会话 токен принят в памяти, но не сохранён (${email})——после рестарта нужен повторный вход`, 'V2SESSION')
