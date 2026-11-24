@@ -24,7 +24,8 @@ const sessionPersistence = require('../src/utils/v2-session-persistence')
 const accountManager = require('../src/utils/account')
 const browserEgress = require('../src/utils/browser-egress')
 const { generateChatID, sendChatRequest } = require('../src/utils/request')
-const { ChatCreationError } = require('../src/utils/upstream-error')
+const { ChatCreationError, isWafChallengeError } = require('../src/utils/upstream-error')
+const { consumeSSEStream } = require('../src/utils/sse')
 const { logger } = require('../src/utils/logger')
 
 const EMAIL = 'egress@example.invalid'
@@ -54,7 +55,8 @@ async function until(condition, timeoutMs = 5000) {
 
 // A loopback stand-in for the signin worker: scripted answers per route and a
 // record of everything the app sent. Nothing here knows about qwen.ai, and a
-// script may return a promise to hold an answer back.
+// script may return a promise to hold an answer back — or a function, which
+// takes the response over (what the streaming /egress needs: relay()).
 function standInWorker() {
     const calls = []
     const script = {}
@@ -71,6 +73,7 @@ function standInWorker() {
             Promise.resolve().then(answer)
                 .then(reply => reply || Promise.reject(new Error(`nothing scripted for ${route}`)))
                 .then(reply => {
+                    if (typeof reply === 'function') return reply(res, req)
                     res.writeHead(reply.status, { 'content-type': 'application/json' })
                     res.end(JSON.stringify(reply.body))
                 }, error => {
@@ -87,7 +90,12 @@ function standInWorker() {
         listen: () => new Promise(resolve => server.listen(0, '127.0.0.1', () => {
             resolve(`http://127.0.0.1:${server.address().port}`)
         })),
-        close: () => new Promise(resolve => server.close(resolve))
+        // A relay the app never hung up on must not hold the teardown — nor a
+        // runtime whose close callback never comes.
+        close: () => Promise.race([
+            new Promise(resolve => server.close(resolve)),
+            new Promise(resolve => setTimeout(resolve, 2000))
+        ]).then(() => { server.closeAllConnections?.() })
     }
 }
 
@@ -105,6 +113,9 @@ const harvested = (label, cookies = [cookie('cna', `from-${label}`)]) =>
     ({ token: tokenWith(label), expiresAt: EXPIRES_AT, cookies })
 const unauthorized = () => egress({ success: false, data: { code: 'unauthorized', details: SECRET } })
 const refusedDirect = async () => ({ status: 200, data: { success: false, code: 'unauthorized' }, headers: {} })
+
+// The send settings as the process was configured; a test may quicken the retry.
+const SENT = { chatRetryCount: config.chatRetryCount, chatRetryBackoffMs: config.chatRetryBackoffMs }
 
 // The worker's routes, wherever the client is pointed; anything else is qwen.ai.
 const isWorkerCall = url => /^\/(egress|renew|session)$/.test(new URL(url).pathname)
@@ -204,11 +215,14 @@ test.beforeEach(async () => {
     store.clearSessions()
     accountManager.accountTokens.length = 0
     config.chatCreationTransport = 'auto'
+    config.completionsTransport = 'auto'
+    Object.assign(config, SENT)
     config.signinWorkerConfigured = true
     config.sessionRecoveryMinIntervalMs = 0
     config.sessionReloginMinIntervalMs = 0
     sessionPersistence.resetRecoveryForTests()
     sessionPersistence.setRecoveryClockForTests(null)
+    browserEgress.setTimingForTests()
 })
 
 /* ------------------------------------------------------------------ config -- */
@@ -248,6 +262,28 @@ test('a forced browser transport on another session mode is refused at startup',
         }
         process.env.V2_SESSION_MODE = 'browser'
         assert.equal(fresh().chatCreationTransport, 'direct')
+    } finally {
+        for (const key of keys) {
+            if (saved[key] === undefined) delete process.env[key]
+            else process.env[key] = saved[key]
+        }
+        delete require.cache[require.resolve('../src/config')]
+    }
+})
+
+test('a forced browser completions transport on another session mode is refused at startup too', () => {
+    const keys = ['COMPLETIONS_TRANSPORT', 'V2_SESSION_MODE']
+    const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]))
+    const fresh = () => {
+        delete require.cache[require.resolve('../src/config')]
+        return require('../src/config')
+    }
+    try {
+        process.env.V2_SESSION_MODE = 'off'
+        process.env.COMPLETIONS_TRANSPORT = 'browser'
+        assert.throws(fresh, /COMPLETIONS_TRANSPORT=browser requires V2_SESSION_MODE=browser/)
+        process.env.V2_SESSION_MODE = 'browser'
+        assert.equal(fresh().completionsTransport, 'browser')
     } finally {
         for (const key of keys) {
             if (saved[key] === undefined) delete process.env[key]
@@ -1066,4 +1102,538 @@ test('a WAF challenge on the direct path is not a verdict on the session: nothin
     await assert.rejects(generateChatID(account.token, MODEL, account), { code: 'upstream_waf_challenge' })
     assert.equal(current(), session, 'the challenge is the IP\'s or the request\'s doing, not the session\'s')
     assert.equal(worker.calls.length, 0, 'and it costs neither a reload nor a password')
+})
+
+/* --------------------------------- completions through the egress (Qwen2API-3ue.3) -- */
+
+// The worker's streaming /egress as the app sees it: the test writes the
+// relay's events (they wait for the app to open the relay), and learns when
+// the app hung up — which is the app's whole way of saying "stop".
+function relay() {
+    const waiting = []
+    let response = null
+    let finishing = false
+    let hangUp
+    const hungUp = new Promise(resolve => { hangUp = resolve })
+    const send = event => {
+        if (response) response.write(`${JSON.stringify(event)}\n`)
+        else waiting.push(event)
+    }
+    // The worker ends its answer with the stream's last event.
+    const finish = event => {
+        send(event)
+        if (response) response.end()
+        else finishing = true
+    }
+    return {
+        // What the worker does with /egress {stream: true}: it owns the answer.
+        open: (res, req) => {
+            response = res
+            res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+            // The connection going is what the worker watches too: a
+            // server-side response does not emit 'close' under Bun, its socket does.
+            const gone = () => hangUp(res.writableEnded)
+            res.on('close', gone)
+            req?.socket?.on('close', gone)
+            for (const event of waiting.splice(0)) res.write(`${JSON.stringify(event)}\n`)
+            if (finishing) res.end()
+        },
+        // qwen.ai's answer head: its status and headers, the jar as of then.
+        head: (status = 200, headers = { 'content-type': SSE }, cookies = []) =>
+            send({ type: 'head', status, url: `${COMPLETIONS}chat-1`, redirected: false, headers, cookies }),
+        chunk: data => send({ type: 'chunk', data: Buffer.from(data).toString('base64') }),
+        end: (cookies = []) => finish({ type: 'end', cookies }),
+        fail: code => finish({ type: 'error', code, message: `In-page fetch failed (${code}).` }),
+        // Resolves once the app closed its side of the relay, with whether the
+        // answer had ended by then. It is the server seeing the connection
+        // go — which a stand-in hosted by Bun does not report (Bun 1.3.11): the
+        // worker is a Node process in production, and the gate runs this file
+        // on Node.
+        hungUp
+    }
+}
+
+const SSE = 'text/event-stream'
+const frame = delta => `data: ${JSON.stringify({ id: 'c', object: 'chat.completion.chunk', choices: [{ index: 0, delta }] })}\n\n`
+const DONE = 'data: [DONE]\n\n'
+// An answer that starts well: the head with the jar, then a first frame.
+const answering = () => {
+    const stream = relay()
+    stream.head(200, undefined, [cookie('cna', 'from-head')])
+    stream.chunk(frame({ content: 'по' }))
+    return stream
+}
+// An answer that refuses the session as an HTTP status, body and all.
+const refusing = () => {
+    const stream = relay()
+    stream.head(401, { 'content-type': 'application/json' })
+    stream.chunk(`{"code":"unauthorized","details":"${SECRET}"}`)
+    stream.end()
+    return stream
+}
+// The request's chats/new as always, and one relay per completions call, in order.
+const scripted = (...streams) => {
+    worker.script.egress = body => {
+        if (body.stream !== true) return egress(chat('chat-1'))
+        assert.ok(streams.length, 'more completions calls than the script has relays for')
+        return streams.shift().open
+    }
+}
+// The completions calls the app made, in order.
+const completionsCalls = () => worker.sent('/egress').filter(body => body.stream === true)
+// What the request charged the account with while `fn` ran — instead of
+// charging the test's account manager.
+async function charging(fn) {
+    const charged = []
+    const real = Object.fromEntries(BOOKKEEPING.map(name => [name, accountManager[name]]))
+    for (const name of BOOKKEEPING) accountManager[name] = (...args) => { charged.push([name, ...args]) }
+    try {
+        return { value: await fn(), charged }
+    } finally {
+        for (const name of BOOKKEEPING) accountManager[name] = real[name]
+    }
+}
+const BOOKKEEPING = ['recordAccountFailure', 'recordAccountError', 'recordAccountQuotaExhausted']
+// The send settings a client's retry works with: one more try, right away.
+const QUICK_RETRY = { count: 1, backoffMs: 0 }
+const UNCLASSIFIED_503 = { rateLimited: false, overloaded: false, status: 503, retryAfter: null }
+const UNCLASSIFIED_502 = { rateLimited: false, overloaded: false, status: 502, retryAfter: null }
+
+test('COMPLETIONS_TRANSPORT=browser sends the call from the page and hands the answer on in the caller’s shape', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    const stream = answering()
+    scripted(stream)
+
+    const result = await sendChatRequest(BODY, { currentAccount: account })
+    assert.equal(result.status, true)
+    assert.deepEqual(direct, [], 'no axios call reaches qwen.ai')
+    const [creation, completions] = worker.sent('/egress')
+    assert.equal(creation.stream, undefined, 'chats/new is the whole-answer call it was')
+    assert.equal(worker.calls[1].auth, 'Bearer shared-secret')
+    // What left the page: the v2.1 body the direct path builds, on the
+    // session's token, with the headers chats/new sends.
+    assert.equal(completions.email, EMAIL)
+    assert.equal(completions.url, `${COMPLETIONS}chat-1`)
+    assert.equal(completions.method, 'POST')
+    assert.equal(completions.stream, true)
+    assert.equal(completions.proxy, null)
+    assert.equal(completions.timeoutMs, browserEgress.COMPLETIONS_TIMEOUT_MS)
+    assert.deepEqual(Object.keys(completions.headers).sort(), ['authorization', 'content-type', 'x-request-id'])
+    assert.equal(completions.headers.authorization, `Bearer ${account.token}`)
+    assert.deepEqual(JSON.parse(completions.body), {
+        model: MODEL, max_tokens: 64, stream: true, chat_id: 'chat-1', chatId: 'chat-1', parent_id: null, parentId: null,
+        messages: [{ role: 'user', content: 'hello', parent_id: null, parentId: null }]
+    })
+
+    assert.equal(result.chatId, 'chat-1')
+    // What the controllers get from either direct transport: a stream of the
+    // body, the first frame already in it.
+    assert.ok(result.response instanceof Readable)
+    // The jar as of the head is in the session already.
+    assert.equal(jarPairs(COMPLETIONS).cna, 'from-head')
+
+    // The rest comes through as it arrives: frame by frame, not once it is all in.
+    const events = result.response[Symbol.asyncIterator]()
+    assert.equal((await events.next()).value.toString('utf8'), frame({ content: 'по' }))
+    stream.chunk(frame({ content: 'нг' }))
+    assert.equal((await events.next()).value.toString('utf8'), frame({ content: 'нг' }))
+    stream.chunk(DONE)
+    stream.end([cookie('ssxmod_itna', 'from-end')])
+    assert.equal((await events.next()).value.toString('utf8'), DONE)
+    assert.equal((await events.next()).done, true)
+    assert.equal(jarPairs(COMPLETIONS).ssxmod_itna, 'from-end')
+    assert.deepEqual(worker.routes(), ['/egress', '/egress'])
+    assert.deepEqual(logs, [])
+})
+
+test('the transport answers in the shape axios and the impersonating transport use', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    const stream = answering()
+    scripted(stream)
+
+    const response = await browserEgress.postCompletions({
+        account, url: `${COMPLETIONS}chat-1`, body: '{"stream":true}', token: account.token
+    })
+    assert.equal(response.status, 200)
+    assert.equal(response.statusText, 'OK')
+    assert.equal(response.headers['content-type'], SSE)
+    assert.ok(response.data instanceof Readable)
+    const events = response.data[Symbol.asyncIterator]()
+    assert.equal((await events.next()).value.toString('utf8'), frame({ content: 'по' }))
+    stream.end()
+    assert.equal((await events.next()).done, true)
+    assert.deepEqual(worker.routes(), ['/egress'])
+})
+
+test('the relayed answer parses downstream exactly as a direct one does', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    const stream = relay()
+    stream.head()
+    // A frame cut inside a two-byte character: the relay carries bytes, and
+    // the downstream decoder sees one stream of them.
+    const whole = Buffer.from(frame({ content: 'привет' }))
+    const cut = whole.indexOf(Buffer.from('п')) + 1
+    stream.chunk(whole.subarray(0, cut))
+    stream.chunk(whole.subarray(cut))
+    stream.chunk(frame({ content: ' мир' }))
+    stream.chunk(DONE)
+    stream.end()
+    scripted(stream)
+
+    const { response: answer } = await sendChatRequest(BODY, { currentAccount: account })
+    let content = ''
+    const outcome = await consumeSSEStream(answer, parsed => {
+        if (parsed.data === '[DONE]') return
+        content += JSON.parse(parsed.data).choices[0].delta.content
+    })
+    assert.equal(content, 'привет мир')
+    assert.equal(outcome.sawDone, true)
+    assert.equal(outcome.completed, true)
+})
+
+test('a session refused in the answer’s first frame is recovered: live reload, then exactly one retry', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    accountManager.accountTokens = [account]
+    const refused = relay()
+    refused.head()
+    refused.chunk('data: {"code":"unauthorized"}\n\n')
+    refused.chunk(`data: {"details":"${SECRET}"}\n\n`)
+    scripted(refused, answering())
+
+    const result = await sendChatRequest(BODY, { currentAccount: account })
+    assert.equal(result.status, true)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
+    // The refused relay is hung up on: what follows its refusal is never read.
+    assert.equal(await refused.hungUp, false)
+    // The retry rides the renewed token, and so does everything after it.
+    assert.equal(completionsCalls()[1].headers.authorization, `Bearer ${tokenWith('renewed')}`)
+    assert.equal(result.currentToken, tokenWith('renewed'))
+    assert.equal(current().token, tokenWith('renewed'))
+    assert.equal(account.token, tokenWith('renewed'))
+    // A reload is all it took: no password.
+    assert.equal(worker.count('/session'), 0)
+    assert.equal(JSON.stringify(logs).includes(SECRET), false, 'the refusal frame never reaches a log line')
+})
+
+test('a session refused as an HTTP status is recovered the same way', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    scripted(refusing(), answering())
+
+    const result = await sendChatRequest(BODY, { currentAccount: account })
+    assert.equal(result.status, true)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
+    assert.equal(completionsCalls()[1].headers.authorization, `Bearer ${tokenWith('renewed')}`)
+})
+
+test('still refused after the reload: the request fails, and a completions refusal never costs a password', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    // For as many relays as the app asks.
+    worker.script.egress = body => (body.stream === true ? refusing().open : egress(chat('chat-1')))
+
+    const { value: result, charged } = await charging(() => sendChatRequest(BODY, { currentAccount: account }))
+    assert.equal(result.status, false)
+    assert.deepEqual(result.failure, UNCLASSIFIED_502)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
+    // Not a sign-in, now or once the reload's bookkeeping has settled:
+    // chats/new accepted this session a moment ago.
+    assert.equal(worker.count('/session'), 0)
+    await until(() => sessionPersistence.renewals.size === 0)
+    assert.equal(worker.count('/session'), 0)
+    // The session stays where the reload put it: not dropped into a 409 nobody renews.
+    assert.equal(current()?.token, tokenWith('renewed'))
+    // A refused session is a 4xx of the upstream's: the warn mark and nothing else.
+    assert.deepEqual(charged, [['recordAccountError', EMAIL, 401]])
+    assert.equal(JSON.stringify(logs).includes(SECRET), false, 'the refusal body never reaches a log line')
+})
+
+test('one recovery per interval: a completions refusal inside the window fails as it is, with no second reload', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    config.sessionRecoveryMinIntervalMs = 60000
+    const account = givenAccount()
+    worker.script.egress = body => (body.stream === true ? refusing().open : egress(chat('chat-1')))
+
+    // The first refusal gets its reload and its retry.
+    const first = await charging(() => sendChatRequest(BODY, { currentAccount: account }))
+    assert.equal(first.value.status, false)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
+    const renewed = current()
+    assert.equal(renewed.token, tokenWith('renewed'))
+
+    // The next request lands inside the window: no reload on top of that one.
+    const second = await charging(() => sendChatRequest(BODY, { currentAccount: account }))
+    assert.equal(second.value.status, false)
+    assert.deepEqual(second.value.failure, UNCLASSIFIED_502)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress', '/egress', '/egress'])
+    assert.equal(current(), renewed)
+    assert.deepEqual(second.charged, [['recordAccountError', EMAIL, 401]])
+})
+
+test('a completions call refused on a token a sibling already replaced retries on the new one, with no reload of its own', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    accountManager.accountTokens = [account]
+    const sibling = harvested('sibling')
+    worker.script.egress = body => {
+        if (body.stream !== true) return egress(chat('chat-1'))
+        // The store moved on while this call was on its way out.
+        if (current().token !== sibling.token) {
+            store.setSession(EMAIL, { token: sibling.token, expiresAt: EXPIRES_AT, jar: store.jarFromCookies(sibling.cookies) })
+            return refusing().open
+        }
+        return answering().open
+    }
+
+    const result = await sendChatRequest(BODY, { currentAccount: account })
+    assert.equal(result.status, true)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress'])
+    assert.equal(completionsCalls()[1].headers.authorization, `Bearer ${sibling.token}`)
+    assert.equal(result.currentToken, sibling.token)
+})
+
+test('a dead profile behind the page is re-logged in with the password before the retry', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    // The page cannot be opened (no_profile), and the reload finds it logged out.
+    worker.script.renew = () => refused(422, 'session_expired')
+    const answers = [refused(404, 'no_profile'), answering().open]
+    worker.script.egress = body => (body.stream === true ? answers.shift() : egress(chat('chat-1')))
+
+    const result = await sendChatRequest(BODY, { currentAccount: account })
+    assert.equal(result.status, true)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/session', '/egress'])
+    assert.equal(completionsCalls()[1].headers.authorization, `Bearer ${tokenWith('signed-in')}`)
+    assert.equal(worker.sent('/session')[0].force, true)
+})
+
+test('a worker that cannot serve the call is retried, then answered with a 503 that is not the account’s', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    Object.assign(config, { chatRetryCount: QUICK_RETRY.count, chatRetryBackoffMs: QUICK_RETRY.backoffMs })
+    const account = givenAccount()
+    for (const [status, code] of [[502, 'page_closed'], [504, 'egress_timeout'], [503, 'resident_capacity']]) {
+        worker.calls.length = 0
+        worker.script.egress = body => (body.stream === true ? refused(status, code) : egress(chat('chat-1')))
+
+        const { value: result, charged } = await charging(() => sendChatRequest(BODY, { currentAccount: account }))
+        assert.equal(result.status, false, code)
+        assert.deepEqual(result.failure, UNCLASSIFIED_503, code)
+        assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress'], `${code}: one retry`)
+        assert.deepEqual(charged, [], `${code}: the egress's failure, not the account's`)
+        assert.ok(logs.some(args => String(args[0]).includes(code)), `${code}: the log says whose failure it was`)
+        assert.deepEqual(direct, [], `${code}: never a direct request`)
+    }
+})
+
+test('a worker refusing the call itself is a configuration: not retried, not recovered', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    Object.assign(config, { chatRetryCount: QUICK_RETRY.count, chatRetryBackoffMs: QUICK_RETRY.backoffMs })
+    const account = givenAccount()
+    const { value: result, charged } = await charging(async () => {
+        worker.script.egress = body => (body.stream === true ? refused(401, 'unauthorized') : egress(chat('chat-1')))
+        return sendChatRequest(BODY, { currentAccount: account })
+    })
+    assert.equal(result.status, false)
+    assert.deepEqual(result.failure, UNCLASSIFIED_503)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress'])
+    assert.deepEqual(charged, [])
+    assert.equal(current().token, account.token)
+})
+
+test('a relay that fails before anything reached the client is retried like a dropped connection', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    Object.assign(config, { chatRetryCount: QUICK_RETRY.count, chatRetryBackoffMs: QUICK_RETRY.backoffMs })
+    const account = givenAccount()
+    const dropped = relay()
+    dropped.head()
+    dropped.fail('egress_timeout')
+    scripted(dropped, answering())
+
+    const { value: result, charged } = await charging(() => sendChatRequest(BODY, { currentAccount: account }))
+    assert.equal(result.status, true)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress'])
+    // A relay's failure is not a verdict on the session.
+    assert.equal(worker.count('/renew'), 0)
+    // A retried send that then went through is not a failure of anything.
+    assert.deepEqual(charged, [])
+})
+
+test('a relay that fails once the answer is under way is the stream’s failure: nothing is replayed', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    Object.assign(config, { chatRetryCount: QUICK_RETRY.count, chatRetryBackoffMs: QUICK_RETRY.backoffMs })
+    const account = givenAccount()
+    const stream = answering()
+    scripted(stream)
+
+    const { response: answer } = await sendChatRequest(BODY, { currentAccount: account })
+    const events = answer[Symbol.asyncIterator]()
+    await events.next()
+    stream.chunk(frame({ content: 'нг' }))
+    await events.next()
+    // The page died mid-answer.
+    stream.fail('page_closed')
+    await assert.rejects(events.next(), error => error.code === 'ECONNRESET' && error.workerCode === 'page_closed')
+    assert.deepEqual(worker.routes(), ['/egress', '/egress'])
+})
+
+test('the consumer letting go of the answer ends the relay: the app hangs up on the worker', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+
+    // However the consumer lets go — destroying the stream outright...
+    const destroyed = answering()
+    scripted(destroyed)
+    const first = await sendChatRequest(BODY, { currentAccount: account })
+    first.response.destroy()
+    assert.equal(await destroyed.hungUp, false, 'the worker sees its app close the connection before the answer ended')
+
+    // ...or doing what the agent paths do: stop reading after a frame.
+    const stopped = relay()
+    stopped.head()
+    stopped.chunk(frame({ content: 'стоп' }))
+    scripted(stopped)
+    const second = await sendChatRequest(BODY, { currentAccount: account })
+    const outcome = await consumeSSEStream(second.response, () => {}, { shouldStop: () => true })
+    assert.equal(outcome.stopped, true)
+    assert.equal(await stopped.hungUp, false)
+    // Neither cost a reload or a password.
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress', '/egress'])
+})
+
+test('a slow first frame is not waited for past the grace: the answer goes on as it is, refusal or not', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    browserEgress.setTimingForTests({ firstFrameMs: 40 })
+    const account = givenAccount()
+    const stream = relay()
+    stream.head()
+    scripted(stream)
+
+    const { response: answer } = await sendChatRequest(BODY, { currentAccount: account })
+    // Handed on with nothing in it yet: the client's stream is under way
+    // while qwen.ai is still thinking.
+    const events = answer[Symbol.asyncIterator]()
+    const late = 'data: {"code":"unauthorized"}\n\n'
+    stream.chunk(late)
+    // Past the hand-off the frame is the caller's to read: a stream that
+    // started is not started over.
+    assert.equal((await events.next()).value.toString('utf8'), late)
+    stream.end()
+    assert.equal((await events.next()).done, true)
+    assert.equal(worker.count('/renew'), 0)
+})
+
+test('only a refusal of the SESSION in the first frame is a recovery; any other first frame goes on', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    const firstFrames = [
+        frame({ content: 'unauthorized' }),
+        'data: {"error":{"code":"invalid_request","message":"bad tool schema"}}\n\n',
+        'data: {"success":false,"code":"RateLimited"}\n\n',
+        ': keep-alive\n\n',
+        DONE
+    ]
+    for (const first of firstFrames) {
+        worker.calls.length = 0
+        const stream = relay()
+        stream.head()
+        stream.chunk(first)
+        stream.end()
+        scripted(stream)
+
+        const { response: answer } = await sendChatRequest(BODY, { currentAccount: account })
+        const events = answer[Symbol.asyncIterator]()
+        assert.equal((await events.next()).value.toString('utf8'), first)
+        assert.equal((await events.next()).done, true)
+        assert.deepEqual(worker.routes(), ['/egress', '/egress'], first)
+    }
+})
+
+test('an HTML challenge as the answer is screened as a direct one is', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    const stream = relay()
+    stream.head(200, { 'content-type': 'text/html; charset=utf-8' })
+    stream.chunk(`<html><meta name="aliyun_waf_aa" content="${SECRET}"></html>`)
+    stream.end()
+    scripted(stream)
+
+    await assert.rejects(sendChatRequest(BODY, { currentAccount: account }), isWafChallengeError)
+    assert.equal(worker.count('/renew'), 0)
+    assert.equal(JSON.stringify(logs).includes(SECRET), false)
+})
+
+test('a 429 from qwen.ai is the quota, with its Retry-After, as it is on the direct transports', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    const stream = relay()
+    stream.head(429, { 'content-type': 'application/json', 'retry-after': '7' })
+    stream.chunk('{"error":"RateLimited"}')
+    stream.end()
+    scripted(stream)
+
+    const { value: result, charged } = await charging(() => sendChatRequest(BODY, { currentAccount: account }))
+    assert.deepEqual(result.failure, { rateLimited: true, overloaded: false, status: 429, retryAfter: 7 })
+    assert.deepEqual(charged, [['recordAccountQuotaExhausted', EMAIL, 7]])
+    assert.equal(worker.count('/renew'), 0)
+})
+
+test('a relay that stays silent past every budget the worker has is cut by the app', { timeout: 10000 }, async () => {
+    browserEgress.setTimingForTests({ relaySilenceMs: 40 })
+    const account = givenAccount()
+    const stream = answering()
+    scripted(stream)
+
+    const response = await browserEgress.postCompletions({
+        account, url: `${COMPLETIONS}chat-1`, body: '{}', token: account.token, timeoutMs: 30
+    })
+    const events = response.data[Symbol.asyncIterator]()
+    await events.next()
+    // The page would cut a silent upstream at 30 ms and the worker say so;
+    // when neither does, the relay itself is gone.
+    await assert.rejects(events.next(), error => error.code === 'ETIMEDOUT' && error.workerCode === 'relay_silent')
+    assert.equal(await stream.hungUp, false)
+})
+
+test('with chats/new direct, a refused egress completions call leaves the session alone too', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    config.chatCreationTransport = 'direct'
+    directReply = async () => ({ status: 200, data: chat('direct-chat'), headers: {} })
+    const account = givenAccount()
+    worker.script.egress = body => (body.stream === true ? refusing().open : egress(chat('chat-1')))
+
+    const result = await sendChatRequest(BODY, { currentAccount: account })
+    assert.equal(result.status, false)
+    assert.equal(direct.length, 1)
+    assert.equal(direct[0].url, CHATS_NEW)
+    // The transport had its reload and retry; the caller's 401 bookkeeping
+    // does not drop the session on top of it.
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'])
+    assert.equal(current()?.token, tokenWith('renewed'))
+})
+
+test('COMPLETIONS_TRANSPORT=browser is a forced transport: a worker that is not there is never replaced by axios', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    // chats/new stays direct here, so that the only thing asked of a missing
+    // worker is the completions call.
+    config.chatCreationTransport = 'direct'
+    directReply = async () => ({ status: 200, data: chat('direct-chat'), headers: {} })
+    Object.assign(config, { chatRetryCount: QUICK_RETRY.count, chatRetryBackoffMs: QUICK_RETRY.backoffMs })
+    const account = givenAccount()
+    config.signinWorkerUrl = 'http://127.0.0.1:1'
+    try {
+        const { value: result, charged } = await charging(() => sendChatRequest(BODY, { currentAccount: account }))
+        assert.equal(result.status, false)
+        assert.deepEqual(result.failure, UNCLASSIFIED_503)
+        // The direct call is chats/new's and nothing else: plain Node TLS to
+        // qwen.ai is what the egress exists to avoid.
+        assert.deepEqual(direct.map(call => call.url), [CHATS_NEW])
+        assert.deepEqual(charged, [])
+        assert.ok(logs.some(args => String(args[0]).includes('worker_unreachable')))
+    } finally {
+        config.signinWorkerUrl = workerUrl
+    }
 })

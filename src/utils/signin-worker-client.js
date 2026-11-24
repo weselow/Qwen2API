@@ -1,4 +1,5 @@
 const axios = require('axios')
+const { StringDecoder } = require('node:string_decoder')
 const config = require('../config')
 const store = require('./v2-session-store')
 const { SigninError } = require('./signin-error')
@@ -9,7 +10,7 @@ const { resolveProxyUrl } = require('./proxy-helper')
  * Chromium profiles; this module asks it to acquire or renew a chat.qwen.ai
  * session and hands the harvested token + cookies to the session store. Since
  * Qwen2API-3ue.2 it also carries qwen.ai API calls into the account's resident
- * page (/egress).
+ * page (/egress) — streamed since Qwen2API-3ue.3 (egressStream).
  *
  * Credentials travel only in request bodies over the internal network and
  * are never logged: error paths log worker status codes, never payloads.
@@ -39,6 +40,35 @@ function workerHeaders() {
 }
 
 /**
+ * What a failed call to the worker means in the app's terms: a SigninError
+ * carrying the worker's own code (workerCode) for the log.
+ * @param {Error & {response?: object}} error - As axios rejected it
+ * @param {boolean} [timedOut] - A budget this module ran itself ran out
+ */
+function workerFailure(error, timedOut = false) {
+    if (error.response) {
+        const code = error.response.data?.code
+        const failure = new SigninError(
+            CODE_FOR_WORKER_CODE[code] || 'signin_upstream_error',
+            error.response.status >= 500 ? 502 : error.response.status,
+            'Signin worker rejected the request.',
+            error.response.status
+        )
+        failure.sessionLost = SESSION_LOST_CODES.has(code)
+        if (Number.isFinite(error.response.data?.retryAfterMs)) {
+            failure.retryAfterMs = error.response.data.retryAfterMs
+        }
+        failure.workerCode = typeof code === 'string' ? code : null
+        return failure
+    }
+    // The same code either way (callers branch on it); the log line should not blame a worker that is up and still working.
+    if (timedOut || error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+        return new SigninError('signin_transport_error', 502, 'Signin worker did not answer in time.')
+    }
+    return new SigninError('signin_transport_error', 502, 'Signin worker unreachable.')
+}
+
+/**
  * POST to the worker and return the axios response. Every worker failure
  * leaves as a SigninError carrying the worker's own code (workerCode) for the log.
  * @param {number} [timeoutMs] - Defaults to the configured worker budget: a
@@ -53,26 +83,7 @@ async function postWorker(path, payload, timeoutMs = config.signinWorkerTimeoutM
             maxRedirects: 0
         })
     } catch (error) {
-        if (error.response) {
-            const code = error.response.data?.code
-            const failure = new SigninError(
-                CODE_FOR_WORKER_CODE[code] || 'signin_upstream_error',
-                error.response.status >= 500 ? 502 : error.response.status,
-                'Signin worker rejected the request.',
-                error.response.status
-            )
-            failure.sessionLost = SESSION_LOST_CODES.has(code)
-            if (Number.isFinite(error.response.data?.retryAfterMs)) {
-                failure.retryAfterMs = error.response.data.retryAfterMs
-            }
-            failure.workerCode = typeof code === 'string' ? code : null
-            throw failure
-        }
-        // The same code either way (callers branch on it); the log line should not blame a worker that is up and still working.
-        if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
-            throw new SigninError('signin_transport_error', 502, 'Signin worker did not answer in time.')
-        }
-        throw new SigninError('signin_transport_error', 502, 'Signin worker unreachable.')
+        throw workerFailure(error)
     }
     return response
 }
@@ -149,4 +160,130 @@ async function egress(email, account, { url, method = 'POST', headers = {}, body
     return answer
 }
 
-module.exports = { acquireSession, renewSession, egress, EGRESS_OPEN_MARGIN_MS }
+// A worker refusal to a streamed call arrives as a stream of its own: its
+// JSON is a few hundred bytes.
+const ERROR_BODY_LIMIT = 16384
+
+// One line of the relay, as the worker wrote it: a JSON object with a `type`.
+const relayEvent = line => {
+    let event
+    try {
+        event = JSON.parse(line)
+    } catch { /* not an event: reported below */ }
+    if (!event || typeof event !== 'object' || typeof event.type !== 'string') {
+        throw new SigninError('signin_upstream_error', 502, 'Signin worker returned a malformed egress stream.')
+    }
+    return event
+}
+
+/**
+ * The worker's relay as an async iterator of its events, one JSON object per
+ * line (signin-worker/server.js#relayEgress). An `error` event is yielded
+ * like any other: what it means for the caller is the caller's to say.
+ *
+ * Ending the iteration early is what tells the worker to stop: `return()`
+ * lands in the finally, which closes the connection — and the worker, seeing
+ * it go, aborts the fetch inside the page.
+ */
+async function* relayFrames(relay) {
+    const decoder = new StringDecoder('utf8')
+    let pending = ''
+    try {
+        for await (const chunk of relay) {
+            pending += typeof chunk === 'string' ? chunk : decoder.write(chunk)
+            for (;;) {
+                const newline = pending.indexOf('\n')
+                if (newline < 0) break
+                const line = pending.slice(0, newline).trim()
+                pending = pending.slice(newline + 1)
+                if (line) yield relayEvent(line)
+            }
+        }
+        const rest = (pending + decoder.end()).trim()
+        if (rest) yield relayEvent(rest)
+    } finally {
+        relay.destroy?.()
+    }
+}
+
+/**
+ * The failure of a streamed call, in the terms of every other worker failure
+ * (workerFailure) — which needs the worker's JSON, and to a streamed call
+ * the worker sends that as a stream too.
+ */
+async function streamWorkerFailure(error, timedOut) {
+    const body = error.response?.data
+    if (body && typeof body[Symbol.asyncIterator] === 'function') {
+        const chunks = []
+        let size = 0
+        try {
+            for await (const chunk of body) {
+                size += chunk.length
+                chunks.push(chunk)
+                if (size >= ERROR_BODY_LIMIT) break
+            }
+        } catch { /* the body is all there was to read */ }
+        try {
+            error.response.data = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+        } catch {
+            error.response.data = null
+        }
+    }
+    return workerFailure(error, timedOut)
+}
+
+/**
+ * One qwen.ai API call from inside the account's resident page, its answer
+ * relayed as it arrives (Qwen2API-3ue.3): the streaming /egress. Resolves once
+ * the worker took the call; the answer comes through `frames`.
+ *
+ * The budget is the whole-answer call's, and it covers nothing after the
+ * worker started: a stream lasts as long as qwen.ai keeps talking, and its
+ * silence is the worker's own timer to police (request.timeoutMs, inside the page).
+ *
+ * The app cancelling is it closing the relay: `frames` ending early, or
+ * `close()`, destroys the connection, and the worker aborts the fetch inside
+ * the page when it sees it go.
+ *
+ * @param {string} email
+ * @param {Object} [account] - Account (its proxy opens the page)
+ * @param {Object} request - What egress() takes
+ * @param {number} [request.timeoutMs] - How long qwen.ai may fall silent between two chunks
+ * @returns {Promise<{frames: AsyncGenerator<Object>, close: () => void}>}
+ * @throws {SigninError} the worker could not take the call
+ */
+async function egressStream(email, account, { url, method = 'POST', headers = {}, body, timeoutMs = 30000 }) {
+    const controller = new AbortController()
+    let expired = false
+    const timer = setTimeout(() => {
+        expired = true
+        controller.abort()
+    }, timeoutMs + config.signinWorkerTimeoutMs + EGRESS_OPEN_MARGIN_MS)
+    let response
+    try {
+        response = await axios.post(`${config.signinWorkerUrl}/egress`, {
+            email, url, method, headers, body, timeoutMs, proxy: resolveProxyUrl(account), stream: true
+        }, {
+            headers: workerHeaders(),
+            responseType: 'stream',
+            timeout: 0,
+            maxRedirects: 0,
+            signal: controller.signal
+        })
+    } catch (error) {
+        throw await streamWorkerFailure(error, expired)
+    } finally {
+        clearTimeout(timer)
+    }
+    const relay = response.data
+    return {
+        frames: relayFrames(relay),
+        // For a relay that is never read, or read no further: the same closing of the connection.
+        close: () => {
+            controller.abort()
+            relay.destroy?.()
+        }
+    }
+}
+
+module.exports = { acquireSession, renewSession, egress, egressStream, EGRESS_OPEN_MARGIN_MS }
