@@ -8,7 +8,11 @@ const vm = require('node:vm')
 
 const { createServer, shutdownHandler } = require('../signin-worker/server')
 const { createResidents } = require('../signin-worker/lib/resident-pages')
-const { pageFetch, normalizeEgress } = require('../signin-worker/lib/egress-fetch')
+const {
+    pageCall, normalizeEgress, isChallengePage, isHtmlAnswer, readFrontEndVersion, PAGE_HEADERS, ABORT_REASON,
+    STREAM_CHANNEL, STREAM_ABORTS
+} = require('../signin-worker/lib/egress-fetch')
+const { pageGlobals } = require('./helpers/fake-xml-http-request')
 
 const CHAT = 'https://chat.qwen.ai'
 const AUTH = { authorization: 'Bearer secret' }
@@ -35,7 +39,8 @@ const jsonResponse = (payload, status = 200) =>
 
 // A fake "Playwright" in the jik.3 mold: contexts and pages that record what
 // the worker does. page.evaluate runs the REAL in-page function inside a
-// sandbox whose fetch is scripted, so the tests see exactly what the page
+// sandbox whose XMLHttpRequest answers from a scripted fetch
+// (helpers/fake-xml-http-request.js), so the tests see exactly what the page
 // would send. No Chromium anywhere near CI.
 function fakeBrowser() {
   const script = { fetch: () => jsonResponse({ success: true }), cookies: [], renew: null, evaluate: null, closeDelay: 0 }
@@ -52,7 +57,9 @@ function fakeBrowser() {
     const handlers = {}
     return {
       on(event, handler) { (handlers[event] ||= []).push(handler) },
-      emit(event) { for (const handler of handlers[event] || []) handler() }
+      off(event, handler) { handlers[event] = (handlers[event] || []).filter(kept => kept !== handler) },
+      emit(event, ...args) { for (const handler of [...handlers[event] || []]) handler(...args) },
+      listenerCount(event) { return (handlers[event] || []).length }
     }
   }
 
@@ -68,7 +75,7 @@ function fakeBrowser() {
         const run = script.evaluate || ((fn, arg) => {
           page.evaluations.push(arg)
           // Only what a page can see: no module scope leaks in.
-          const sandbox = { AbortController, setTimeout, clearTimeout, Blob, ...page.bindings, fetch: script.fetch }
+          const sandbox = { AbortController, setTimeout, clearTimeout, Blob, ...page.bindings, ...pageGlobals(script, page) }
           return vm.runInNewContext(`(${fn.toString()})`, sandbox)(arg)
         })
         Promise.resolve().then(() => run(fn, arg)).then(resolve, reject)
@@ -114,7 +121,7 @@ async function start(t, options) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwen-signin-egress-'))
   const server = createServer({
     dataDir, token: 'secret', timeoutMs: 120000, maxPages: 16,
-    minRenewDelayMs: 60000, keepAliveMs: 60000, drainMs: 1000, backstopMs: 5000,
+    minRenewDelayMs: 60000, keepAliveMs: 60000, drainMs: 1000, backstopMs: 5000, frontEndMs: 100,
     // Login pacing is signin-worker-pacing.test.js's subject.
     minLoginIntervalMs: 1,
     ...options
@@ -138,29 +145,45 @@ const egress = (post, email, extra = {}) => post('/egress', {
   headers: { 'content-type': 'application/json' }, body: '{"chatId":""}', timeoutMs: 5000, ...extra
 })
 
-// page.evaluate serializes pageFetch by source: run it the same way, in a
+// What the worker logs while `fn` runs — as it runs, so that `fn` can wait
+// for a line.
+async function logged(fn) {
+  const lines = []
+  const real = console.log
+  console.log = (...args) => lines.push(args.join(' '))
+  try {
+    return await fn(lines)
+  } finally {
+    console.log = real
+  }
+}
+
+const CHALLENGE_PAGE = '<!doctype html> <meta charset="UTF-8"> <meta name="aliyun_waf_aa" content="x"> <script> /* v2.0.1 */ </script>'
+
+// page.evaluate serializes pageCall by source: run it the same way, in a
 // bare sandbox, to reach the outcomes the HTTP tests cannot stage. Its
 // objects come from the sandbox's realm, so they are compared as plain data.
-// The guard turns a fetch that never settles (a broken abort timer) into a
+// The guard turns a request that never settles (a broken abort timer) into a
 // failure here instead of a hung test runner.
-const inPage = async (sandbox, arg) => {
+const inPage = async (script, arg) => {
   let timer
   const guard = new Promise((resolve, reject) => {
-    timer = setTimeout(() => reject(new Error('the in-page fetch never settled')), 2000)
+    timer = setTimeout(() => reject(new Error('the in-page request never settled')), 2000)
   })
   try {
-    const run = vm.runInNewContext(`(${pageFetch.toString()})`,
-      { AbortController, setTimeout, clearTimeout, Blob, ...sandbox })(arg)
+    const run = vm.runInNewContext(`(${pageCall.toString()})`,
+      { AbortController, setTimeout, clearTimeout, btoa, ...script, ...pageGlobals(script) })(arg)
     return JSON.parse(JSON.stringify(await Promise.race([run, guard])))
   } finally {
     clearTimeout(timer)
   }
 }
 
-test('egress opens a resident page on first use and runs the call as an in-page fetch', async t => {
+test('egress opens a resident page on first use and runs the call from inside it, as one of the page’s own requests', async t => {
   const signer = fakeBrowser()
   const { post, health, dataDir } = await start(t, { signer })
   const email = 'live@example.invalid'
+  signer.script.frontEnd = '0.3.50'
 
   // No persisted profile: nothing to open a page on, and no browser launched.
   const missing = await egress(post, email)
@@ -169,28 +192,29 @@ test('egress opens a resident page on first use and runs the call as an in-page 
   assert.equal(signer.calls.length, 0)
 
   withProfile(dataDir, email)
-  const fetched = []
-  signer.script.fetch = async (url, init) => {
-    fetched.push({ url, init })
-    return jsonResponse({ success: true })
-  }
   signer.script.cookies = [{ name: 'ssxmod_itna', value: 'rotated', domain: 'chat.qwen.ai', path: '/' }]
 
-  const first = await egress(post, email, {
-    headers: {
-      'content-type': 'application/json',
-      'X-Request-Id': '6f1c9d2e',
-      Authorization: 'Bearer app-token',
-      Cookie: 'stolen=1'
-    }
+  const { lines } = await logged(async captured => {
+    const first = await egress(post, email, {
+      headers: {
+        'content-type': 'application/json',
+        'X-Request-Id': '6f1c9d2e',
+        Authorization: 'Bearer app-token',
+        Cookie: 'stolen=1'
+      }
+    })
+    assert.equal(first.status, 200)
+    const result = await first.json()
+    assert.equal(result.status, 200)
+    assert.equal(result.headers['content-type'], 'application/json')
+    assert.deepEqual(JSON.parse(result.body), { success: true })
+    assert.equal(result.url, `${CHAT}/api/v2/chats/new`)
+    assert.equal(result.redirected, false)
+    assert.equal(result.challenge, undefined, 'an ordinary JSON answer is no challenge')
+    // The live jar rides back with every answer (jar sync, Qwen2API-3ue.2).
+    assert.deepEqual(result.cookies.map(cookie => cookie.name), ['ssxmod_itna'])
+    return { lines: captured }
   })
-  assert.equal(first.status, 200)
-  const result = await first.json()
-  assert.equal(result.status, 200)
-  assert.equal(result.headers['content-type'], 'application/json')
-  assert.deepEqual(JSON.parse(result.body), { success: true })
-  // The live jar rides back with every answer (jar sync, Qwen2API-3ue.2).
-  assert.deepEqual(result.cookies.map(cookie => cookie.name), ['ssxmod_itna'])
 
   // One browser, on the hashed profile directory, loaded once like a renewal.
   const opens = () => signer.calls.filter(call => call.op === 'open')
@@ -199,24 +223,40 @@ test('egress opens a resident page on first use and runs the call as an in-page 
   assert.equal(opens()[0].dataDir.includes(email), false)
   const [context] = signer.contexts
   assert.equal(signer.calls.find(call => call.op === 'renew').page, context.page)
+  // What the page runs is said once, where the log says the page is up.
+  assert.ok(lines.some(line => /resident-open ok \(1\/16 pages, front-end 0\.3\.50\)$/.test(line)), lines.join('\n'))
 
-  // What the page sent: the profile's own cookies, the app's headers minus Cookie.
-  assert.equal(fetched.length, 1)
-  assert.equal(fetched[0].url, `${CHAT}/api/v2/chats/new`)
-  const init = fetched[0].init
-  assert.equal(init.method, 'POST')
-  assert.equal(init.body, '{"chatId":""}')
-  assert.equal(init.credentials, 'include')
-  assert.ok(init.signal instanceof AbortSignal)
-  assert.deepEqual(init.headers, {
-    'content-type': 'application/json', 'x-request-id': '6f1c9d2e', authorization: 'Bearer app-token'
+  // What the page sent (Qwen2API-3ue.5): an XMLHttpRequest, with the app's
+  // headers and the page's own on top — the way the page's own code sends
+  // its API requests, which is what qwen.ai answered with JSON on 24.11.
+  // Cookie is dropped: the profile's own jar rides along instead.
+  assert.equal(signer.script.xhrs.length, 1)
+  const sent = signer.script.xhrs[0].sent
+  assert.equal(sent.url, `${CHAT}/api/v2/chats/new`)
+  assert.equal(sent.method, 'POST')
+  assert.equal(sent.body, '{"chatId":""}')
+  assert.match(sent.headers.timezone,
+    /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d\d \d{4} \d\d:\d\d:\d\d GMT[+-]\d{4}$/)
+  assert.deepEqual({ ...sent.headers, timezone: '<the page’s clock>' }, {
+    accept: PAGE_HEADERS.accept,
+    'accept-language': 'en-US,en;q=0.9',
+    source: PAGE_HEADERS.source,
+    'content-type': 'application/json',
+    'x-request-id': '6f1c9d2e',
+    authorization: 'Bearer app-token',
+    timezone: '<the page’s clock>',
+    version: '0.3.50'
   })
 
   // Second call reuses the page: no launch, no reload.
   await (await egress(post, email)).json()
   assert.equal(opens().length, 1)
   assert.equal(signer.calls.filter(call => call.op === 'renew').length, 1)
-  assert.equal(context.page.evaluations.length, 2)
+  // (Of that page's evaluations, the two calls are the ones that were given a request.)
+  assert.equal(context.page.evaluations.filter(arg => arg?.url).length, 2)
+  // The caller brought no request id on the second call: the worker gave it one.
+  assert.match(signer.script.xhrs[1].sent.headers['x-request-id'],
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
 
   assert.deepEqual(await health(), {
     ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell'
@@ -324,18 +364,77 @@ test('normalizeEgress pins the target to whatever origin the worker is configure
   assert.equal(normalizeEgress({ url: '/api/v2/models', method: 'get' }, lab).url,
     'http://127.0.0.1:8080/api/v2/models')
   assert.throws(() => normalizeEgress({ url: `${CHAT}/api/v2/models`, method: 'GET' }, lab), /chat origin/)
-  assert.deepEqual(normalizeEgress({ url: '/x', method: 'post', headers: { 'X-A': '1' }, body: '' }, lab), {
+  const normalized = normalizeEgress({ url: '/x', method: 'post', headers: { 'X-A': '1' }, body: '' }, lab)
+  // Every call is known to the worker by its request id (Qwen2API-3ue.6): the
+  // page's own requests carry theirs.
+  assert.match(normalized.init.headers['x-request-id'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  assert.deepEqual(normalized, {
     url: 'http://127.0.0.1:8080/x',
-    init: { method: 'POST', headers: { 'x-a': '1' }, body: undefined },
+    init: { method: 'POST', headers: { 'x-a': '1', 'x-request-id': normalized.init.headers['x-request-id'] }, body: undefined },
     timeoutMs: 1000,
     stream: false
   })
+  assert.notEqual(normalizeEgress({ url: '/x', method: 'post' }, lab).init.headers['x-request-id'],
+    normalized.init.headers['x-request-id'])
+  // The caller's own is sent, not replaced.
+  assert.deepEqual(normalizeEgress({ url: '/x', method: 'post', headers: { 'X-Request-Id': 'mine' } }, lab).init.headers,
+    { 'x-request-id': 'mine' })
 })
 
-test('the in-page fetch maps its own outcomes: chunked body, empty body, network failure, timeout, oversize', async () => {
-  const request = { url: `${CHAT}/api/v2/models`, init: { method: 'GET', headers: {} }, timeoutMs: 1000, maxBytes: 1024 }
+test('the in-page call sends the page’s own headers: its time zone and front end version, and what the caller brought', async () => {
+  const request = { url: `${CHAT}/api/v2/models`, init: { method: 'GET', headers: {} }, timeoutMs: 1000, maxBytes: 1024, reasons: ABORT_REASON }
+  // What one call left the page with, its headers included.
+  const sentBy = async (script, init = { method: 'GET', headers: {} }) => {
+    const scripted = { frontEnd: '0.3.50', ...script }
+    await inPage(scripted, { ...request, init })
+    return scripted.xhrs[0].sent
+  }
 
-  // The body is assembled across stream chunks, decoded as UTF-8.
+  // The page's clock says the time zone in the front end's own format (its
+  // requests on 24.11 carried 'Tue Nov 24 2026 14:19:55 GMT+0000'), and in the
+  // page's own zone. (Not the very second: the call and this check may straddle one.)
+  const sent = await sentBy({})
+  assert.match(sent.headers.timezone,
+    /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d\d \d{4} \d\d:\d\d:\d\d GMT[+-]\d{4}$/)
+  const offset = -new Date().getTimezoneOffset()
+  const pad = value => String(value).padStart(2, '0')
+  const zone = `GMT${offset < 0 ? '-' : '+'}${pad(Math.floor(Math.abs(offset) / 60))}${pad(Math.abs(offset) % 60)}`
+  assert.ok(sent.headers.timezone.endsWith(zone), `${sent.headers.timezone} is not in the page's own zone (${zone})`)
+  // The front end's version is read off the address its scripts load from.
+  assert.equal(sent.headers.version, '0.3.50')
+  assert.equal((await sentBy({ frontEnd: '0.4.1' })).headers.version, '0.4.1')
+  // A page that shows no front end version sends none, rather than a guess.
+  assert.equal('version' in (await sentBy({ frontEnd: '' })).headers, false)
+  assert.equal('version' in (await sentBy({ frontEnd: 'elsewhere' })).headers, false)
+
+  // What a caller may leave out is what the page's own requests carry anyway.
+  assert.equal(sent.headers.accept, PAGE_HEADERS.accept)
+  assert.equal(sent.headers.source, PAGE_HEADERS.source)
+  // The language in Chrome's own form for it — what the page's own requests
+  // carried on 24.11, where a request left to the browser said only 'en-US'.
+  assert.equal(sent.headers['accept-language'], 'en-US,en;q=0.9')
+  assert.equal((await sentBy({ language: 'zh-CN' })).headers['accept-language'], 'zh-CN,zh;q=0.9')
+  assert.equal((await sentBy({ language: 'de' })).headers['accept-language'], 'de')
+
+  // A call that brings no Bearer is one of the page's own: it goes on the page's session.
+  assert.equal('authorization' in sent.headers, false, 'a page without a session sends no Bearer')
+  assert.equal((await sentBy({ pageToken: 'page-session' })).headers.authorization, 'Bearer page-session')
+
+  // A header the caller brought is sent as given, and nothing of the page's is put over it.
+  assert.deepEqual((await sentBy({}, {
+    method: 'GET',
+    headers: {
+      timezone: 'Sat Nov 21 2026 19:55:52 GMT+0400', version: '0.0.1', accept: 'text/plain', source: 'app', 'accept-language': 'fr'
+    }
+  })).headers, {
+    timezone: 'Sat Nov 21 2026 19:55:52 GMT+0400', version: '0.0.1', accept: 'text/plain', source: 'app', 'accept-language': 'fr'
+  })
+})
+
+test('the in-page call maps its own outcomes: a body in pieces, no body, network failure, timeout, an abort, oversize', async () => {
+  const request = { url: `${CHAT}/api/v2/models`, init: { method: 'GET', headers: {} }, timeoutMs: 1000, maxBytes: 1024, reasons: ABORT_REASON }
+
+  // The body arrives in pieces and is assembled.
   const stream = (pieces, onCancel = () => {}) => new Response(new ReadableStream({
     start(controller) {
       for (const piece of pieces) controller.enqueue(new TextEncoder().encode(piece))
@@ -345,38 +444,313 @@ test('the in-page fetch maps its own outcomes: chunked body, empty body, network
   }), { headers: { 'content-type': 'text/plain; charset=utf-8' } })
   const split = await inPage({ fetch: async () => stream(['{"answer":"при', 'вет"}']) }, request)
   assert.deepEqual(split, {
-    ok: true, status: 200, url: '', redirected: false,
+    ok: true, status: 200, url: `${CHAT}/api/v2/models`, redirected: false,
     headers: { 'content-type': 'text/plain; charset=utf-8' }, body: '{"answer":"привет"}'
   })
 
   // No body at all (HEAD, 204).
   assert.deepEqual(await inPage({
-    fetch: async () => ({ status: 204, headers: new Headers(), body: null, url: '', redirected: false })
-  }, request), { ok: true, status: 204, url: '', redirected: false, headers: {}, body: '' })
+    fetch: async () => ({ status: 204, headers: new Headers(), body: null })
+  }, request), { ok: true, status: 204, url: `${CHAT}/api/v2/models`, redirected: false, headers: {}, body: '' })
 
   // The browser's own failure: a dead connection, a blocked request.
   const failed = await inPage({ fetch: async () => { throw new TypeError('Failed to fetch') } }, request)
-  assert.deepEqual(failed, { ok: false, error: 'network_error', message: 'Failed to fetch' })
+  assert.deepEqual(failed, { ok: false, error: 'network_error', message: 'network error' })
 
-  // A stalled upstream: the in-page timer aborts the fetch.
+  // A stalled upstream: the in-page timer aborts the request.
   const stalled = await inPage({
     fetch: (url, init) => new Promise((resolve, reject) => {
       init.signal.addEventListener('abort', () => reject(abortError()))
     })
   }, { ...request, timeoutMs: 20 })
-  assert.deepEqual(stalled, { ok: false, error: 'timeout', message: 'The operation was aborted.' })
+  assert.deepEqual(stalled, { ok: false, error: 'timeout' })
 
-  // An abort that is not ours is not reported as a timeout.
-  const hijacked = await inPage({ fetch: async () => { throw abortError() } }, request)
-  assert.equal(hijacked.error, 'aborted')
+  // An abort that is not the call's own is not the app going away: a script
+  // of the page cut the request. That is the page's doing, and is said so.
+  const pending = { fetch: () => new Promise(() => {}) }
+  const hijacked = inPage(pending, request)
+  await until(() => pending.xhrs?.length === 1)
+  pending.xhrs[0].abort()
+  assert.deepEqual(await hijacked, { ok: false, error: 'aborted_in_page' })
 
-  // Oversize is cut off while streaming, not buffered whole.
-  let cancelled = false
+  // Oversize is cut off as it arrives, not after it was buffered whole.
   const oversize = await inPage({
-    fetch: async () => stream(['x'.repeat(2048), 'x'.repeat(2048)], () => { cancelled = true })
+    fetch: async () => stream(['x'.repeat(600), 'x'.repeat(600)])
   }, request)
   assert.deepEqual(oversize, { ok: false, error: 'too_large', status: 200 })
-  assert.equal(cancelled, true)
+})
+
+test('a WAF challenge page is qwen.ai’s answer, said at once and by name, and the page stays', async t => {
+  const signer = fakeBrowser()
+  const { post, health, dataDir } = await start(t, { signer, backstopMs: 5000 })
+  const email = 'challenged@example.invalid'
+  withProfile(dataDir, email)
+  // What qwen.ai answered an API call with on 2026-11-24: status 200, a page.
+  signer.script.fetch = async () => new Response(CHALLENGE_PAGE, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } })
+
+  const { answer, lines, took } = await logged(async lines => {
+    const since = Date.now()
+    const response = await egress(post, email, { timeoutMs: 30000 })
+    return { answer: { status: response.status, body: await response.json() }, lines, took: Date.now() - since }
+  })
+  // The worker does not decide what a challenge means: qwen.ai's status and
+  // body travel inside its 200, as for any answer, and the app classifies.
+  assert.equal(answer.status, 200)
+  assert.equal(answer.body.status, 200)
+  assert.equal(answer.body.headers['content-type'], 'text/html; charset=utf-8')
+  assert.equal(answer.body.body, CHALLENGE_PAGE)
+  assert.equal(answer.body.challenge, 'page')
+  assert.ok(took < 2000, `the answer was there at once; the call took ${took} ms`)
+  // Said in the log by name — a 200 that is a challenge does not read as a 200.
+  assert.ok(lines.some(line => /egress \/api\/v2\/chats\/new -> 200 \(1\/16 pages\) — WAF challenge page$/.test(line)), lines.join('\n'))
+  // The page is alive and well: nothing closed it, nothing waited for a backstop.
+  assert.equal((await health()).residentPages, 1)
+  assert.equal(signer.contexts[0].closed, false)
+  assert.equal(lines.some(line => /resident-close/.test(line)), false)
+  assert.equal(lines.some(line => /unresponsive|stopped responding/.test(line)), false)
+
+  // An HTML page without the challenge's markers is just an answer: said as what it is.
+  signer.script.fetch = async () => new Response('<!doctype html><title>Maintenance</title>', { status: 503, headers: { 'content-type': 'text/html' } })
+  const maintenance = await (await egress(post, email)).json()
+  assert.equal(maintenance.status, 503)
+  assert.equal(maintenance.challenge, undefined)
+})
+
+test('a challenge the page’s hooks keep from the call is read off the page’s network, and the page stays', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { post, health, dataDir } = await start(t, { signer, keptGraceMs: 50, backstopMs: 5000 })
+  const email = 'kept@example.invalid'
+  withProfile(dataDir, email)
+  // The page's request hooks hold an answer they take for a block: the call's
+  // own listeners never hear of it. The page's network did.
+  signer.script.hold = body => /aliyun_waf_/.test(body)
+  signer.script.fetch = async () => new Response(CHALLENGE_PAGE, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } })
+
+  const { answer, lines, took } = await logged(async lines => {
+    const since = Date.now()
+    const response = await egress(post, email, { timeoutMs: 30000 })
+    return { answer: await response.json(), lines, took: Date.now() - since }
+  })
+  assert.equal(answer.status, 200)
+  assert.equal(answer.body, CHALLENGE_PAGE)
+  assert.equal(answer.headers['content-type'], 'text/html; charset=utf-8')
+  assert.equal(answer.challenge, 'network')
+  assert.ok(took < 2000, `the answer was read off the network at once; the call took ${took} ms`)
+  assert.ok(lines.some(line => /egress \/api\/v2\/chats\/new -> 200 \(1\/16 pages\) — WAF challenge page, kept from the call by the page$/.test(line)),
+    lines.join('\n'))
+  assert.equal((await health()).residentPages, 1)
+  assert.equal(signer.contexts[0].closed, false)
+  assert.equal(lines.some(line => /resident-close|unresponsive|stopped responding/.test(line)), false)
+
+  // The page is none the worse, and answers the next call itself.
+  signer.script.hold = null
+  signer.script.fetch = async () => jsonResponse({ success: true })
+  const after = await (await egress(post, email)).json()
+  assert.equal(JSON.parse(after.body).success, true)
+  assert.equal(after.challenge, undefined)
+  assert.equal((await health()).residentPages, 1)
+})
+
+test('only a challenge is taken off the page’s network: any other answer is the page’s to hand over or to time out', async t => {
+  const signer = fakeBrowser()
+  const { post, health, dataDir } = await start(t, { signer, keptGraceMs: 50 })
+  const email = 'patient@example.invalid'
+  withProfile(dataDir, email)
+  // The hooks hold every answer, JSON included: nothing in the worker's
+  // watching says "challenge", so nothing is put in the page's place.
+  signer.script.hold = () => true
+  signer.script.fetch = async () => jsonResponse({ success: true })
+  const held = await egress(post, email, { timeoutMs: 200 })
+  assert.equal(held.status, 504)
+  assert.equal((await held.json()).code, 'egress_timeout')
+  assert.equal((await health()).residentPages, 1)
+
+  // An HTML page without the challenge's markers is an answer like any other:
+  // not qwen.ai asking for a verification, and not the worker's to take over.
+  signer.script.fetch = async () => new Response('<!doctype html><title>Maintenance</title>', { status: 200, headers: { 'content-type': 'text/html' } })
+  const maintenance = await egress(post, email, { timeoutMs: 200 })
+  assert.equal(maintenance.status, 504)
+  assert.equal((await maintenance.json()).code, 'egress_timeout')
+  assert.equal((await health()).residentPages, 1)
+})
+
+test('of two calls held on one page, each is answered with qwen.ai’s answer to itself', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { post, health, dataDir } = await start(t, { signer, keptGraceMs: 50 })
+  const email = 'two@example.invalid'
+  withProfile(dataDir, email)
+  await (await egress(post, email)).json()
+  // Both calls are held by the page's hooks. qwen.ai answered the first with
+  // a challenge page and the second with JSON. Neither answers before both
+  // calls are in the page: each call's watch is up by then, and each watch
+  // hears of both answers.
+  const page = () => new Response(CHALLENGE_PAGE, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } })
+  let arrivals = 0
+  let bothArrived
+  const both = new Promise(resolve => { bothArrived = resolve })
+  signer.script.hold = () => true
+  signer.script.fetch = async url => {
+    const arrival = ++arrivals
+    if (arrivals === 2) bothArrived()
+    await both
+    return arrival === 1 ? page() : jsonResponse({ success: true, forThe: 'second' })
+  }
+  const held = await Promise.all([egress(post, email, { timeoutMs: 300 }), egress(post, email, { timeoutMs: 300 })])
+  const answers = await Promise.all(held.map(async response => ({ status: response.status, body: await response.json() })))
+  // The call that was challenged has its answer read off the network; the other is not answered with it.
+  const challenged = answers.filter(answer => answer.status === 200)
+  const timedOut = answers.filter(answer => answer.status !== 200)
+  assert.equal(challenged.length, 1, JSON.stringify(answers))
+  assert.equal(challenged[0].body.challenge, 'network')
+  assert.equal(challenged[0].body.body, CHALLENGE_PAGE)
+  assert.deepEqual(timedOut.map(answer => [answer.status, answer.body.code]), [[504, 'egress_timeout']])
+  assert.equal((await health()).residentPages, 1)
+})
+
+test('a call leaves nothing listening on its page, however it ended', async t => {
+  const signer = fakeBrowser()
+  const { post, health, dataDir } = await start(t, { signer, keptGraceMs: 50 })
+  const email = 'tidy@example.invalid'
+  withProfile(dataDir, email)
+  const listening = () => signer.contexts[0].page.listenerCount('response')
+  await (await egress(post, email)).json()
+  assert.equal(listening(), 0, 'an answered call left its watch behind')
+
+  // A hung page: the backstop abandons the call and drops the page.
+  signer.script.evaluate = () => new Promise(() => {})
+  assert.equal((await egress(post, email, { timeoutMs: 200 })).status, 504)
+  await until(() => signer.contexts[0].closed)
+  signer.script.evaluate = null
+  await (await egress(post, email)).json()
+
+  // A challenge kept from the call: answered off the page's network.
+  signer.script.hold = body => /aliyun_waf_/.test(body)
+  signer.script.fetch = async () => new Response(CHALLENGE_PAGE, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } })
+  assert.equal((await (await egress(post, email)).json()).challenge, 'network')
+  assert.equal(listening(), 0, 'a call answered off the network left its watch behind')
+  assert.equal((await health()).residentPages, 1)
+})
+
+test('the call listens, as the page’s hooks cannot hold it: no handler properties, no readyState', async () => {
+  // The page's request hooks hold an answer back from a request by never
+  // calling its onload, onloadend and onreadystatechange properties, and sit
+  // on the readyState getter. The call must use none of the four — the stand-in
+  // page notes every use.
+  const request = { url: `${CHAT}/api/v2/chats/new`, init: { method: 'POST', headers: {} }, timeoutMs: 1000, maxBytes: 4096, reasons: ABORT_REASON }
+  const whole = {
+    frontEnd: '0.3.50',
+    fetch: async () => jsonResponse({ success: true })
+  }
+  assert.deepEqual(await inPage(whole, request), { ok: true, status: 200, url: `${CHAT}/api/v2/chats/new`, redirected: false,
+    headers: { 'content-type': 'application/json' }, body: '{"success":true}' })
+  const streamed = {
+    frontEnd: '0.3.50', [STREAM_CHANNEL]: () => undefined,
+    fetch: async (url, init) => new Response('data: x\n\n', { headers: { 'content-type': 'text/event-stream' } })
+  }
+  assert.deepEqual(await inPage(streamed, { ...request, channel: STREAM_CHANNEL, registry: STREAM_ABORTS, id: 7 }), { ok: true })
+  for (const script of [whole, streamed]) {
+    assert.equal(script.xhrs.length, 1)
+    assert.deepEqual(script.xhrs[0].handlerProperties, undefined, 'a handler property was assigned')
+    assert.equal(script.xhrs[0].readyStateReads, undefined, 'readyState was read')
+  }
+})
+
+test('markers quoted in an answer that is no page make no challenge', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer })
+  const email = 'quoted@example.invalid'
+  withProfile(dataDir, email)
+  // An answer about this very code quotes the challenge's markers as text.
+  const markers = 'aliyun_waf_aa aliyunCaptcha _waf_is_mobile id="captcha-element" <title>Verification</title>'
+  signer.script.fetch = async () => jsonResponse({ success: true, text: markers })
+  const { lines } = await logged(async captured => {
+    const answer = await (await egress(post, email)).json()
+    assert.equal(answer.status, 200)
+    assert.equal(answer.challenge, undefined, 'an answer that quotes the markers was named a challenge')
+    return { lines: captured }
+  })
+  assert.equal(lines.some(line => /WAF challenge/.test(line)), false, lines.join('\n'))
+})
+
+test('each marker of the challenge makes an HTML answer one — and only an HTML answer', () => {
+  const html = { 'content-type': 'text/html; charset=utf-8' }
+  for (const page of [
+    '<meta name="aliyun_waf_aa" content="x">', '<script src="aliyunCaptcha.js"></script>', '<div id="_waf_is_mobile"></div>',
+    '<div id="captcha-element"></div>', "<div id='captcha-element'></div>", '<title>Verification</title>', '<TITLE>VERIFICATION</TITLE>'
+  ]) {
+    assert.equal(isChallengePage(html, page), true, page)
+    for (const type of ['application/json', 'text/event-stream', 'text/plain']) {
+      assert.equal(isChallengePage({ 'content-type': type }, page), false, `${page} as ${type}`)
+    }
+    assert.equal(isChallengePage({}, page), false, page)
+  }
+  assert.equal(isChallengePage(html, 'The word captcha on its own'), false)
+  // Beyond the start of the body nothing is looked at: the first 64 KiB.
+  const marker = '<meta name="aliyun_waf_aa">'
+  assert.equal(isChallengePage(html, 'x'.repeat(64 * 1024 - marker.length) + marker), true)
+  assert.equal(isChallengePage(html, 'x'.repeat(64 * 1024) + marker), false)
+  assert.equal(isHtmlAnswer(html), true)
+  assert.equal(isHtmlAnswer({ 'content-type': 'text/html' }), true)
+  assert.equal(isHtmlAnswer({ 'content-type': 'application/json' }), false)
+  assert.equal(isHtmlAnswer({}), false)
+})
+
+test('the worker names a challenge by the same markers the app screens by', () => {
+  const { isWafChallengeBody } = require('../src/utils/upstream-error')
+  const html = { 'content-type': 'text/html' }
+  for (const body of [
+    '<meta name="aliyun_waf_aa" content="x">', 'aliyunCaptcha', '_waf_is_mobile', 'id="captcha-element"', "id='captcha-element'",
+    '<title>Verification</title>', '<TITLE>VERIFICATION</TITLE>', 'ALIYUN_WAF_BB',
+    // Not a challenge page.
+    '{"success":true}', '<html><title>Qwen</title></html>', 'The word captcha on its own', ''
+  ]) {
+    assert.equal(isChallengePage(html, body), isWafChallengeBody(body), body)
+  }
+})
+
+test('the worker names its own failures by their own codes: the page’s doing is neither qwen.ai’s nor the account’s', () => {
+  const { CODE_FOR_OUTCOME } = require('../signin-worker/lib/egress-fetch')
+  const { STATUS_FOR_CODE } = require('../signin-worker/lib/worker-errors')
+  assert.deepEqual(CODE_FOR_OUTCOME, {
+    timeout: 'egress_timeout', too_large: 'egress_too_large', aborted_in_page: 'page_fault', report_failed: 'page_fault'
+  })
+  // A code the worker does not answer by would come out as browser_error.
+  assert.equal(STATUS_FOR_CODE.page_fault, 502)
+  for (const code of Object.values(CODE_FOR_OUTCOME)) assert.equal(typeof STATUS_FOR_CODE[code], 'number', code)
+})
+
+test('a listener of the call that throws ends the call, named as the page’s doing', async () => {
+  const request = { url: `${CHAT}/api/v2/chats/new`, init: { method: 'POST', headers: {} }, timeoutMs: 1000, maxBytes: 4096, reasons: ABORT_REASON }
+  // The page's channel is gone from under the stream (a report cannot be made).
+  const broken = {
+    [STREAM_CHANNEL]: () => { throw new Error('the binding is gone') },
+    fetch: async () => new Response('data: x\n\n', { headers: { 'content-type': 'text/event-stream' } })
+  }
+  assert.deepEqual(await inPage(broken, { ...request, channel: STREAM_CHANNEL, registry: STREAM_ABORTS, id: 7 }),
+    { ok: false, error: 'report_failed', message: 'the binding is gone' })
+})
+
+test('the front end is read for a log line only: a page that cannot be asked still opens', async t => {
+  const signer = fakeBrowser()
+  const { post, health, dataDir } = await start(t, { signer })
+  const email = 'unasked@example.invalid'
+  withProfile(dataDir, email)
+  const openContext = signer.openContext
+  signer.openContext = async options => {
+    const context = await openContext(options)
+    const evaluate = context.pages()[0].evaluate
+    context.pages()[0].evaluate = (fn, arg) => {
+      if (fn === readFrontEndVersion) throw new TypeError('this page cannot be asked')
+      return evaluate(fn, arg)
+    }
+    return context
+  }
+  const { lines } = await logged(async captured => {
+    assert.equal((await (await egress(post, email)).json()).status, 200)
+    return { lines: captured }
+  })
+  assert.ok(lines.some(line => /resident-open ok \(1\/16 pages, front-end unknown\)$/.test(line)), lines.join('\n'))
+  assert.equal((await health()).residentPages, 1)
 })
 
 test('a stalled upstream is aborted inside the page and the page stays usable', async t => {
@@ -482,9 +856,11 @@ test('a crashed or closed page is dropped and reopened on the next call', async 
   assert.equal(live.closed, false)
 
   // A call in flight when its page dies ends as page_closed, not as a hang.
+  // (That page's evaluations: the front end's version at its opening, the
+  // call above, and the one in flight.)
   signer.script.fetch = () => new Promise(() => {})
   const inflight = egress(post, email, { timeoutMs: 60000 })
-  await until(() => live.page.evaluations.length === 2)
+  await until(() => live.page.evaluations.length === 3)
   live.page.emit('crash')
   const failed = await inflight
   assert.equal(failed.status, 502)

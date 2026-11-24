@@ -2,8 +2,8 @@
 
 /**
  * Resident page service (Qwen2API-3ue.1): one live chat.qwen.ai page per
- * ACTIVE account, kept open so qwen.ai API calls leave as in-page fetches
- * (docs/browser-egress-design.md).
+ * ACTIVE account, kept open so qwen.ai API calls leave from inside it, as
+ * requests of the page's own (docs/browser-egress-design.md).
  *
  * The page lives in the account's persistent context (userDataDir), which
  * makes it the PROFILE OWNER: Chromium locks a userDataDir, so while a page
@@ -21,13 +21,22 @@
  * renewal does not wait for it. What that costs is that a page reloaded or
  * evicted meanwhile ends its streams — they fail as page_closed, the way a
  * call does when its page dies.
+ *
+ * Since Qwen2API-3ue.6 a WAF challenge page is recognised as what it is, at
+ * once. The page's own request hooks keep an answer they take for a block away
+ * from the call that asked for it (that is how a challenge hung /egress for
+ * 35 s on 2026-11-24, and got the page closed as unresponsive). Two things
+ * see the answer regardless: the call listens with addEventListener, which
+ * those hooks leave alone, and the worker watches the page's network for the
+ * response (watchAnswer). A challenge is handed on as qwen.ai's answer — the
+ * app classifies it — named in the log, and the page is left alone.
  */
 
 const fs = require('node:fs')
 const { WorkerError } = require('./worker-errors')
 const {
-    pageFetch, pageFetchStream, pageAbortStream, CODE_FOR_OUTCOME,
-    ABORT_REASON, STREAM_CHANNEL, STREAM_ABORTS
+    pageCall, pageAbortStream, readFrontEndVersion, isChallengePage, isHtmlAnswer, CODE_FOR_OUTCOME,
+    ABORT_REASON, STREAM_CHANNEL, STREAM_ABORTS, CHALLENGE_HEAD_BYTES
 } = require('./egress-fetch')
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -40,6 +49,10 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
  * @param {(email: string, cookies: object[]) => void} options.onCookies the live jar, after a fetch or a keep-alive poll
  * @param {string} [options.headlessMode] which headless browser opens a page (lib/browser-identity.js)
  * @param {number} [options.maxStreamBytes] - Cap on a streamed body. 0, the default, is none
+ * @param {number} [options.keptGraceMs] - How long the page gets to hand over an answer qwen.ai
+ *   already gave before the worker reads it off the page's network. Default 1000
+ * @param {number} [options.frontEndMs] - How long the page's opening waits for the front end's
+ *   version. Default 2000
  */
 function createResidents({
     signer,
@@ -52,6 +65,8 @@ function createResidents({
     keepAliveMs = 5 * 60 * 1000,
     maxBytes = 8 * 1024 * 1024,
     maxStreamBytes = 0,
+    keptGraceMs = 1000,
+    frontEndMs = 2000,
     drainMs = 5000,
     backstopMs = 5000,
     closeMs = 5000,
@@ -169,6 +184,77 @@ function createResidents({
     }
 
     /**
+     * qwen.ai's answer to one call as the page's own network gets it, which no
+     * script in the page can hold back (Qwen2API-3ue.6). The call is found by
+     * the request id the worker gave it; the page's own requests carry their
+     * own. Only a challenge page is reported: any other answer is the page's
+     * to hand over, and the call's own timer and the backstop say when it
+     * does not. An answer that is no page (JSON, a stream) is not even read:
+     * a page is the only thing the page's scripts are known to keep.
+     *
+     * The worker gives the page `keptGraceMs` to hand a challenge over itself
+     * before reading it off the network; a call whose own `timeoutMs` is
+     * shorter than that ends as a timeout first.
+     *
+     * @param {object} entry
+     * @param {{url: string, init: object}} request as normalizeEgress returned it
+     * @returns {{answer: Promise<{status: number, url: string, headers: Object<string,string>, body: Buffer}>, stop: () => void}}
+     *   `answer` settles once at most and never rejects; `stop` forgets the call
+     */
+    function watchAnswer(entry, request) {
+        const marker = request.init.headers['x-request-id']
+        let tell
+        const answer = new Promise(resolve => { tell = resolve })
+        const onResponse = response => {
+            try {
+                const sent = response.request()
+                if (sent.method() !== request.init.method || sent.headers()['x-request-id'] !== marker) return
+                const status = response.status()
+                const url = response.url()
+                const headers = {}
+                for (const [name, value] of Object.entries(response.headers())) headers[name.toLowerCase()] = value
+                // No page here: nothing to read.
+                if (!isHtmlAnswer(headers)) return stop()
+                // Whatever Playwright could not hand out: the page's own report is all there is.
+                Promise.resolve(response.text()).then(text => {
+                    const body = Buffer.from(text, 'utf8')
+                    if (isChallengePage(headers, body)) tell({ status, url, headers, body })
+                }, () => {})
+            } catch {
+                // The same for a response Playwright cannot describe.
+            }
+        }
+        entry.page.on('response', onResponse)
+        const stop = () => entry.page.off('response', onResponse)
+        return { answer, stop }
+    }
+
+    /** qwen.ai's answer as the network saw it, in the shape the page reports an answer in. */
+    const fromNetwork = answer => ({ ok: true, ...answer, redirected: false, body: answer.body.toString('utf8') })
+
+    // Whether the answer was a WAF challenge page, and who got to see it:
+    // 'page' — the page's scripts handed it to the call; 'network' — they kept
+    // it back, and the worker read it off the page's network.
+    const verdict = (headers, body, seenBy) => (isChallengePage(headers, body) ? { challenge: seenBy } : {})
+
+    /**
+     * The front end the page runs, for the log: its version, or that there was
+     * none to read. Bounded and never throwing: this is for a log line, and
+     * must neither hold the page's opening nor fail it.
+     */
+    async function frontEnd(entry) {
+        let wait
+        const version = await Promise.race([
+            Promise.resolve().then(() => entry.page.evaluate(readFrontEndVersion)).catch(() => ''),
+            new Promise(resolve => {
+                wait = setTimeout(() => resolve(''), frontEndMs)
+                wait.unref?.()
+            })
+        ]).finally(() => clearTimeout(wait))
+        return version || 'unknown'
+    }
+
+    /**
      * The ready page for this account, if any.
      * @param {string} email
      */
@@ -235,7 +321,7 @@ function createResidents({
             entry.keepAlive.unref?.()
             entry.lastUsed = Date.now()
             entry.inflight++
-            log('resident-open', `ok (${pages.size}/${maxPages} pages)`)
+            log('resident-open', `ok (${pages.size}/${maxPages} pages, front-end ${await frontEnd(entry)})`)
             return entry
         } catch (error) {
             await close(entry, 'open_failed')
@@ -244,42 +330,50 @@ function createResidents({
     }
 
     /**
-     * Run a fetch on a page handed out by acquire(); consumes that claim.
-     * Not under the account lock: many fetches may share one page.
+     * Run a whole-answer call on a page handed out by acquire(); consumes that
+     * claim. Not under the account lock: many calls may share one page.
      *
      * @param {object} entry
      * @param {{url: string, init: object, timeoutMs: number}} request as normalizeEgress returned it
+     * @returns {Promise<{status: number, url: string, redirected: boolean, headers: Object<string,string>,
+     *   body: string, cookies: ?Object[], challenge?: 'page'|'network'}>} qwen.ai's answer, with
+     *   `challenge` when it was a WAF challenge page
+     * @throws {WorkerError} the call's own failures
      */
     async function fetch(entry, request) {
         let backstop = null
+        const watch = watchAnswer(entry, request)
         try {
-            let outcome
-            try {
-                outcome = await Promise.race([
-                    entry.page.evaluate(pageFetch, { ...request, maxBytes }),
-                    new Promise((resolve, reject) => {
-                        // The in-page timer answers at timeoutMs. If even that
-                        // never comes back, the page itself is hung.
-                        backstop = setTimeout(() => reject(new WorkerError('egress_timeout',
-                            'The resident page stopped responding.')), request.timeoutMs + backstopMs)
-                        backstop.unref?.()
-                    })
-                ])
-            } catch (error) {
-                if (error instanceof WorkerError) {
-                    close(entry, 'unresponsive')
-                    throw error
-                }
-                // evaluate itself failed: the document left from under the
-                // fetch. A page that is still registered merely navigated.
-                throw new WorkerError(pages.get(entry.email) === entry ? 'browser_error' : 'page_closed',
-                    'The resident page could not run the fetch.')
-            } finally {
-                clearTimeout(backstop)
+            const raced = await Promise.race([
+                entry.page.evaluate(pageCall, { ...request, maxBytes, reasons: ABORT_REASON })
+                    .then(outcome => ({ outcome }), error => ({ error })),
+                new Promise(resolve => {
+                    // The in-page timer answers at timeoutMs. If even that
+                    // never comes back, the page itself is hung.
+                    backstop = setTimeout(() => resolve({ hung: true }), request.timeoutMs + backstopMs)
+                    backstop.unref?.()
+                }),
+                // qwen.ai answered with a challenge page and the page did not
+                // hand it over: its scripts are keeping it from the call.
+                watch.answer.then(answer => new Promise(resolve => {
+                    const grace = setTimeout(() => resolve({ kept: answer }), keptGraceMs)
+                    grace.unref?.()
+                }))
+            ])
+            if (raced.hung) {
+                close(entry, 'unresponsive')
+                throw new WorkerError('egress_timeout', 'The resident page stopped responding.')
             }
+            if (raced.error) {
+                // evaluate itself failed: the document left from under the
+                // request. A page that is still registered merely navigated.
+                throw new WorkerError(pages.get(entry.email) === entry ? 'browser_error' : 'page_closed',
+                    'The resident page could not run the request.')
+            }
+            const outcome = raced.kept ? fromNetwork(raced.kept) : raced.outcome
             if (!outcome.ok) {
                 throw new WorkerError(CODE_FOR_OUTCOME[outcome.error] || 'egress_failed',
-                    `In-page fetch failed (${outcome.error}${outcome.message ? `: ${outcome.message}` : ''}).`)
+                    `In-page request failed (${outcome.error}${outcome.message ? `: ${outcome.message}` : ''}).`)
             }
             return {
                 status: outcome.status,
@@ -287,9 +381,12 @@ function createResidents({
                 redirected: outcome.redirected,
                 headers: outcome.headers,
                 body: outcome.body,
+                ...verdict(outcome.headers, outcome.body, raced.kept ? 'network' : 'page'),
                 cookies: await currentCookies(entry)
             }
         } finally {
+            clearTimeout(backstop)
+            watch.stop()
             entry.inflight--
         }
     }
@@ -300,7 +397,7 @@ function createResidents({
     }
 
     /**
-     * Run a streaming fetch on a page handed out by acquire(); consumes that
+     * Run a streaming call on a page handed out by acquire(); consumes that
      * claim at once, for the reason the module comment gives.
      *
      * The page reports through its channel while the body arrives; what it
@@ -310,14 +407,19 @@ function createResidents({
      * of the response head, the result the jar as of the end. Not under the
      * account lock.
      *
+     * A challenge page the page's scripts kept from the call is relayed by
+     * the worker itself, from what the page's network saw: whole, the way the
+     * page relays an answer that is a page.
+     *
      * @param {object} entry
      * @param {{url: string, init: object, timeoutMs: number}} request as normalizeEgress returned it
      * @param {object} sink
      * @param {number} sink.id - What abort() names this stream by
      * @param {(event: object) => Promise<void>|void} sink.onEvent - May take its time: the page waits
-     * @returns {Promise<{cookies: ?Object[], aborted: boolean}>} the jar at the end; `aborted`
-     *   when the app went away and the fetch was cut for it
-     * @throws {WorkerError} the fetch's own failures, as fetch() throws them
+     * @returns {Promise<{cookies: ?Object[], aborted: boolean, challenge?: 'page'|'network'}>} the jar
+     *   at the end; `aborted` when the app went away and the request was cut
+     *   for it; `challenge` when the answer was a WAF challenge page
+     * @throws {WorkerError} the call's own failures, as fetch() throws them
      */
     async function stream(entry, request, { id, onEvent }) {
         let timer = null
@@ -333,6 +435,11 @@ function createResidents({
             timer = setTimeout(fire, request.timeoutMs + backstopMs)
             timer.unref?.()
         }
+        // The answer as relayed so far: its head and the start of its body
+        // are what a challenge page is recognised by.
+        let head = null
+        const start = []
+        let startBytes = 0
         const live = {
             entry,
             receive: async event => {
@@ -343,7 +450,14 @@ function createResidents({
                 entry.lastUsed = Date.now()
                 try {
                     // The jar as of the response head: its Set-Cookie is in the browser by now.
-                    if (event.type === 'head') event = { ...event, cookies: await currentCookies(entry) }
+                    if (event.type === 'head') {
+                        head = event
+                        event = { ...event, cookies: await currentCookies(entry) }
+                    } else if (event.type === 'chunk' && startBytes < CHALLENGE_HEAD_BYTES) {
+                        const bytes = Buffer.from(event.data, 'base64').subarray(0, CHALLENGE_HEAD_BYTES - startBytes)
+                        start.push(bytes)
+                        startBytes += bytes.length
+                    }
                     return await onEvent(event)
                 } finally {
                     arm()
@@ -353,46 +467,65 @@ function createResidents({
         streams.set(id, live)
         entry.inflight--
         arm()
+        const watch = watchAnswer(entry, request)
         // What the page ends up saying, however it ends: a value either way,
         // so the race below can only reject from the backstop. Deferred by a
         // microtask, so that even a page.evaluate throwing outright is caught.
-        const running = Promise.resolve().then(() => entry.page.evaluate(pageFetchStream, {
+        const running = Promise.resolve().then(() => entry.page.evaluate(pageCall, {
             ...request, maxBytes: maxStreamBytes, channel: STREAM_CHANNEL, registry: STREAM_ABORTS, id, reasons: ABORT_REASON
         })).then(outcome => ({ outcome }), error => ({ error }))
         try {
             let settled
             try {
-                settled = await Promise.race([running, hung])
+                settled = await Promise.race([running, hung, watch.answer.then(answer => new Promise(resolve => {
+                    // The page had its moment. Once it relayed anything of this
+                    // answer it is not keeping the answer back, and the answer is
+                    // its to finish.
+                    const grace = setTimeout(() => { if (!head) resolve({ kept: answer }) }, keptGraceMs)
+                    grace.unref?.()
+                }))])
             } catch (error) {
                 // Only the backstop gets here: the page stopped responding.
                 close(entry, 'unresponsive')
                 throw error
             }
+            if (settled.kept) {
+                // The call in the page is over, whether its scripts know it or
+                // not: its request is cut now, not when its own timer runs out.
+                await abort(id)
+                // Nothing the page reports from here on is relayed: the answer is out.
+                streams.delete(id)
+                const { body, ...head } = settled.kept
+                await live.receive({ type: 'head', ...head })
+                await live.receive({ type: 'chunk', data: body.toString('base64') })
+                return { cookies: await currentCookies(entry), aborted: false, challenge: 'network' }
+            }
             if (settled.error) {
                 // evaluate itself failed: the document left from under the
-                // fetch. A page that is still registered merely navigated.
+                // request. A page that is still registered merely navigated.
                 throw new WorkerError(pages.get(entry.email) === entry ? 'browser_error' : 'page_closed',
-                    'The resident page could not run the fetch.')
+                    'The resident page could not run the request.')
             }
             const { outcome } = settled
             if (!outcome.ok && outcome.error === 'aborted') return { cookies: null, aborted: true }
             if (!outcome.ok) {
                 throw new WorkerError(CODE_FOR_OUTCOME[outcome.error] || 'egress_failed',
-                    `In-page fetch failed (${outcome.error}${outcome.message ? `: ${outcome.message}` : ''}).`)
+                    `In-page request failed (${outcome.error}${outcome.message ? `: ${outcome.message}` : ''}).`)
             }
-            return { cookies: await currentCookies(entry), aborted: false }
+            return { cookies: await currentCookies(entry), aborted: false, ...verdict(head?.headers, Buffer.concat(start), 'page') }
         } finally {
             clearTimeout(timer)
             streams.delete(id)
+            watch.stop()
         }
     }
 
     /**
      * Cut a running stream short: the app that asked for it is gone. Reaches
-     * the fetch inside the page through the AbortController it registered —
-     * a fetch already running there is beyond a Node-side timer, let alone a
+     * the request inside the page through the AbortController it registered —
+     * a request already running there is beyond a Node-side timer, let alone a
      * destroyed socket. Resolves once the request was made; a page that
-     * cannot take it (navigating, closing) is losing the fetch anyway.
+     * cannot take it (navigating, closing) is losing the request anyway.
      * @param {number} id as given to stream()
      */
     async function abort(id) {

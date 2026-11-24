@@ -9,10 +9,14 @@
  *                         script: the call is pending and the page stops answering —
  *                         what the worker saw on prod on 2026-11-24
  *   STUB_MODE=waf         a model of the real page's request protection. The page's own
- *                         hook signs XMLHttpRequests to /api/v2/chats/… (x-stub-ua,
- *                         x-stub-umidtoken) and leaves fetch alone. The server answers
- *                         an unsigned chats/new with a challenge page under status 200,
- *                         the way qwen.ai's WAF did on 2026-11-24.
+ *                         hook (in the shape of baxiaCommon.js 2.5.37) signs every
+ *                         XMLHttpRequest, signs XMLHttpRequests to /api/v2/chats/… further
+ *                         (x-stub-ua, x-stub-umidtoken), and leaves fetch alone. The server
+ *                         answers an unsigned chats/new with a challenge page under status
+ *                         200, the way qwen.ai's WAF did on 2026-11-24. To a request whose
+ *                         onload or onloadend is set, the hook never tells such an answer
+ *                         — which is how the worker's call hung for 35 s that day. A request
+ *                         that listens with addEventListener gets it all the same.
  *   STUB_PORT             default 3847
  */
 const http = require('http')
@@ -29,17 +33,28 @@ const sockets = new Set()
 // What stands in for the page's own request hook (baxiaCommon.js on the real page).
 const hook = `
     (function () {
-        const open = XMLHttpRequest.prototype.open
-        XMLHttpRequest.prototype.open = function (method, url) {
+        const proto = XMLHttpRequest.prototype
+        const open = proto.open
+        proto.open = function (method, url) {
             this.protected = /\\/api\\/v2\\/chats\\//.test(String(url))
             return open.apply(this, arguments)
         }
-        const send = XMLHttpRequest.prototype.send
-        XMLHttpRequest.prototype.send = function () {
-            this.setRequestHeader('x-stub-v', '1')
+        const blocked = xhr => {
+            let text = ''
+            try { text = xhr.response || xhr.responseText } catch (error) { /* nothing to read yet */ }
+            return /aliyun_waf_/.test(String(text))
+        }
+        const send = proto.send
+        proto.send = function () {
+            this.setRequestHeader('x-stub-v', '2.5.37')
             if (this.protected) {
                 this.setRequestHeader('x-stub-ua', 'stub-ua')
                 this.setRequestHeader('x-stub-umidtoken', 'stub-umidtoken')
+            }
+            // An answer the hook takes for a block is never told to these.
+            for (const name of ['onload', 'onloadend']) {
+                const own = this[name]
+                if (own) this[name] = function (event) { if (!blocked(this)) own.call(this, event) }
             }
             return send.apply(this, arguments)
         }
