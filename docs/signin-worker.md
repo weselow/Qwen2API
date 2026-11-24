@@ -29,7 +29,10 @@ Aliyun/Baxia, HTML вместо JSON). В реальном браузерном 
   кэша не истёк; отказанная запись кэша сбрасывается до перезагрузки.
   Перекрывающиеся по времени продления схлопываются в одну перезагрузку —
   принудительные и обычные, включая тихое продление по таймеру.
-- `GET /health` → `{ok, sessions, residentPages, maxResidentPages}`.
+- `GET /health` → `{ok, sessions, residentPages, maxResidentPages, headless, headlessMode}`.
+  `headlessMode` говорит, какой headless-браузер воркер запускает (`shell`,
+  `chrome`, или `null` у браузера с окном), — чтобы проверить переключение до
+  первого запроса, которое от него зависит.
 - `POST /egress {email, url, method, headers, body, timeoutMs, proxy?}` →
   `{status, headers, body, url, redirected, cookies[]}` — запрос к qwen.ai **изнутри
   резидентной страницы** аккаунта (`page.evaluate` + `fetch` с
@@ -252,6 +255,7 @@ egress **выключен**, пока его не включат явно (`brow
 | --- | --- | --- |
 | `SIGNIN_WORKER_TOKEN` | пусто | Общий bearer-секрет; пусто = без авторизации (только внутренняя сеть) |
 | `SIGNIN_HEADLESS` | `true` | `false` — с видимым окном |
+| `SIGNIN_HEADLESS_MODE` | `shell` | Какой headless-браузер запускается (Qwen2API-3ue.4): `shell` — как раньше, Chrome Headless Shell, который называет себя `HeadlessChrome`; `chrome` — полный Chromium, предъявляющийся как браузер с окном. Действует, только пока `SIGNIN_HEADLESS=true`. Значение вне этих двух останавливает воркер на старте. Прокинут в Compose |
 | `SIGNIN_TIMEOUT_MS` | `120000` | Бюджет браузерных потоков (вход, ожидание токена); для `/egress` — `timeoutMs` по умолчанию |
 | `MAX_RESIDENT_PAGES` | `16` | Лимит резидентных страниц (~200–300 МБ Chromium на каждую). Прокинут в Compose |
 | `RESIDENT_KEEPALIVE_MS` | `300000` | Период, с которым воркер читает живую банку cookies страницы |
@@ -261,10 +265,41 @@ egress **выключен**, пока его не включат явно (`brow
 | `SIGNIN_LOGIN_MAX_WAIT_MS` | `120000` | Сколько `/session` может ждать свой слот в очереди входов; дольше — сразу `429 signin_paced`. Прокинут в Compose |
 
 Compose передаёт воркеру только то, что перечислено в `environment:` сервиса
-`signin-worker`: `SIGNIN_WORKER_TOKEN`, `SIGNIN_HEADLESS`, четыре переменные
-резидентных страниц и две переменные очереди входов. `SIGNIN_TIMEOUT_MS`,
-`SIGNIN_MIN_RENEW_DELAY_MS` и `SIGNIN_CHAT_ORIGIN` задаются только при запуске
-воркера вне Compose.
+`signin-worker`: `SIGNIN_WORKER_TOKEN`, `SIGNIN_HEADLESS`, `SIGNIN_HEADLESS_MODE`,
+четыре переменные резидентных страниц и две переменные очереди входов.
+`SIGNIN_TIMEOUT_MS`, `SIGNIN_MIN_RENEW_DELAY_MS` и `SIGNIN_CHAT_ORIGIN` задаются
+только при запуске воркера вне Compose.
+
+### Как браузер предъявляется: `SIGNIN_HEADLESS_MODE` (Qwen2API-3ue.4)
+
+Оба headless-режима Chromium называют себя `HeadlessChrome` в User-Agent, а
+оболочка (`shell`, режим воркера по умолчанию) — ещё и в подсказках клиента
+(`sec-ch-ua`), и у неё нет того, что есть у браузера с окном (`window.chrome`,
+список плагинов). Пускает ли qwen.ai headless-страницу, узнает первый живой
+запрос (см. `docs/prod-hybrid-deploy.md`, выкатка browser egress). Если нет,
+переключатель — `SIGNIN_HEADLESS_MODE=chrome`, без пересборки образа: полный
+Chromium лежит в образе рядом с оболочкой (`playwright install chromium`
+ставит оба).
+
+`chrome` запускает полный Chromium и убирает «Headless» из его User-Agent —
+и больше ничего не меняет: подсказки клиента уходят собственные, прочитанные
+у браузера до первой навигации, а окно получает рамку, как у браузера с окном.
+Замерено (`tools/worker-identity-probe.js`, против заглушки на 127.0.0.1, на
+Windows и в образе воркера на Linux): по всем полям, которые читает проба, режим
+`chrome` совпадает с запуском того же Chromium с окном; оболочка отличается в
+14 полях. Почему нельзя просто подменить строку User-Agent и что это стоило —
+в `docs/browser-egress-design.md`, раздел «HeadlessChrome».
+
+Цена режима `chrome` — память: около 340 МБ на браузер против 180 МБ у оболочки
+(Linux, PSS, замер 24.11), плюс ~0,3 с на чтение identity при запуске. Вход и
+капча в нём живьём не проверялись — только тождество страницы; это делает смоук.
+
+Перепроверить после обновления Playwright (без выхода в интернет):
+
+```sh
+node tools/worker-identity-probe.js            # shell, полный Chromium, chrome
+node tools/worker-identity-probe.js --headed   # + эталон: тот же браузер с окном
+```
 
 ## Сборка и запуск
 
@@ -309,9 +344,13 @@ Playwright; этот смоук — единственный способ без
 стриминг (Qwen2API-3ue.3): реле отдаёт куски по мере поступления (кадр,
 разрезанный внутри двухбайтового символа, приходит целым), разрыв реле
 отменяет fetch внутри страницы, стрим не держит страницу от перезагрузки, а
-канал страницы переживает перезагрузки. Запускать после
+канал страницы переживает перезагрузки. И режим `chrome`
+(Qwen2API-3ue.4): настоящий `openContext` запускает полный Chromium на профиле,
+который до этого написала оболочка, и заглушка видит User-Agent без «Headless»,
+собственные подсказки браузера и тот же профиль после перезагрузки. Запускать после
 правок `signin-worker/server.js`, `signin-worker/lib/login-pacer.js`,
-`signin-worker/lib/resident-pages.js` и `signin-worker/lib/egress-fetch.js`:
+`signin-worker/lib/resident-pages.js`, `signin-worker/lib/egress-fetch.js`,
+`signin-worker/lib/browser-signin.js` и `signin-worker/lib/browser-identity.js`:
 
 ```sh
 bunx playwright install chromium   # один раз
@@ -343,6 +382,14 @@ headless начнёт помечаться WAF; в контейнере это �
   (shape запросов, bearer, маппинг кодов ошибок, `force`, бюджет вызова).
 - `tests/signin-worker-service.test.js` — сам воркер с фейковым браузерным
   модулем: кэш, тихое продление, сериализация запусков на профиль, коды ошибок.
+- `tests/signin-worker-identity.test.js` — headless-режим воркера
+  (Qwen2API-3ue.4): `SIGNIN_HEADLESS_MODE` читается строго и доходит до каждого
+  запуска браузера; режим `chrome` запускает полный Chromium, меняет в
+  User-Agent одно слово, несёт собственные подсказки браузера в сессии, которая
+  живёт столько же, сколько контекст, и закрывает браузер, если не получилось.
+- `tests/egress-log-watch.test.js` — `tools/egress-log-watch.js`: счётчик
+  логов выкатки читает строки той формы, которую печатает код, и называет
+  причины, по которым час логов нельзя признать чистым.
 - `tests/signin-worker-pacing.test.js` — очередь полных входов и дедуп
   `/session`: слоты и пауза между входами, отказ `signin_paced` без слота,
   живая сессия вместо входа, `force`, один вход на всех ждущих, продление
