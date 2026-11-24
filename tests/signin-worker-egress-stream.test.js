@@ -198,7 +198,7 @@ async function start(t, options) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwen-signin-stream-'))
   const server = createServer({
     dataDir, token: 'secret', timeoutMs: 120000, maxPages: 16,
-    minRenewDelayMs: 60000, keepAliveMs: 60000, drainMs: 1000, backstopMs: 5000, frontEndMs: 100,
+    minRenewDelayMs: 60000, keepAliveMs: 60000, drainMs: 1000, backstopMs: 5000, frontEndMs: 100, settleStableMs: 40, settlePollMs: 10, settleTimeoutMs: 300,
     // Login pacing is signin-worker-pacing.test.js's subject.
     minLoginIntervalMs: 1,
     ...options

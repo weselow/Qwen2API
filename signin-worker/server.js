@@ -128,6 +128,11 @@ function createServer(overrides = {}) {
         // off the page's network this long after qwen.ai answered
         // (Qwen2API-3ue.6).
         keptGraceMs: overrides.keptGraceMs ?? 1000,
+        // After a page (re)loads its token changes more than once; a call
+        // before it has settled is refused (Qwen2API-3ue.5).
+        settleStableMs: overrides.settleStableMs ?? 2500,
+        settlePollMs: overrides.settlePollMs ?? 250,
+        settleTimeoutMs: overrides.settleTimeoutMs ?? 20000,
         // Grace periods, all bounded so a wedged browser cannot stall a request.
         drainMs: overrides.drainMs ?? 5000,
         backstopMs: overrides.backstopMs ?? 5000,
@@ -235,6 +240,9 @@ function createServer(overrides = {}) {
         maxBytes: config.egressMaxBytes,
         maxStreamBytes: config.egressMaxStreamBytes,
         keptGraceMs: config.keptGraceMs,
+        settleStableMs: config.settleStableMs,
+        settlePollMs: config.settlePollMs,
+        settleTimeoutMs: config.settleTimeoutMs,
         drainMs: config.drainMs,
         backstopMs: config.backstopMs,
         closeMs: config.closeMs,

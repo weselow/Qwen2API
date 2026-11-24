@@ -53,6 +53,10 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
  *   already gave before the worker reads it off the page's network. Default 1000
  * @param {number} [options.frontEndMs] - How long the page's opening waits for the front end's
  *   version. Default 2000
+ * @param {number} [options.settleStableMs] - How long the page's token must stay the same after a
+ *   (re)load before a call may go out. Default 2500
+ * @param {number} [options.settlePollMs] - How often it is read meanwhile. Default 250
+ * @param {number} [options.settleTimeoutMs] - How long the wait may take at most. Default 20000
  */
 function createResidents({
     signer,
@@ -67,6 +71,9 @@ function createResidents({
     maxStreamBytes = 0,
     keptGraceMs = 1000,
     frontEndMs = 2000,
+    settleStableMs = 2500,
+    settlePollMs = 250,
+    settleTimeoutMs = 20000,
     drainMs = 5000,
     backstopMs = 5000,
     closeMs = 5000,
@@ -243,15 +250,58 @@ function createResidents({
      * must neither hold the page's opening nor fail it.
      */
     async function frontEnd(entry) {
-        let wait
-        const version = await Promise.race([
-            Promise.resolve().then(() => entry.page.evaluate(readFrontEndVersion)).catch(() => ''),
-            new Promise(resolve => {
-                wait = setTimeout(() => resolve(''), frontEndMs)
-                wait.unref?.()
-            })
-        ]).finally(() => clearTimeout(wait))
+        const version = await asked(entry, readFrontEndVersion, frontEndMs)
         return version || 'unknown'
+    }
+
+    /**
+     * What the page answers to a question, or null: if it cannot be asked,
+     * does not answer, or does not answer within `ms`. A page that does not
+     * answer is not what any wait here is for, and no wait may hang on it.
+     */
+    async function asked(entry, question, ms) {
+        let timer
+        try {
+            return await Promise.race([
+                Promise.resolve().then(() => entry.page.evaluate(question)).catch(() => null),
+                new Promise(resolve => {
+                    timer = setTimeout(() => resolve(null), ms)
+                    timer.unref?.()
+                })
+            ])
+        } finally {
+            clearTimeout(timer)
+        }
+    }
+
+    /**
+     * Wait until the page's token has stopped changing. A page that has just
+     * (re)loaded exchanges its token more than once as it boots (24.11, prod:
+     * the old one, then one for 30 days, then one for 15 minutes — within
+     * about a second), and a call made before that is over is refused as
+     * unauthorized: chats/new was, 0.3 s after the page opened, and passed
+     * on the same page a minute later. The app would answer that refusal
+     * with a reload and a retry — into a page that has just reloaded.
+     *
+     * Bounded, and it says nothing of which token a renewal harvested: that
+     * stays the first stable one, as before. A page that cannot be asked, or
+     * shows no token, is not waited for: nothing here is what deals with that.
+     */
+    async function settle(entry) {
+        const deadline = Date.now() + settleTimeoutMs
+        let previous
+        let since = Date.now()
+        while (Date.now() < deadline) {
+            const token = await asked(entry, () => localStorage.getItem('token'), deadline - Date.now())
+            if (typeof token !== 'string' || !token) return
+            if (token !== previous) {
+                previous = token
+                since = Date.now()
+            } else if (Date.now() - since >= settleStableMs) {
+                return
+            }
+            await sleep(settlePollMs)
+        }
     }
 
     /**
@@ -315,6 +365,7 @@ function createResidents({
             await entry.page.exposeFunction(STREAM_CHANNEL, onStreamEvent)
             watch(entry)
             const harvested = await signer.renew(entry.context, { chatOrigin, timeoutMs: openTimeoutMs })
+            await settle(entry)
             onHarvest(email, harvested, proxy)
             entry.state = 'ready'
             entry.keepAlive = setInterval(() => { keepAlive(entry) }, keepAliveMs)
@@ -549,7 +600,11 @@ function createResidents({
         entry.exclusive = true
         try {
             await drain(entry)
-            return await operation(entry.context)
+            const result = await operation(entry.context)
+            // The operation reloaded the page (or signed in on it): no call
+            // goes out into it before its token has settled.
+            await settle(entry)
+            return result
         } catch (error) {
             await close(entry, 'operation_failed')
             throw error
