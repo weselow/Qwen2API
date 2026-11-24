@@ -25,7 +25,7 @@ const accountManager = require('../src/utils/account')
 const browserEgress = require('../src/utils/browser-egress')
 const transport = require('../src/utils/impersonate-transport')
 const { generateChatID, sendChatRequest } = require('../src/utils/request')
-const { ChatCreationError, isWafChallengeError } = require('../src/utils/upstream-error')
+const { ChatCreationError, isWafChallengeError, resetChatChallengeBreaker } = require('../src/utils/upstream-error')
 const { consumeSSEStream } = require('../src/utils/sse')
 const { text } = require('node:stream/consumers')
 const { logger } = require('../src/utils/logger')
@@ -224,6 +224,8 @@ test.beforeEach(async () => {
     config.sessionReloginMinIntervalMs = 0
     sessionPersistence.resetRecoveryForTests()
     sessionPersistence.setRecoveryClockForTests(null)
+    // A challenge one test answered must not pause the next one's requests.
+    resetChatChallengeBreaker()
     browserEgress.setTimingForTests()
 })
 
@@ -1041,6 +1043,28 @@ test('once a reload did not help, the next recovery is a full sign-in, not anoth
     assert.equal(worker.count('/renew'), 1)
 })
 
+test('a WAF challenge never reaches the password — not even on an account that waits for its next sign-in', async () => {
+    const account = givenAccount()
+    accountManager.accountTokens = [account]
+    const signedIn = harvested('signed-in')
+    worker.script.egress = () => unauthorized()
+    await assert.rejects(generateChatID(account.token, MODEL, account), { code: 'upstream_session_unauthorized' })
+    await until(() => current()?.token === signedIn.token)
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress', '/session'])
+
+    // The account now waits for its next sign-in. Its next chats/new is not
+    // refused but challenged: that is a reload and one retry — and no password.
+    worker.script.egress = () => challenged()
+    await assert.rejects(generateChatID(current().token, MODEL, account), { code: 'upstream_waf_challenge', status: 503 })
+    assert.deepEqual(worker.routes().slice(4), ['/egress', '/renew', '/egress'])
+    await until(() => sessionPersistence.renewals.size === 0)
+    assert.equal(worker.count('/session'), 1, 'a password was spent on a WAF challenge')
+    // The account still waits for its sign-in where a refused session is concerned.
+    worker.script.egress = () => unauthorized()
+    await assert.rejects(generateChatID(current().token, MODEL, account), { code: 'upstream_session_unauthorized' })
+    assert.equal(worker.count('/session'), 2)
+})
+
 test('an accepted session ends the escalation: the next refusal is answered with a reload again', async () => {
     const account = givenAccount()
     const answers = [
@@ -1223,7 +1247,11 @@ test('COMPLETIONS_TRANSPORT=browser sends the call from the page and hands the a
     assert.equal(completions.stream, true)
     assert.equal(completions.proxy, null)
     assert.equal(completions.timeoutMs, browserEgress.COMPLETIONS_TIMEOUT_MS)
-    assert.deepEqual(Object.keys(completions.headers).sort(), ['authorization', 'content-type', 'x-request-id'])
+    // The app puts its own on the call; the rest of what a request of the
+    // page's carries is the worker's (Qwen2API-3ue.5) — except the one the
+    // page's own completions call differs in from its other XHRs.
+    assert.deepEqual(Object.keys(completions.headers).sort(), ['accept', 'authorization', 'content-type', 'x-request-id'])
+    assert.equal(completions.headers.accept, 'application/json')
     assert.equal(completions.headers.authorization, `Bearer ${account.token}`)
     assert.deepEqual(JSON.parse(completions.body), {
         model: MODEL, max_tokens: 64, stream: true, chat_id: 'chat-1', chatId: 'chat-1', parent_id: null, parentId: null,
@@ -1556,6 +1584,22 @@ test('a worker that cannot serve the call is retried, then answered with a 503 t
     }
 })
 
+test('a call a script of the page cut (page_fault, the relay’s last event) is retried and is not the account’s', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    Object.assign(config, { chatRetryCount: QUICK_RETRY.count, chatRetryBackoffMs: QUICK_RETRY.backoffMs })
+    const account = givenAccount()
+    worker.script.egress = body => (body.stream === true ? (() => { const stream = relay(); stream.fail('page_fault'); return stream.open })() : egress(chat('chat-1')))
+
+    const { value: result, charged } = await charging(() => sendChatRequest(BODY, { currentAccount: account }))
+    assert.equal(result.status, false)
+    assert.deepEqual(result.failure, UNCLASSIFIED_503)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress'], 'one retry')
+    assert.deepEqual(charged, [], 'the page’s doing, not the account’s')
+    assert.ok(logs.some(args => String(args[0]).includes('page_fault')), 'the log says whose failure it was')
+    // And nothing of the session was touched for it: no reload, no password.
+    assert.equal(worker.count('/renew') + worker.count('/session'), 0)
+})
+
 test('a worker refusing the call itself is a configuration: not retried, not recovered', { timeout: 10000 }, async () => {
     config.completionsTransport = 'browser'
     Object.assign(config, { chatRetryCount: QUICK_RETRY.count, chatRetryBackoffMs: QUICK_RETRY.backoffMs })
@@ -1679,18 +1723,114 @@ test('only a refusal of the SESSION in the first frame is a recovery; any other 
     }
 })
 
-test('an HTML challenge as the answer is screened as a direct one is', { timeout: 10000 }, async () => {
-    config.completionsTransport = 'browser'
-    const account = givenAccount()
+// An answer that is a WAF challenge page, status 200 and all: what qwen.ai
+// gave an API call through the page on 2026-11-24. The worker relays it whole.
+// In two pieces, the marker in the second and after a blank line: a reader
+// that stopped where a frame of a stream ends would never see it.
+const challenging = (page = `<html>\n<head>\n</head>\n\n<body><meta name="aliyun_waf_aa" content="${SECRET}"></body></html>`) => {
     const stream = relay()
     stream.head(200, { 'content-type': 'text/html; charset=utf-8' })
-    stream.chunk(`<html><meta name="aliyun_waf_aa" content="${SECRET}"></html>`)
+    const cut = page.indexOf('\n\n') + 2
+    stream.chunk(page.slice(0, cut))
+    stream.chunk(page.slice(cut))
     stream.end()
-    scripted(stream)
+    return stream
+}
+
+test('a WAF challenge page as the answer gets the live reload and exactly one retry', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    accountManager.accountTokens = [account]
+    const challenged = challenging()
+    scripted(challenged, answering())
+
+    const result = await sendChatRequest(BODY, { currentAccount: account })
+    assert.equal(result.status, true)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
+    assert.equal(completionsCalls()[1].headers.authorization, `Bearer ${tokenWith('renewed')}`)
+    // A reload is all it took: no password — chats/new accepted this session a moment ago.
+    assert.equal(worker.count('/session'), 0)
+    assert.equal(JSON.stringify(logs).includes(SECRET), false, 'the challenge page never reaches a log line')
+    // The client gets the retried answer: its first frame, and nothing of the page.
+    const answer = result.response[Symbol.asyncIterator]()
+    assert.equal((await answer.next()).value.toString('utf8'), frame({ content: 'по' }))
+})
+
+test('a challenge that outlasts the reload is screened as a direct one is — and never costs a password', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    // For as many relays as the app asks.
+    worker.script.egress = body => (body.stream === true ? challenging().open : egress(chat('chat-1')))
 
     await assert.rejects(sendChatRequest(BODY, { currentAccount: account }), isWafChallengeError)
-    assert.equal(worker.count('/renew'), 0)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
+    assert.equal(worker.count('/session'), 0)
     assert.equal(JSON.stringify(logs).includes(SECRET), false)
+})
+
+test('an HTML answer is read whole even where its pieces come with a pause', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    // The first-frame grace is short here: a pause in the page longer than it must not end the reading.
+    browserEgress.setTimingForTests({ firstFrameMs: 40 })
+    const account = givenAccount()
+    const page = `<html>\n<head>\n</head>\n\n<body><meta name="aliyun_waf_aa" content="${SECRET}"></body></html>`
+    const first = page.indexOf('\n\n') + 2
+    const stream = relay()
+    stream.head(200, { 'content-type': 'text/html; charset=utf-8' })
+    stream.chunk(page.slice(0, first))
+    // The rest of the page comes after a pause longer than the grace.
+    setTimeout(() => {
+        stream.chunk(page.slice(first))
+        stream.end()
+    }, 150)
+    scripted(stream, answering())
+
+    const result = await sendChatRequest(BODY, { currentAccount: account })
+    assert.equal(result.status, true, 'the page was given up on before its marker was in')
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
+})
+
+test('a challenge whose reload fails earns no password: the answer goes on as it is', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    worker.script.egress = body => (body.stream === true ? challenging().open : egress(chat('chat-1')))
+    // The page cannot be reloaded: the profile is gone. For a refused SESSION
+    // that would be the password's moment; for a challenge it never is.
+    worker.script.renew = () => refused(404, 'no_profile')
+
+    await assert.rejects(sendChatRequest(BODY, { currentAccount: account }), isWafChallengeError)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew'])
+    await until(() => sessionPersistence.renewals.size === 0)
+    assert.equal(worker.count('/session'), 0, 'a password was spent on a WAF challenge')
+})
+
+test('one recovery per interval: a challenge inside the window is answered as it is, with no second reload', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    config.sessionRecoveryMinIntervalMs = 60000
+    const account = givenAccount()
+    worker.script.egress = body => (body.stream === true ? challenging().open : egress(chat('chat-1')))
+
+    await assert.rejects(sendChatRequest(BODY, { currentAccount: account }), isWafChallengeError)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
+    await until(() => sessionPersistence.renewals.size === 0)
+    await assert.rejects(sendChatRequest(BODY, { currentAccount: account }), isWafChallengeError)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress', '/egress', '/egress'])
+    assert.equal(worker.count('/session'), 0)
+})
+
+test('an HTML answer that is no challenge goes on as it is: nothing is reloaded', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    const maintenance = '<!doctype html><html><title>Maintenance</title></html>'
+    scripted(challenging(maintenance))
+
+    const response = await browserEgress.postCompletions({
+        account, url: `${COMPLETIONS}chat-1`, body: '{"stream":true}', token: account.token, timeoutMs: 600000
+    })
+    assert.equal(response.status, 200)
+    assert.equal(response.headers['content-type'], 'text/html; charset=utf-8')
+    assert.equal(await text(response.data), maintenance)
+    assert.deepEqual(worker.routes(), ['/egress'])
 })
 
 test('a 429 from qwen.ai is the quota, with its Retry-After, as it is on the direct transports', { timeout: 10000 }, async () => {

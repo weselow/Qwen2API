@@ -9,8 +9,10 @@ const { getTimezoneHeader } = require('./tools')
 
 // chat.qwen.ai 前端版本（FE version）：请求头 Version 必须与线上前端一致，
 // 否则 /api/v2/chat/completions 返回 Bad_Request（2026-11-21 实测线上为 0.3.49，
-// 见 docs/et0-live-integration-2026-11-21.md；漂移检测：tools/et0-live-probe.js）。
-const QWEN_WEB_VERSION = '0.3.49'
+// 2026-11-24 线上为 0.3.50——页面自己请求里的 version，见 Qwen2API-3ue.5；
+// 漂移检测：tools/et0-live-probe.js）。只用于直连路径：走 signin-worker 的
+// 调用由页面自己给出它的版本（signin-worker/lib/egress-fetch.js）。
+const QWEN_WEB_VERSION = '0.3.50'
 
 // Refreshed against locally observed Chrome 157 (not a stable-release claim).
 // Keep the existing four-major deterministic profile spread.

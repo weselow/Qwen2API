@@ -22,7 +22,7 @@ const FE_HEADERS = {
     'content-type': 'application/json',
     'accept': 'application/json',
     'source': 'web',
-    'Version': '0.3.49',
+    'Version': '0.3.50',
     'timezone': 'Sat Nov 21 2026 19:55:52 GMT+0400',
     'referer': 'https://chat.qwen.ai/c/abc123',
     'Authorization': `Bearer ${TOKEN}`,
@@ -109,7 +109,7 @@ test('impersonate argv carries the chrome116 TLS profile, FE headers over argv a
     for (const pair of [
         `Authorization: Bearer ${TOKEN}`,
         `cookie: token=${TOKEN}; ssxmod_itna=fingerprint`,
-        'Version: 0.3.49',
+        'Version: 0.3.50',
         'timezone: Sat Nov 21 2026 19:55:52 GMT+0400',
         'source: web',
         'content-type: application/json'

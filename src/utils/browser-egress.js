@@ -4,7 +4,7 @@ const { Readable } = require('node:stream')
 const store = require('./v2-session-store')
 const signinWorker = require('./signin-worker-client')
 const sessionPersistence = require('./v2-session-persistence')
-const { ChatCreationError, assertChatCreationResponse } = require('./upstream-error.js')
+const { ChatCreationError, assertChatCreationResponse, isWafChallengeBody } = require('./upstream-error.js')
 const { SigninError } = require('./signin-error')
 const { generateUUID } = require('./tools.js')
 const { logger } = require('./logger')
@@ -40,6 +40,7 @@ const RECOVERABLE = new Set(['upstream_session_unauthorized', 'upstream_waf_chal
 // is not the session's fault, and logins are what it punishes: that one gets
 // its reload and retry, and nothing more.
 const UNAUTHORIZED = 'upstream_session_unauthorized'
+const WAF_CHALLENGE = 'upstream_waf_challenge'
 
 const recoverable = error => error instanceof ChatCreationError && RECOVERABLE.has(error.code)
 
@@ -55,15 +56,20 @@ const usesWorker = (transport, { v2SessionMode, signinWorkerConfigured }) => (
 
 const enabled = () => usesWorker(config.chatCreationTransport, config)
 
-// Only what the page's own client adds and qwen.ai needs from us; TLS,
-// cookies, user agent and the sec-ch-* set are the browser's. The 2026-11-23
-// probe passed with content-type + x-request-id. The Bearer is the session's,
-// so a token the page rotated away from is refused here — and recovered inside
-// this request — instead of failing the generation later on a direct call.
-const egressHeaders = token => ({
+// What the app itself puts on an egress call. Everything a request of the
+// page's own carries besides is the worker's to send, and it sends it with
+// every call (Qwen2API-3ue.5): accept, source, the language, the time zone and
+// the front end's version, read off the page — the direct path's profile has
+// them from the account's fingerprint, which is not what the page says. The
+// Bearer is the session's, so a token the page rotated away from is refused
+// here — and recovered inside this request — instead of failing the generation
+// later on a direct call.
+const egressHeaders = (token, accept) => ({
     'content-type': 'application/json',
     'x-request-id': generateUUID(),
-    authorization: `Bearer ${token}`
+    authorization: `Bearer ${token}`,
+    // The one call the page's own code sends with another accept than its XHRs' default.
+    ...(accept ? { accept } : {})
 })
 
 /**
@@ -219,6 +225,10 @@ const isUnauthorized = payload => Boolean(payload) && typeof payload === 'object
     [payload.code, payload.error, payload.error?.code, payload.data?.code]
         .some(code => typeof code === 'string' && code.toLowerCase() === 'unauthorized')
 
+// An HTML answer to an API call. On qwen.ai that is a WAF challenge page under
+// status 200 (2026-11-24, through the page): the worker relays it whole.
+const isHtmlAnswer = headers => /text\/html/i.test(String(headers?.['content-type'] || ''))
+
 // The first complete SSE frame of what was relayed so far, and its payload
 // when it is JSON.
 const firstSseFrame = buffered => {
@@ -265,7 +275,8 @@ async function openCompletions(context, token) {
     let relay
     try {
         relay = await signinWorker.egressStream(context.email, context.account, {
-            url: context.url, headers: egressHeaders(token), body: context.body, timeoutMs: context.timeoutMs
+            // The page's own completions call says `accept: application/json`, where its other XHRs carry axios's default.
+            url: context.url, headers: egressHeaders(token, 'application/json'), body: context.body, timeoutMs: context.timeoutMs
         })
     } catch (error) {
         // The profile no longer authenticates: the same refusal chats/new makes of it.
@@ -366,16 +377,19 @@ async function openCompletions(context, token) {
         /**
          * The answer as far as its first complete SSE frame — every byte of it
          * included — or as far as the grace allows. `frame` is null when no
-         * frame completed in time (or the answer is not SSE at all).
+         * frame completed in time (or the answer is not SSE at all). With
+         * `whole` nothing stops at a frame or at the grace: the answer is read
+         * to its end, bounded by the size and by the relay's own silence budget.
+         * @param {boolean} [whole]
          * @returns {Promise<{bytes: Buffer[], frame: {text: string, payload: object|null}|null}>}
          */
-        async firstFrame() {
+        async firstFrame({ whole = false } = {}) {
             const bytes = []
             let size = 0
             const started = Date.now()
             for (;;) {
                 const left = firstFrameGraceMs - (Date.now() - started)
-                const event = left > 0 ? await readWithin(left) : await read()
+                const event = !whole && left > 0 ? await readWithin(left) : await read()
                 if (event === null) return { bytes, frame: null }
                 if (event.type === 'end') {
                     ended = true
@@ -386,7 +400,7 @@ async function openCompletions(context, token) {
                 bytes.push(Buffer.from(event.data, 'base64'))
                 size += bytes.at(-1).length
                 const frame = firstSseFrame(bytes)
-                if (frame || size >= FIRST_FRAME_MAX_BYTES) return { bytes, frame }
+                if (size >= FIRST_FRAME_MAX_BYTES || (!whole && frame)) return { bytes, frame }
             }
         },
         /**
@@ -456,13 +470,22 @@ async function streamCompletions(context, token) {
         // stored cookies of the same name.
         sessionPersistence.syncCookies(context.email, relay.head.cookies)
         if (relay.head.status < 200 || relay.head.status >= 300) throw await relay.refusal()
+        // An HTML answer is read whole — a challenge page is told by its
+        // markers, and it is a page, not a frame of an answer.
+        const html = isHtmlAnswer(relay.head.headers)
         // Nothing has reached the client yet, so a refusal is still one this
         // request can answer — by the caller's retry in postCompletions.
-        const first = await relay.firstFrame()
-        if (isUnauthorized(first.frame?.payload)) throw httpError(401, relay.head, first.frame.text)
+        const first = await relay.firstFrame({ whole: html })
+        if (!html && isUnauthorized(first.frame?.payload)) throw httpError(401, relay.head, first.frame.text)
         // (The session is not marked accepted here: chats/new did that for this
         // very request a moment ago, and it is the call that proves a session.)
-        return relay.handOff(first.bytes)
+        return {
+            response: relay.handOff(first.bytes),
+            // A WAF challenge page, status 200 and all (2026-11-24): the worker
+            // hands it on as qwen.ai's answer; whether it is one is said here,
+            // by the markers the direct path is screened by.
+            challenge: html && isWafChallengeBody(Buffer.concat(first.bytes).toString('utf8'))
+        }
     } catch (error) {
         relay.stop()
         throw error
@@ -472,7 +495,10 @@ async function streamCompletions(context, token) {
 /**
  * One completions call from inside the account's resident page, with the
  * recovery chats/new gets: a session qwen.ai refuses is replaced by a live
- * one (the page is reloaded) and the call is made exactly once more.
+ * one (the page is reloaded) and the call is made exactly once more. So is a
+ * WAF challenge page — what a refusal of the request, not of the session,
+ * looks like through the page (Qwen2API-3ue.6): the page is reloaded and the
+ * call made once more.
  *
  * Unlike chats/new, a refusal that survives the reload escalates to nothing.
  * The password is spent on chats/new's verdict alone — that is the call that
@@ -500,20 +526,32 @@ async function postCompletions(context) {
     // The silence budget is the direct transports' unless the caller brings a
     // number of its own (an undefined one would arm every timer for "NaN").
     const call = { ...context, email, timeoutMs: context.timeoutMs ?? COMPLETIONS_TIMEOUT_MS }
+    // A sibling request may have replaced the session this call went out on
+    // (and was refused or challenged on): that one carries the retry.
+    const recovered = async reason => {
+        const latest = store.sessions.get(email)
+        return latest && latest.token !== session?.token
+            ? latest
+            : await sessionPersistence.recoverSession(email, account, reason)
+    }
     for (let attempt = 1; ; attempt++) {
         try {
-            return await streamCompletions(call, token)
+            const { response, challenge } = await streamCompletions(call, token)
+            if (!challenge || attempt > 1) return response
+            // Challenged again after the reload: the answer goes on as it is,
+            // and the caller screens it as it screens a direct one's.
+            const live = await recovered(WAF_CHALLENGE)
+            if (!live) return response
+            // The challenged answer is nobody's now: its relay is closed.
+            response.data.destroy()
+            session = live
+            token = live.token
         } catch (error) {
             if (error.response?.status !== 401 || attempt > 1) throw error
-            // A sibling request may have replaced the session this call went
-            // out on (and was refused on): that one carries the retry.
-            const latest = store.sessions.get(email)
-            const recovered = latest && latest.token !== session?.token
-                ? latest
-                : await sessionPersistence.recoverSession(email, account, UNAUTHORIZED)
-            if (!recovered) throw error
-            session = recovered
-            token = recovered.token
+            const live = await recovered(UNAUTHORIZED)
+            if (!live) throw error
+            session = live
+            token = live.token
         }
     }
 }

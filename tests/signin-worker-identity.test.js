@@ -315,7 +315,8 @@ test('the resident pages on their own open with the shell, and pass on what they
     const signer = {
       async openContext(options) {
         opens.push(options)
-        const page = { ...emitter(), exposeFunction: async () => {} }
+        // A page is asked one thing as it opens (the front end's version, for the log).
+        const page = { ...emitter(), exposeFunction: async () => {}, evaluate: async () => '' }
         return { ...emitter(), pages: () => [page], cookies: async () => [], close: async () => {} }
       },
       async renew() {
