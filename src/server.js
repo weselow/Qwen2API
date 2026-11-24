@@ -103,7 +103,11 @@ const serverInfo = {
   searchInfoMode: config.searchInfoMode === 'table' ? '表格' : '文本',
   dataSaveMode: config.dataSaveMode,
   logLevel: config.logLevel,
-  enableFileLog: config.enableFileLog
+  enableFileLog: config.enableFileLog,
+  // Which way qwen.ai calls leave (Qwen2API-3ue.4): the log of a watch window
+  // then says by itself which flags were in effect.
+  chatCreationTransport: config.chatCreationTransport,
+  completionsTransport: config.completionsTransport
 }
 
 // 应用持久化的运行时设置（web UI > env > hardcoded default）
