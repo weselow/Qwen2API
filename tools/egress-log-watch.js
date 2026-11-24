@@ -20,10 +20,13 @@
 const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g')
 const WORKER_LINE = /^(\d{4}-\d\d-\d\dT[\d:.]+Z) (request|egress-stream|egress|resident-open|resident-close|resident-shutdown|renew|session|silent-renew|signin-worker|stopping)\b ?(.*)$/
 const APP_LINE = /^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \[(ERROR|WARN|INFO|SUCCESS|DEBUG)\] \[([^\]]+)\] ?(.*)$/
-// The app's startup record prints its flags as an object on the lines after it.
-const FLAG_LINE = /^ {2}(chatCreationTransport|completionsTransport): '([a-z]+)',?$/
+// The app's start-up record prints its flags as an object on the lines after
+// it. The app runs on Bun, which quotes strings with double quotes; Node, on
+// a developer's machine, with single ones.
+const FLAG_LINE = /^ {2}(chatCreationTransport|completionsTransport): (["'])([a-z]+)\2,?$/
 
 const CHATS_NEW = '/api/v2/chats/new'
+const REFUSED_PREFIX = 'app.chatsNewRefused.'
 // Why a resident page closes other than on purpose (evicted, shut down, proxy changed).
 const PAGE_DEATHS = ['unresponsive', 'page_crashed', 'context_closed', 'keepalive_failed', 'open_failed', 'operation_failed']
 const REFUSALS = ['upstream_session_unauthorized', 'upstream_waf_challenge']
@@ -65,8 +68,12 @@ function readWorkerLine(report, event, detail) {
             else bump(report, 'unparsed.worker')
             return
         case 'request':
-            if ((found = /^POST (\/\w+) -> (\d{3}) /.exec(detail))) bump(report, `workerHttp.${found[1].slice(1)}.${found[2]}`)
-            else bump(report, 'unparsed.worker')
+            // The app's calls are POSTs to a route; anything else that reached the
+            // worker is listed under "other".
+            if ((found = /^(\w+) (\S+) -> (\d{3}) /.exec(detail))) {
+                const route = found[1] === 'POST' && /^\/\w+$/.test(found[2]) ? found[2].slice(1) : 'other'
+                bump(report, `workerHttp.${route}.${found[3]}`)
+            } else bump(report, 'unparsed.worker')
             return
         case 'resident-open':
             if ((found = /^ok \((\d+)\/(\d+) pages\)$/.exec(detail))) {
@@ -114,7 +121,7 @@ function readAppLine(report, level, message) {
     const first = /^\S+/.exec(message)?.[0]
     if (first && !/[\p{L}\p{N}"'`]/u.test(first)) message = message.slice(first.length).trimStart()
     let found
-    if ((found = /^Qwen chat creation failed: category=([a-z_]+)/.exec(message))) {
+    if ((found = /^Qwen chat creation failed: category=([a-z0-9_]+)/.exec(message))) {
         bump(report, `app.chatsNewRefused.${found[1]}`)
     } else if (message.includes('chats/new через signin-worker не прошёл')) {
         bump(report, `app.workerRefused.chatsNew.${(/\(([a-z_]+)\)/.exec(message) || [null, 'unreachable'])[1]}`)
@@ -152,7 +159,7 @@ function summarize(lines, report = newReport()) {
             // The app's clock is local time without a zone: it does not feed the window.
             readAppLine(report, found[2], found[4])
         } else if ((found = FLAG_LINE.exec(line))) {
-            report.flags = { ...(report.flags || {}), [found[1]]: found[2] }
+            report.flags = { ...(report.flags || {}), [found[1]]: found[3] }
         } else if (line.trim()) {
             report.lines.other++
         }
@@ -179,16 +186,37 @@ function complaints(report) {
     }
     // Any other way chats/new failed (a 409 with no session, an answer of an unknown shape, a quota):
     // in an hour through the pages there is no such thing as a harmless one.
-    const otherwise = [...report.counts.keys()].filter(name => name.startsWith('app.chatsNewRefused.') && !REFUSALS.includes(name.slice(18)))
-    if (otherwise.length) why.push(`chats/new failed otherwise: ${otherwise.map(name => `${name.slice(18)} ${count(name)}`).join(', ')}`)
+    const otherwise = [...report.counts.keys()]
+        .filter(name => name.startsWith(REFUSED_PREFIX) && !REFUSALS.includes(name.slice(REFUSED_PREFIX.length)))
+        .sort()
+    if (otherwise.length) {
+        why.push(`chats/new failed otherwise: ${
+            otherwise.map(name => `${name.slice(REFUSED_PREFIX.length)} ${count(name)}`).join(', ')}`)
+    }
     if (total(report, 'app.workerRefused.')) why.push(`the worker could not serve ${total(report, 'app.workerRefused.')} call(s)`)
+    // The worker's own answer to an egress call that was not a success. The app's
+    // line says which code when the app's log is in the feed; the worker's alone still says it happened.
+    const notServed = [...report.counts].filter(([name]) => /^workerHttp\.egress\.([3-5]\d\d)$/.test(name))
+    if (notServed.length) {
+        const statuses = notServed.map(([name]) => name.slice('workerHttp.egress.'.length)).sort().join(' and ')
+        why.push(`the worker answered ${notServed.reduce((sum, [, hits]) => sum + hits, 0)} egress call(s) with HTTP ${statuses}`)
+    }
     if (total(report, 'stream.failed.')) why.push(`${total(report, 'stream.failed.')} stream(s) ended with an error`)
-    // What qwen.ai answered. A 401 head of a stream is the app's to recover from
-    // inside the request (one reload, one retry), so it is counted, not complained of.
+    // What qwen.ai answered.
     for (const [name, hits] of report.counts) {
         const found = /^(egress\..+|stream\.head)\.([1-5]\d\d)$/.exec(name)
         if (!found || found[2] === '200' || (found[1] === 'stream.head' && found[2] === '401')) continue
         why.push(`${name}: ${hits}`)
+    }
+    // A 401 head of a stream is the app's to recover from inside the request (one
+    // reload, one retry), so one is counted and not complained of. Refused more
+    // often than accepted is the shape of 23.11: every call refused, the page
+    // reloaded for each, refused again.
+    const refused = count('stream.head.401')
+    const accepted = count('stream.head.200')
+    if (refused > accepted) why.push(`streams refused as 401 more often than accepted: ${refused} refused, ${accepted} accepted`)
+    if (count('renew.forced') && total(report, 'stream.head.') && !count('stream.ended')) {
+        why.push(`${count('renew.forced')} forced reload(s), and not one stream finished`)
     }
     if (total(report, 'app.recoveryFailed.') || total(report, 'silentRenew.failed.')) {
         why.push(`a refused session was not replaced: recovery failed ${total(report, 'app.recoveryFailed.')}, silent renewal failed ${total(report, 'silentRenew.failed.')}`)
@@ -252,10 +280,14 @@ function render(report) {
     }
     const why = complaints(report)
     let verdict = 'OK'
-    // A start-up line alone says nothing about what qwen.ai did.
-    const judged = total(report, 'egress.') + total(report, 'stream.') + total(report, 'app.') - count('app.started')
-    if (!judged) verdict = 'NOTHING TO JUDGE'
-    else if (why.length) verdict = 'LOOK'
+    if (why.length) verdict = 'LOOK'
+    // Without any, there is nothing to judge the egress by: a start-up line alone
+    // says nothing about what qwen.ai did.
+    else {
+        const judged = total(report, 'egress.') + total(report, 'stream.') + total(report, 'workerHttp.egress.') +
+            total(report, 'app.') - count('app.started')
+        if (!judged) verdict = 'NOTHING TO JUDGE'
+    }
     out.push(`verdict: ${verdict}${why.length ? `\n  - ${why.join('\n  - ')}` : ''}`)
     return { text: out.join('\n'), verdict, why }
 }

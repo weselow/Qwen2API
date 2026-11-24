@@ -116,11 +116,17 @@ test('the default launches the headless shell and touches nothing else', async (
   assert.equal(fake.calls.launches.length, 1)
   const { dataDir, options } = fake.calls.launches[0]
   assert.equal(dataDir, '/profiles/a')
-  assert.equal(options.channel, undefined)
-  assert.equal(options.userAgent, undefined)
-  assert.equal(options.headless, true)
-  assert.deepEqual(options.viewport, { width: 1280, height: 800 })
-  assert.deepEqual(options.proxy, { server: 'http://p:8080' })
+  // Every option exactly as it was before the headless mode existed.
+  assert.deepEqual(options, {
+    headless: true,
+    viewport: { width: 1280, height: 800 },
+    locale: 'en-US',
+    chromiumSandbox: false,
+    ignoreDefaultArgs: ['--enable-automation'],
+    args: ['--disable-blink-features=AutomationControlled'],
+    proxy: { server: 'http://p:8080' },
+    timeout: 30000
+  })
   // No browser asked, no page opened, no CDP: the page is whatever the shell makes of it.
   assert.equal(fake.calls.evaluations.length, 0)
   assert.equal(fake.calls.newPages, 0)
@@ -151,12 +157,18 @@ test('chrome asks the full Chromium what it calls itself, then launches it sayin
   // The real launch: the full build, on the real profile, with one word of the
   // User-Agent changed — and Playwright's option is what carries it into every frame.
   assert.equal(real.dataDir, '/profiles/a')
-  assert.equal(real.options.channel, 'chromium')
-  assert.equal(real.options.userAgent, STOCK.replace('HeadlessChrome', 'Chrome'))
-  assert.equal(real.options.headless, true)
-  assert.equal(real.options.timeout, 45000)
-  assert.deepEqual(real.options.viewport, { width: 1280, height: 800 })
-  assert.deepEqual(real.options.proxy, { server: 'http://p:8080' })
+  assert.deepEqual(real.options, {
+    headless: true,
+    channel: 'chromium',
+    userAgent: STOCK.replace('HeadlessChrome', 'Chrome'),
+    viewport: { width: 1280, height: 800 },
+    locale: 'en-US',
+    chromiumSandbox: false,
+    ignoreDefaultArgs: ['--enable-automation'],
+    args: ['--disable-blink-features=AutomationControlled'],
+    proxy: { server: 'http://p:8080' },
+    timeout: 45000
+  })
   // Nothing was done to the context for it: no page opened, nothing navigated, no override sent.
   assert.equal(context, fake.calls.contexts[1])
   assert.equal(fake.calls.newPages, 0)
@@ -238,6 +250,24 @@ test('a browser that cannot be started to be asked fails the launch the same way
   })
   assert.equal(fake.calls.launches.length, 0)
   assert.equal(fake.calls.contexts.length, 0)
+})
+
+test('a throwaway profile that will not delete costs nothing', async t => {
+  const remove = fs.rmSync
+  fs.rmSync = (target, options) => {
+    if (String(target).includes('signin-worker-identity-')) {
+      throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' })
+    }
+    return remove(target, options)
+  }
+  t.after(() => { fs.rmSync = remove })
+  const fake = fakeChromium()
+  const context = await openChrome(fake)
+  assert.equal(context.closed, 0)
+  assert.equal(fake.calls.contexts[0].closed, 1)
+  // Not this test's to leave behind: removed once it can be.
+  fs.rmSync = remove
+  remove(fake.calls.launches[0].dataDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 })
 })
 
 test('only the one word of the User-Agent changes', () => {

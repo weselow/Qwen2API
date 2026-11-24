@@ -84,7 +84,11 @@ async function readStockUserAgent(chromium, timeoutMs) {
         return userAgent
     } finally {
         if (context) await context.close().catch(() => {})
-        fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 })
+        // A profile left in the temp directory — a file still held, on Windows —
+        // is not worth a launch.
+        try {
+            fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 })
+        } catch { /* as above */ }
     }
 }
 

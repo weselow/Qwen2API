@@ -29,13 +29,14 @@ function generation(minute, { first = false, ending = 'end' } = {}) {
 const appLine = (minute, level, module, message) =>
     `${appAt(minute)} [${level}] [${module}] ${message}`
 
+// The app runs on Bun, which prints an object with double quotes and a trailing comma.
 const STARTUP = [
     appLine(0, 'INFO', 'SERVER', '🚀 服务器启动成功'),
     '{',
-    "  address: '0.0.0.0',",
-    "  port: 3000,",
-    "  chatCreationTransport: 'browser',",
-    "  completionsTransport: 'browser'",
+    '  address: "0.0.0.0",',
+    '  port: 3000,',
+    '  chatCreationTransport: "browser",',
+    '  completionsTransport: "browser",',
     '}'
 ]
 
@@ -46,7 +47,8 @@ test('a healthy hour through the pages reads OK', () => {
         ...generation(1, { first: true }),
         ...generation(20),
         ...generation(59, { ending: 'cancelled' }),
-        appLine(59, 'SUCCESS', 'V2SESSION', '✅ v2 会话已续期 (a@example.invalid, 触发原因: upstream_session_unauthorized)')
+        // The logger's success() prints as INFO.
+    appLine(59, 'INFO', 'V2SESSION', '✅ v2 会话已续期 (a@example.invalid, 触发原因: upstream_session_unauthorized)')
     ]
     const { verdict, why, text } = watch.render(watch.summarize(lines))
     assert.equal(verdict, 'OK', why.join('\n'))
@@ -81,7 +83,8 @@ test('a refusal of chats/new by qwen.ai is the first thing said', () => {
             appLine(3, 'ERROR', 'CHAT', `❌ Qwen chat creation failed: category=${code}, status=401`)
         ]))
         assert.equal(verdict, 'LOOK')
-        assert.equal(why[0], `qwen.ai refused chats/new as ${code}: 1`)
+        // Said once: the named refusal is not repeated among "the others".
+        assert.deepEqual(why, [`qwen.ai refused chats/new as ${code}: 1`])
     }
     // Another category (a quota, an answer of a shape nobody knows) is listed, and said.
     const other = watch.render(watch.summarize([
@@ -89,6 +92,12 @@ test('a refusal of chats/new by qwen.ai is the first thing said', () => {
     ]))
     assert.equal(other.verdict, 'LOOK')
     assert.match(other.text, /chatsNewRefused\.upstream_invalid_response {2}1/)
+    // Said once: the two named refusals are not repeated among "the others".
+    assert.deepEqual(other.why, ['chats/new failed otherwise: upstream_invalid_response 1'])
+    // A category with a digit in it is read whole.
+    assert.deepEqual(watch.complaints(watch.summarize([
+        appLine(3, 'ERROR', 'CHAT', 'Qwen chat creation failed: category=v2_session_required, status=409')
+    ])), ['chats/new failed otherwise: v2_session_required 1'])
 })
 
 test('a worker that could not serve a call is said, with its code', () => {
@@ -123,8 +132,6 @@ test('a 401 head of a stream is counted; any other refusal is said', () => {
         `${at(5)} egress-stream ${COMPLETIONS} end (5200 ms)`
     ]))
     assert.equal(head(200).verdict, 'OK')
-    // The app reloads the page and retries inside the request: a 401 is its business.
-    assert.equal(head(401).verdict, 'OK')
     for (const status of [403, 429, 500, 502, 503]) {
         assert.deepEqual(head(status).why, [`stream.head.${status}: 1`])
     }
@@ -132,6 +139,54 @@ test('a 401 head of a stream is counted; any other refusal is said', () => {
     assert.deepEqual(watch.render(watch.summarize([
         `${at(5)} egress /api/v2/chats/new -> 405 (1/16 pages)`
     ])).why, ['egress.chatsNew.405: 1'])
+})
+
+test('a stream refused as 401 is the app\'s to recover from; refused more often than accepted is said', () => {
+    const stream = (minute, status, how) => [
+        `${at(minute)} egress-stream ${COMPLETIONS} -> ${status} (900 ms, 1/16 pages)`,
+        `${at(minute)} egress-stream ${COMPLETIONS} ${how} (5200 ms)`
+    ]
+    // Refused once, the page reloaded, the retry accepted: what recovery is for.
+    // A stream the app closed to retry is "cancelled" in the worker's log.
+    const recovered = watch.render(watch.summarize([
+        ...stream(5, 401, 'cancelled'),
+        `${at(5)} renew ok (forced) (1 sessions)`,
+        ...stream(5, 200, 'end')
+    ]))
+    assert.equal(recovered.verdict, 'OK', recovered.why.join('\n'))
+    assert.equal(watch.summarize([...stream(5, 401, 'end')]).counts.get('stream.head.401'), 1)
+
+    // The shape of 23.11: every call refused, the page reloaded for each, never accepted.
+    const refused = watch.render(watch.summarize(Array.from({ length: 20 }, (_, atMinute) => [
+        `${at(atMinute / 2)} egress /api/v2/chats/new -> 200 (1/16 pages)`,
+        ...stream(atMinute / 2, 401, 'cancelled'),
+        `${at(atMinute / 2)} renew ok (forced) (1 sessions)`
+    ]).flat()))
+    assert.equal(refused.verdict, 'LOOK')
+    assert.deepEqual(refused.why, [
+        'streams refused as 401 more often than accepted: 20 refused, 0 accepted',
+        '20 forced reload(s), and not one stream finished'
+    ])
+    // One refusal against two accepted answers is not a pattern.
+    const sparse = watch.render(watch.summarize([
+        ...stream(5, 401, 'cancelled'),
+        ...stream(20, 200, 'end'),
+        ...stream(40, 200, 'end')
+    ]))
+    assert.deepEqual(sparse.why, [])
+})
+
+test('a worker that cannot open a page is something to look at, not nothing to judge', () => {
+    // The feed if the chrome mode fails to launch after a flip: no call ever leaves.
+    const dead = watch.render(watch.summarize([
+        `${at(1)} resident-close open_failed (0 pages)`,
+        `${at(1)} request POST /egress -> 500 12ms`,
+        `${at(2)} resident-close open_failed (0 pages)`,
+        `${at(2)} request POST /egress -> 500 12ms`
+    ]))
+    assert.equal(dead.verdict, 'LOOK')
+    assert.deepEqual(dead.why, ['the worker answered 2 egress call(s) with HTTP 500', '2 resident page(s) died (not evicted or shut down)'])
+    assert.match(dead.text, /egress\.500 {2}2/)
 })
 
 test('sign-ins and forced reloads are held to one a minute and one in half a minute', () => {
@@ -212,9 +267,38 @@ test('the worker\'s own HTTP answers are counted, and not held against it', () =
     assert.equal(counts.get('workerHttp.session.429'), 1)
     assert.equal(counts.get('workerHttp.egress.503'), 1)
     assert.equal(counts.get('workerHttp.egress.502'), 1)
-    // The app's line says it; the status alone says nothing about why.
-    assert.deepEqual(watch.complaints(watch.summarize(lines)),
-        ['the worker could not serve 1 call(s)'])
+    // The app's line names the code; the status alone is left to it, except for an egress
+    // call the worker did not put through, which is said even from the worker's log alone.
+    assert.deepEqual(watch.complaints(watch.summarize(lines)), [
+        'the worker could not serve 1 call(s)',
+        'the worker answered 2 egress call(s) with HTTP 502 and 503'
+    ])
+    assert.deepEqual(watch.complaints(watch.summarize(lines.slice(0, 2))), [])
+})
+
+test('the flags are read from the start-up record as Bun prints it, and as Node does', () => {
+    const bun = watch.summarize(STARTUP)
+    assert.deepEqual(bun.flags, { chatCreationTransport: 'browser', completionsTransport: 'browser' })
+    assert.deepEqual(bun.lines, { worker: 0, app: 1, other: 4 })
+    const node = watch.summarize([
+        appLine(0, 'INFO', 'SERVER', '🚀 服务器启动成功'),
+        '{',
+        "  port: 3000,",
+        "  chatCreationTransport: 'direct',",
+        "  completionsTransport: 'auto'",
+        '}'
+    ])
+    assert.deepEqual(node.flags, { chatCreationTransport: 'direct', completionsTransport: 'auto' })
+})
+
+test('a request the app never makes is listed, not taken for a shape this tool does not know', () => {
+    const { verdict, text } = watch.render(watch.summarize([
+        ...generation(5),
+        `${at(5)} request GET / -> 404 1ms`,
+        `${at(5)} request POST / -> 404 1ms`
+    ]))
+    assert.equal(verdict, 'OK')
+    assert.match(text, /other\.404 {2}2/)
 })
 
 test('a line of a shape this tool does not know is said, not skipped', () => {
