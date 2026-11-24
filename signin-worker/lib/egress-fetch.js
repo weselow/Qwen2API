@@ -71,6 +71,112 @@ async function pageFetch({ url, init, timeoutMs, maxBytes }) {
     }
 }
 
+// What a stream's fetch was aborted for, as the page reports it back. The
+// page aborts with the timeout reason itself; anything else aborted it from
+// outside, which only the app going away does.
+const ABORT_REASON = { timeout: 'timeout', cancelled: 'cancelled' }
+
+// Names the worker and the page know each other by. Both live on the page's
+// globalThis: the channel the in-page stream reports on (an exposed binding,
+// page -> Node) and the registry of the streams' AbortControllers, which is
+// what lets Node abort a fetch that is already running in the page.
+const STREAM_CHANNEL = '__qwenEgressEvent'
+const STREAM_ABORTS = '__qwenEgressAborts'
+
+/**
+ * Runs INSIDE the page. Same rules as pageFetch: serialized by source, no
+ * module scope. The streaming counterpart (Qwen2API-3ue.3): the answer is
+ * relayed while it arrives, instead of returned once it is whole.
+ *
+ * `channel` names the binding resident-pages.js exposed on the page. The
+ * page reports on it and waits for the call to return, which is how the
+ * worker holds the page back when the app is not keeping up: a stalled reader
+ * is a stalled upstream. Bytes travel as base64 — the channel carries
+ * strings, and a chunk may cut a multi-byte character in half.
+ *
+ * The AbortController is registered on the page for the life of the call, so
+ * an abort that Node asks for (the app's client went away) reaches a fetch
+ * that is already running: pageAbortStream() looks it up by id.
+ *
+ * `timeoutMs` is a budget of SILENCE here, not for the whole call: a stream
+ * may legitimately run for minutes, and every chunk upstream delivers re-arms
+ * the timer. A stream that stops producing is cut at timeoutMs; one that
+ * keeps producing is not cut at all.
+ */
+async function pageFetchStream({ url, init, timeoutMs, maxBytes, channel, registry, id, reasons }) {
+    const controller = new AbortController()
+    const aborts = globalThis[registry] || (globalThis[registry] = {})
+    aborts[id] = controller
+    // The binding resident-pages.js exposed on this page, by the name it was
+    // given. It takes the stream's id with every event: the page carries
+    // several streams at once, and each report names its own.
+    const emit = globalThis[channel]
+    let timer = null
+    const arm = () => {
+        clearTimeout(timer)
+        timer = setTimeout(() => controller.abort(reasons.timeout), timeoutMs)
+    }
+    // Settles when the fetch is aborted, whatever the loop is waiting for:
+    // a report the app has not acknowledged yet must not outlive its stream.
+    const aborted = new Promise(resolve => {
+        controller.signal.addEventListener('abort', () => resolve(), { once: true })
+    })
+    const report = event => Promise.race([emit(id, event), aborted])
+    const toBase64 = bytes => {
+        let binary = ''
+        for (let at = 0; at < bytes.length; at += 0x8000) {
+            binary += String.fromCharCode(...bytes.subarray(at, at + 0x8000))
+        }
+        return btoa(binary)
+    }
+    try {
+        arm()
+        const response = await fetch(url, { ...init, credentials: 'include', signal: controller.signal })
+        const headers = {}
+        response.headers.forEach((value, name) => { headers[name] = value })
+        arm()
+        await report({ type: 'head', status: response.status, url: response.url, redirected: response.redirected, headers })
+        const reader = response.body ? response.body.getReader() : null
+        let size = 0
+        if (reader) {
+            for (;;) {
+                const { done, value } = await reader.read()
+                arm()
+                if (done) break
+                size += value.byteLength
+                if (size > maxBytes) {
+                    await reader.cancel().catch(() => {})
+                    return { ok: false, error: 'too_large', status: response.status }
+                }
+                await report({ type: 'chunk', data: toBase64(value) })
+            }
+        }
+        return { ok: true }
+    } catch (error) {
+        const aborted = controller.signal.aborted
+        return {
+            ok: false,
+            // The signal says who aborted: a fetch the page itself aborted
+            // for silence is a timeout, one aborted from outside is not.
+            error: aborted ? (controller.signal.reason === reasons.timeout ? 'timeout' : 'aborted') : 'network_error',
+            message: aborted ? undefined : String((error && error.message) || error)
+        }
+    } finally {
+        clearTimeout(timer)
+        delete aborts[id]
+    }
+}
+
+/**
+ * Runs INSIDE the page: abort the stream `id` if it is still running. Returns
+ * whether there was one — a stream that already finished needs no abort.
+ */
+const pageAbortStream = ({ registry, id, reason }) => {
+    const controller = globalThis[registry] && globalThis[registry][id]
+    if (controller) controller.abort(reason)
+    return Boolean(controller)
+}
+
 // What the page reported -> worker error code. Anything else is a network
 // failure on the browser side ("Failed to fetch").
 const CODE_FOR_OUTCOME = {
@@ -86,7 +192,11 @@ const CODE_FOR_OUTCOME = {
  * URL parsing is WHATWG in Node and in Chromium alike, which is what makes
  * the origin check here the same one the browser will make.
  *
- * @returns {{url: string, init: {method: string, headers: Object<string,string>, body?: string}, timeoutMs: number}}
+ * `stream` asks for the answer to be relayed as it arrives (an SSE body)
+ * instead of returned whole. With it, `timeoutMs` bounds the silence between
+ * two chunks; without it, the whole call.
+ *
+ * @returns {{url: string, init: {method: string, headers: Object<string,string>, body?: string}, timeoutMs: number, stream: boolean}}
  */
 function normalizeEgress(body, { chatOrigin, defaultTimeoutMs, maxTimeoutMs }) {
     const allowed = new URL(chatOrigin).origin
@@ -128,12 +238,19 @@ function normalizeEgress(body, { chatOrigin, defaultTimeoutMs, maxTimeoutMs }) {
 
     if (body.timeoutMs !== undefined && !Number.isFinite(body.timeoutMs)) throw invalid('timeoutMs must be a number.')
     const timeoutMs = Math.min(Math.max(body.timeoutMs ?? defaultTimeoutMs, MIN_TIMEOUT_MS), maxTimeoutMs)
+    if (body.stream !== undefined && body.stream !== null && typeof body.stream !== 'boolean') {
+        throw invalid('stream must be a boolean.')
+    }
 
     return {
         url: target.href,
         init: { method, headers, body: hasBody ? raw : undefined },
-        timeoutMs
+        timeoutMs,
+        stream: body.stream === true
     }
 }
 
-module.exports = { pageFetch, normalizeEgress, CODE_FOR_OUTCOME }
+module.exports = {
+    pageFetch, pageFetchStream, pageAbortStream, normalizeEgress, CODE_FOR_OUTCOME,
+    ABORT_REASON, STREAM_CHANNEL, STREAM_ABORTS
+}

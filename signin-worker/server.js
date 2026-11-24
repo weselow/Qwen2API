@@ -30,6 +30,10 @@
  *   POST /egress {email, url, method, headers, body, timeoutMs, proxy?}
  *                                          -> {status, headers, body, cookies[]}
  *
+ * With `stream: true` (Qwen2API-3ue.3) /egress answers with a relay instead:
+ * one JSON event per line while qwen.ai's answer arrives, and the app cutting
+ * its connection cuts the fetch inside the page (relayEgress).
+ *
  * Design: docs/browser-egress-design.md.
  */
 const http = require('node:http')
@@ -94,6 +98,8 @@ function createServer(overrides = {}) {
     // email -> the full sign-in now running for it. A /session that lands on
     // an account whose sign-in is already in flight takes that result.
     const logins = new Map()
+    // What names a stream while it runs: the app going away aborts "its" stream.
+    let streamSequence = 0
     const pacer = createLoginPacer({
         minIntervalMs: config.minLoginIntervalMs,
         maxWaitMs: config.maxLoginWaitMs
@@ -343,7 +349,7 @@ function createServer(overrides = {}) {
         return liveRenewShared(email, proxy, force)
     }
 
-    async function handleEgress(body) {
+    async function handleEgress(req, res, body) {
         const email = parseEmail(body)
         const proxy = parseProxy(body)
         const request = normalizeEgress(body, {
@@ -355,9 +361,100 @@ function createServer(overrides = {}) {
         // runs free, so calls on one page stay concurrent.
         const entry = await serialized(email, () => residents.acquire(email,
             proxy ?? residents.get(email)?.proxy ?? sessions.get(email)?.proxy ?? null))
+        if (request.stream) return relayEgress(req, res, entry, request)
         const result = await residents.fetch(entry, request)
         log('egress', `${new URL(request.url).pathname} -> ${result.status} (${residents.stats().residentPages}/${config.maxPages} pages)`)
         return result
+    }
+
+    /**
+     * The streaming /egress: what the page reports, written out as it comes
+     * in. One JSON event per line:
+     *
+     *   {"type":"head","status":200,"url":"…","redirected":false,"headers":{…},"cookies":[…]}
+     *   {"type":"chunk","data":"<base64 of the bytes qwen.ai just delivered>"}
+     *   {"type":"end","cookies":[…]}
+     *   {"type":"error","code":"egress_timeout","message":"…"}
+     *
+     * Nothing is written until qwen.ai answered: whatever goes wrong before
+     * that is an ordinary error status, with the codes /egress always had.
+     * After it the status is spent, so a failure travels as the last event.
+     *
+     * The app cancelling is it closing the connection — the body of its own
+     * request is long gone by then. That ends the stream here AND the fetch
+     * in the page (resident-pages.js#abort): a fetch already running there is
+     * beyond a Node-side timer, let alone a socket this process no longer holds.
+     */
+    async function relayEgress(req, res, entry, request) {
+        const pathname = new URL(request.url).pathname
+        const id = ++streamSequence
+        // The app may have gone while its page was opening, before there was
+        // anything to listen with: the socket says so all the same.
+        let gone = req.socket.destroyed
+        // The socket, not the response: under Bun a server-side response
+        // never emits 'close' when its client goes.
+        const onGone = () => {
+            gone = true
+            residents.abort(id)
+        }
+        req.socket.on('close', onGone)
+        // The app may be gone by the time a frame is written. Not this handler's error.
+        res.on('error', () => {})
+        const started = Date.now()
+        const frame = event => {
+            // Gone: say it is written. The page must not wait on a socket nobody will drain.
+            if (gone) return
+            if (res.write(JSON.stringify(event) + '\n')) return
+            // The app is behind: the page (and behind it qwen.ai) waits until it catches up.
+            return new Promise(resolve => {
+                const done = () => {
+                    res.off('drain', done)
+                    res.off('close', done)
+                    resolve()
+                }
+                res.once('drain', done)
+                res.once('close', done)
+            })
+        }
+        try {
+            // The app gave up while its page was opening: nothing to run.
+            if (gone) return residents.release(entry)
+            const result = await residents.stream(entry, request, {
+                id,
+                onEvent: async event => {
+                    if (event.type === 'head') {
+                        res.writeHead(200, {
+                            'content-type': 'application/x-ndjson',
+                            'cache-control': 'no-cache',
+                            'x-accel-buffering': 'no'
+                        })
+                        res.flushHeaders()
+                        log('egress-stream',
+                            `${pathname} -> ${event.status} (${Date.now() - started} ms, ` +
+                            `${residents.stats().residentPages}/${config.maxPages} pages)`)
+                    }
+                    await frame(event)
+                }
+            })
+            if (result.aborted) {
+                log('egress-stream', `${pathname} cancelled (${Date.now() - started} ms)`)
+                return
+            }
+            await frame({ type: 'end', cookies: result.cookies })
+            res.end()
+            log('egress-stream', `${pathname} end (${Date.now() - started} ms)`)
+        } catch (error) {
+            const code = error.code && STATUS_FOR_CODE[error.code] ? error.code : 'browser_error'
+            if (!res.headersSent) {
+                if (!gone) throw error
+                return
+            }
+            log('egress-stream', `${pathname} ${code} (${Date.now() - started} ms)`)
+            await frame({ type: 'error', code, message: error.message || 'Signin worker failure.' })
+            res.end()
+        } finally {
+            req.socket.off('close', onGone)
+        }
     }
 
     function authorized(req) {
@@ -424,7 +521,9 @@ function createServer(overrides = {}) {
         if (req.method === 'POST' && req.url === '/egress') {
             if (!authorized(req)) throw new WorkerError('unauthorized', 'Invalid worker token.')
             const body = await readJson(req, EGRESS_BODY_LIMIT)
-            return send(res, 200, await handleEgress(body))
+            // A relay answers for itself, as it goes; there is nothing left to send after it.
+            if (body.stream === true) return handleEgress(req, res, body)
+            return send(res, 200, await handleEgress(req, res, body))
         }
         throw new WorkerError('invalid_request', 'Unknown route.')
     }

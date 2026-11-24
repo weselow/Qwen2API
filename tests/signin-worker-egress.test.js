@@ -60,13 +60,15 @@ function fakeBrowser() {
     calls, contexts, script,
     async openContext(options) {
       calls.push({ op: 'open', ...options })
-      const page = { ...emitter(), evaluations: [], pending: new Set() }
+      const page = { ...emitter(), evaluations: [], pending: new Set(), bindings: {} }
+      // What exposeFunction puts on the page: its streams report through it.
+      page.exposeFunction = async (name, handler) => { page.bindings[name] = handler }
       page.evaluate = (fn, arg) => new Promise((resolve, reject) => {
         page.pending.add(reject)
         const run = script.evaluate || ((fn, arg) => {
           page.evaluations.push(arg)
           // Only what a page can see: no module scope leaks in.
-          const sandbox = { AbortController, setTimeout, clearTimeout, Blob, fetch: script.fetch }
+          const sandbox = { AbortController, setTimeout, clearTimeout, Blob, ...page.bindings, fetch: script.fetch }
           return vm.runInNewContext(`(${fn.toString()})`, sandbox)(arg)
         })
         Promise.resolve().then(() => run(fn, arg)).then(resolve, reject)
@@ -323,7 +325,8 @@ test('normalizeEgress pins the target to whatever origin the worker is configure
   assert.deepEqual(normalizeEgress({ url: '/x', method: 'post', headers: { 'X-A': '1' }, body: '' }, lab), {
     url: 'http://127.0.0.1:8080/x',
     init: { method: 'POST', headers: { 'x-a': '1' }, body: undefined },
-    timeoutMs: 1000
+    timeoutMs: 1000,
+    stream: false
   })
 })
 

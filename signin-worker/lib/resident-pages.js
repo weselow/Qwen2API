@@ -14,11 +14,21 @@
  * Every method that can launch or navigate a browser (acquire, exclusive,
  * close) must run under the caller's per-account lock; fetch() must not, so
  * calls on one page stay concurrent.
+ *
+ * Since Qwen2API-3ue.3 a page also carries streams (stream()): the answer is
+ * relayed while it arrives, and it may take minutes. A stream is deliberately
+ * NOT an in-flight call: it does not hold the page against eviction, and a
+ * renewal does not wait for it. What that costs is that a page reloaded or
+ * evicted meanwhile ends its streams — they fail as page_closed, the way a
+ * call does when its page dies.
  */
 
 const fs = require('node:fs')
 const { WorkerError } = require('./worker-errors')
-const { pageFetch, CODE_FOR_OUTCOME } = require('./egress-fetch')
+const {
+    pageFetch, pageFetchStream, pageAbortStream, CODE_FOR_OUTCOME,
+    ABORT_REASON, STREAM_CHANNEL, STREAM_ABORTS
+} = require('./egress-fetch')
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -52,7 +62,17 @@ function createResidents({
     // email -> the close still in progress. Chromium holds the profile lock
     // until its process is gone, so no launch on that profile may start first.
     const closing = new Map()
+    // id -> the stream now running on a page, as stream() registered it. The
+    // page reports by id through the channel every page is given on opening.
+    const streams = new Map()
     let stopped = false
+
+    // What the page calls (page -> Node) for every event of a stream. Resolves
+    // once the event is written out, or right away for a stream that is gone.
+    const onStreamEvent = (id, event) => {
+        const live = streams.get(id)
+        return live ? live.receive(event) : undefined
+    }
 
     const idle = entry => entry.state === 'ready' && entry.inflight === 0 && !entry.exclusive
 
@@ -158,8 +178,9 @@ function createResidents({
      * Opening IS a renewal: loading the chat root lets the FE settle a fresh
      * token and cookies, so the caller's session cache is refreshed too.
      *
-     * The returned page is claimed (counted as in use) until fetch() runs, so
-     * an eviction on another account cannot take it in between.
+     * The returned page is claimed (counted as in use) until fetch(), stream()
+     * or release() runs, so an eviction on another account cannot take it in
+     * between.
      *
      * Caller holds the account lock.
      * @param {string} email
@@ -184,7 +205,7 @@ function createResidents({
         if (stopped) throw new WorkerError('page_closed', 'The worker is shutting down.')
         const entry = {
             email, proxy, context: null, page: null, state: 'opening',
-            lastUsed: Date.now(), inflight: 0, exclusive: false, polling: false, keepAlive: null
+            lastUsed: Date.now(), inflight: 0, exclusive: false, polling: false, keepAlive: null, streams: 0
         }
         pages.set(email, entry)
         try {
@@ -198,6 +219,10 @@ function createResidents({
             // browser-signin drives context.pages()[0]: keeping the first page
             // as THE resident page is what lets it reuse this context later.
             entry.page = entry.context.pages()[0] || await entry.context.newPage()
+            // The channel the page's streams report on. Exposed once per page
+            // here, under the account lock, and it survives the navigations
+            // sign-in and renewal make.
+            await entry.page.exposeFunction(STREAM_CHANNEL, onStreamEvent)
             watch(entry)
             const harvested = await signer.renew(entry.context, { chatOrigin, timeoutMs: openTimeoutMs })
             onHarvest(email, harvested, proxy)
@@ -265,6 +290,116 @@ function createResidents({
         }
     }
 
+    /** Give back a page handed out by acquire() without running a call on it. */
+    function release(entry) {
+        entry.inflight--
+    }
+
+    /**
+     * Run a streaming fetch on a page handed out by acquire(); consumes that
+     * claim at once, for the reason the module comment gives.
+     *
+     * The page reports through its channel while the body arrives; what it
+     * reports is handed to `onEvent` in order, and only once the previous one
+     * was written out — that promise is the page's hold-back. The promise
+     * here settles when the body is over. The head event carries the jar as
+     * of the response head, the result the jar as of the end. Not under the
+     * account lock.
+     *
+     * @param {object} entry
+     * @param {{url: string, init: object, timeoutMs: number}} request as normalizeEgress returned it
+     * @param {object} sink
+     * @param {number} sink.id - What abort() names this stream by
+     * @param {(event: object) => Promise<void>|void} sink.onEvent - May take its time: the page waits
+     * @returns {Promise<{cookies: ?Object[], aborted: boolean}>} the jar at the end; `aborted`
+     *   when the app went away and the fetch was cut for it
+     * @throws {WorkerError} the fetch's own failures, as fetch() throws them
+     */
+    async function stream(entry, request, { id, onEvent }) {
+        let timer = null
+        let fire = null
+        // The page's own timer cuts a silent upstream at timeoutMs and says
+        // so. Silence past that plus a grace means nothing came back at all:
+        // the page itself is hung.
+        const hung = new Promise((resolve, reject) => {
+            fire = () => reject(new WorkerError('egress_timeout', 'The resident page stopped responding.'))
+        })
+        const arm = () => {
+            clearTimeout(timer)
+            timer = setTimeout(fire, request.timeoutMs + backstopMs)
+            timer.unref?.()
+        }
+        const live = {
+            entry,
+            receive: async event => {
+                // The page just proved it is alive — and cannot report again
+                // until this event is acknowledged, so the watch starts over
+                // only once the app has taken it.
+                clearTimeout(timer)
+                entry.lastUsed = Date.now()
+                try {
+                    // The jar as of the response head: its Set-Cookie is in the browser by now.
+                    if (event.type === 'head') event = { ...event, cookies: await currentCookies(entry) }
+                    return await onEvent(event)
+                } finally {
+                    arm()
+                }
+            }
+        }
+        streams.set(id, live)
+        entry.inflight--
+        entry.streams++
+        arm()
+        // The race settles the caller; whichever leg loses must not be left
+        // as a rejection nobody sees.
+        const running = entry.page.evaluate(pageFetchStream, {
+            ...request, maxBytes, channel: STREAM_CHANNEL, registry: STREAM_ABORTS, id, reasons: ABORT_REASON
+        }).then(outcome => ({ outcome }), error => ({ error }))
+        try {
+            let settled
+            try {
+                settled = await Promise.race([running, hung])
+            } catch (error) {
+                // Only the backstop gets here: the page stopped responding.
+                close(entry, 'unresponsive')
+                throw error
+            }
+            if (settled.error) {
+                // evaluate itself failed: the document left from under the
+                // fetch. A page that is still registered merely navigated.
+                throw new WorkerError(pages.get(entry.email) === entry ? 'browser_error' : 'page_closed',
+                    'The resident page could not run the fetch.')
+            }
+            const { outcome } = settled
+            if (!outcome.ok && outcome.error === 'aborted') return { cookies: null, aborted: true }
+            if (!outcome.ok) {
+                throw new WorkerError(CODE_FOR_OUTCOME[outcome.error] || 'egress_failed',
+                    `In-page fetch failed (${outcome.error}${outcome.message ? `: ${outcome.message}` : ''}).`)
+            }
+            return { cookies: await currentCookies(entry), aborted: false }
+        } finally {
+            clearTimeout(timer)
+            streams.delete(id)
+            entry.streams--
+        }
+    }
+
+    /**
+     * Cut a running stream short: the app that asked for it is gone. Reaches
+     * the fetch inside the page through the AbortController it registered —
+     * a fetch already running there is beyond a Node-side timer, let alone a
+     * destroyed socket. Resolves once the request was made; a page that
+     * cannot take it (navigating, closing) is losing the fetch anyway.
+     * @param {number} id as given to stream()
+     */
+    async function abort(id) {
+        const live = streams.get(id)
+        if (!live) return false
+        return live.entry.page.evaluate(pageAbortStream, {
+            registry: STREAM_ABORTS, id, reason: ABORT_REASON.cancelled
+        }).catch(() => false)
+    }
+
     /**
      * Run a sign-in or renewal on the resident page. Caller holds the account
      * lock. In-flight fetches get a moment to finish first, and a failed
@@ -318,7 +453,7 @@ function createResidents({
         await Promise.all(entries.map(entry => close(entry, 'shutdown', left)))
     }
 
-    return { acquire, fetch, exclusive, get, close: retire, whenClosed, stats, shutdown }
+    return { acquire, fetch, stream, abort, release, exclusive, get, close: retire, whenClosed, stats, shutdown }
 }
 
 module.exports = { createResidents }
