@@ -273,3 +273,144 @@ test('signin worker client carries egress calls and the forced renewal (Qwen2API
     restore()
   }
 })
+
+test('signin worker client carries a streaming egress call, and its failures (Qwen2API-3ue.3)', { timeout: 10000 }, async t => {
+  const CHAT = 'https://chat.qwen.ai'
+  const requests = []
+  let behavior = 'relay'
+  let scriptedLine = ''
+  let hungUp
+  const server = http.createServer((req, res) => {
+    let raw = ''
+    req.on('data', chunk => { raw += chunk })
+    req.on('end', () => {
+      requests.push({ url: req.url, auth: req.headers.authorization, body: JSON.parse(raw) })
+      // The worker's side of the app hanging up, with whether the relay had ended.
+      res.on('close', () => hungUp?.(res.writableEnded))
+      if (behavior === 'refused') return reply(res, 504, { code: 'egress_timeout', message: 'scripted' })
+      if (behavior === 'lost') return reply(res, 404, { code: 'no_profile', message: 'scripted' })
+      if (behavior === 'mute') return // took the request, says nothing
+      if (behavior === 'line') {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+        return res.end(`${scriptedLine}\n`)
+      }
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+      res.write('{"type":"head","status":200,"url":"' + CHAT + '/api/v2/chat/completions","redirected":false,' +
+        '"headers":{"content-type":"text/event-stream"},"cookies":[]}\n')
+      if (behavior === 'hold') return // the answer is still coming
+      if (behavior === 'garbage') return res.end('not an event\n')
+      res.write('{"type":"chunk","data":"' + Buffer.from('data: x\n\n').toString('base64') + '"}\n')
+      return res.end('{"type":"end","cookies":[{"name":"cna","value":"live","domain":"chat.qwen.ai","path":"/"}]}\n')
+    })
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections?.() }))
+  // Resolves once the worker saw its app close the connection.
+  const closed = () => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('the app never closed the relay')), 3000)
+    hungUp = ended => { clearTimeout(timer); resolve(ended) }
+  })
+
+  const restore = freshClient({
+    API_KEY: 'offline',
+    V2_SESSION_MODE: 'browser',
+    QWEN_CHAT_PROXY_URL: CHAT,
+    SIGNIN_WORKER_URL: `http://127.0.0.1:${server.address().port}`,
+    SIGNIN_WORKER_TOKEN: 'shared-secret'
+  })
+  const realPost = axios.post
+  let httpConfig
+  axios.post = async (url, payload, requestConfig) => {
+    httpConfig = requestConfig
+    return realPost(url, payload, requestConfig)
+  }
+  t.after(() => { axios.post = realPost })
+  try {
+    const client = require('../src/utils/signin-worker-client')
+    const email = 'a@example.invalid'
+    const request = { url: '/api/v2/chat/completions', headers: { 'content-type': 'application/json' }, body: '{}', timeoutMs: 5000 }
+
+    // The call as the page runs it, asked of the worker as a stream.
+    behavior = 'relay'
+    const relay = await client.egressStream(email, { proxy: 'http://p:8080' }, request)
+    assert.deepEqual(requests.at(-1), {
+      url: '/egress', auth: 'Bearer shared-secret', body: {
+        email, url: '/api/v2/chat/completions', method: 'POST', headers: { 'content-type': 'application/json' },
+        body: '{}', timeoutMs: 5000, proxy: 'http://p:8080', stream: true
+      }
+    })
+    // Streamed, and on no timer of axios's: the budget is the module's own,
+    // and a stream outlives it.
+    assert.deepEqual(
+      { responseType: httpConfig.responseType, timeout: httpConfig.timeout, maxRedirects: httpConfig.maxRedirects },
+      { responseType: 'stream', timeout: 0, maxRedirects: 0 })
+    const events = []
+    for await (const event of relay.frames) events.push(event)
+    assert.deepEqual(events, [
+      { type: 'head', status: 200, url: `${CHAT}/api/v2/chat/completions`, redirected: false, headers: { 'content-type': 'text/event-stream' }, cookies: [] },
+      { type: 'chunk', data: Buffer.from('data: x\n\n').toString('base64') },
+      { type: 'end', cookies: [{ name: 'cna', value: 'live', domain: 'chat.qwen.ai', path: '/' }] }
+    ])
+
+    // A refusal to a streamed call is the same SigninError as to any other:
+    // the worker's JSON arrives as a stream too, and is read.
+    for (const [mode, expected] of [
+      ['refused', { code: 'signin_upstream_error', status: 502, workerCode: 'egress_timeout', sessionLost: false }],
+      ['lost', { code: 'signin_session_lost', status: 404, workerCode: 'no_profile', sessionLost: true }]
+    ]) {
+      behavior = mode
+      await assert.rejects(client.egressStream(email, null, request), error => {
+        for (const [key, value] of Object.entries(expected)) assert.equal(error[key], value, `${mode}: ${key}`)
+        return true
+      })
+    }
+
+    // A line that is not an event is the worker's fault.
+    behavior = 'garbage'
+    await assert.rejects(async () => {
+      for await (const event of (await client.egressStream(email, null, request)).frames) void event
+    }, error => {
+        // The egress's fault and nobody else's: the caller does not retry it and does not charge it.
+        assert.equal(error.code, 'EGRESS_RELAY_MALFORMED')
+        assert.equal(error.workerCode, 'relay_malformed')
+        assert.equal(error.notAccountFault, true)
+        assert.equal(error.message.includes('not an event'), true)
+        return true
+    })
+
+    // An old worker answers a streamed call with a whole answer; an event out of shape is the same thing.
+    for (const [line, detail] of [
+      ['{"status":200,"headers":{},"body":"","cookies":[]}', 'not an event'],
+      ['{"type":"surprise"}', 'event type surprise'],
+      ['{"type":"chunk"}', 'event type chunk'],
+      ['{"type":"head","status":"200","headers":{}}', 'event type head']
+    ]) {
+      behavior = 'line'
+      scriptedLine = line
+      await assert.rejects(async () => {
+        for await (const event of (await client.egressStream(email, null, request)).frames) void event
+      }, error => error.workerCode === 'relay_malformed' && error.message.includes(detail))
+    }
+
+    // A worker that is up and has not started the relay: given up on in
+    // time — and not reported as unreachable.
+    behavior = 'mute'
+    await assert.rejects(client.egressStream(email, null, request, { budgetMs: 150 }),
+      { code: 'signin_transport_error', status: 502, message: 'Signin worker did not answer in time.' })
+
+    // The app cancelling is it closing the connection: a relay it is done
+    // reading ends on the worker's side, answer or no answer.
+    behavior = 'hold'
+    const waiting = closed()
+    const unread = await client.egressStream(email, null, request)
+    unread.close()
+    assert.equal(await waiting, false)
+    const reading = closed()
+    for await (const event of (await client.egressStream(email, null, request)).frames) {
+      if (event.type === 'head') break // what the consumer's "stop" amounts to
+    }
+    assert.equal(await reading, false)
+  } finally {
+    restore()
+  }
+})

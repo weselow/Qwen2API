@@ -328,11 +328,37 @@ test('http proxies pass through unchanged while socks5 is upgraded to socks5h (r
     assert.deepEqual(argv.slice(argv.indexOf('--proxy'), argv.indexOf('--proxy') + 2), ['--proxy', 'http://proxy:8080'])
 })
 
-test('COMPLETIONS_TRANSPORT parsing accepts the three modes and rejects anything else', () => {
+test('COMPLETIONS_TRANSPORT parsing accepts the four modes and rejects anything else', () => {
     assert.equal(config.parseCompletionsTransport(), 'auto')
     assert.equal(config.parseCompletionsTransport(''), 'auto')
     assert.equal(config.parseCompletionsTransport('auto'), 'auto')
     assert.equal(config.parseCompletionsTransport(' IMPERSONATE '), 'impersonate')
     assert.equal(config.parseCompletionsTransport('axios'), 'axios')
-    assert.throws(() => config.parseCompletionsTransport('curl'), /COMPLETIONS_TRANSPORT/)
+    assert.equal(config.parseCompletionsTransport(' Browser '), 'browser')
+    assert.throws(() => config.parseCompletionsTransport('curl'),
+        /COMPLETIONS_TRANSPORT.*auto \| impersonate \| axios \| browser/)
+})
+
+test('browser mode sends the call through the egress and touches neither axios nor the binary', async t => {
+    config.completionsTransport = 'browser'
+    config.curlImpersonateBin = binPath
+    const axiosCalls = stubAxiosPost(t)
+    const calls = stubSpawn(t)
+    // The egress stands in for itself here: what it does with the call is
+    // tests/browser-egress.test.js's subject.
+    const browserEgress = require('../src/utils/browser-egress')
+    const sent = []
+    const answered = { status: 200, statusText: 'OK', headers: {}, data: PassThrough.from(['egress']) }
+    const real = browserEgress.postCompletions
+    browserEgress.postCompletions = async context => { sent.push(context); return answered }
+    t.after(() => { browserEgress.postCompletions = real })
+
+    const account = { email: 'who@example.invalid', token: TOKEN }
+    const requestConfig = { headers: FE_HEADERS, timeout: 600000 }
+    const response = await transport.postCompletions(URL, PAYLOAD, requestConfig, { account, token: TOKEN })
+
+    assert.equal(response, answered)
+    assert.deepEqual(sent, [{ url: URL, body: JSON.stringify(PAYLOAD), account, token: TOKEN, timeoutMs: 600000 }])
+    assert.equal(axiosCalls.length, 0, 'the egress is not a wrapper around axios')
+    assert.equal(calls.length, 0)
 })

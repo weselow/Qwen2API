@@ -822,13 +822,19 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
                 logger.network(`发送聊天请求`, 'REQUEST')
             }
             // completions 唯一的发送点：由 impersonate-transport 按 COMPLETIONS_TRANSPORT
-            // 在 curl-impersonate（Chrome TLS 指纹）与 axios 之间分派。代理的取值与上面
-            // applyProxyToAxiosConfig 的条件保持一致——lab 模式直连。
+            // 在 curl-impersonate（Chrome TLS 指纹）、axios 与浏览器 egress（Qwen2API-3ue.3：
+            // 从 signin-worker 的常驻页面里发出，用下面的 account 与 token）之间分派。
+            // 代理的取值与上面 applyProxyToAxiosConfig 的条件保持一致——lab 模式直连。
             const response = await postCompletions(url, payload, requestConfig, {
-                proxyUrl: lab.authOrigin ? null : resolveProxyUrl(currentAccount)
+                proxyUrl: lab.authOrigin ? null : resolveProxyUrl(currentAccount),
+                account: currentAccount,
+                token: currentToken
             })
             // Browser mode: the jar follows what qwen.ai set on this direct call too (Qwen2API-3ue.2)
             sessionPersistence.readSetCookies(currentAccount?.email, response.headers, url)
+            // The egress may have recovered the session on the way (Qwen2API-3ue.3):
+            // the generation rides the token the store holds now.
+            currentToken = sessionPersistence.sessionToken(currentAccount, currentToken)
             if (response.status === 200) {
                 // 返回 currentAccount——调用方在消费完 stream 后据此累计 stats
                 // 注意：当前实现单次尝试都用同一个 currentAccount（不轮换），
@@ -891,6 +897,12 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
             // cuota agotada (cooldown por defecto si el upstream no dijo cuanto esperar).
             logger.error(`发送聊天请求失败: 账户额度已耗尽`, 'REQUEST', '', lastError.message)
             accountManager.recordAccountQuotaExhausted(currentAccount.email, failure.retryAfter)
+        } else if (lastError.notAccountFault === true && !hadHttpResponse) {
+            // The signin worker could not carry the completions call (Qwen2API-3ue.3):
+            // the egress's doing, not the account's — nothing to charge it with.
+            // (What qwen.ai itself did to the stream is charged below, as it
+            // always was: the branch after this one takes it.)
+            logger.error(`发送聊天请求失败: completions через signin-worker не прошёл (${lastError.workerCode}): ${lastError.message}`, 'REQUEST')
         } else if (!hadHttpResponse && isRetryableNetworkError(lastError)) {
             // 传输层失败耗尽重试——记 failure，累计可触发 cooldown（PR #112 语义）
             logger.error(
@@ -913,8 +925,10 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
             accountManager.recordAccountError(currentAccount.email, status)
             // 401 = 上游拒绝会话/bearer（jik.4）：v2 会话作废并续期；off/lab 模式 no-op。
             // In egress mode chats/new just accepted this session, and a
-            // refusal of a direct completions call says nothing about it.
-            if (status === 401 && !browserEgress.enabled()) {
+            // refusal of a direct completions call says nothing about it. A
+            // refusal from an egress completions call (Qwen2API-3ue.3) has had
+            // its reload and retry inside the transport already.
+            if (status === 401 && !browserEgress.enabled() && !browserEgress.completionsEnabled()) {
                 sessionPersistence.invalidateSession(currentAccount.email, currentAccount, 401)
             }
         }

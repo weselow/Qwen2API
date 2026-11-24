@@ -60,13 +60,15 @@ function fakeBrowser() {
     calls, contexts, script,
     async openContext(options) {
       calls.push({ op: 'open', ...options })
-      const page = { ...emitter(), evaluations: [], pending: new Set() }
+      const page = { ...emitter(), evaluations: [], pending: new Set(), bindings: {} }
+      // What exposeFunction puts on the page: its streams report through it.
+      page.exposeFunction = async (name, handler) => { page.bindings[name] = handler }
       page.evaluate = (fn, arg) => new Promise((resolve, reject) => {
         page.pending.add(reject)
         const run = script.evaluate || ((fn, arg) => {
           page.evaluations.push(arg)
           // Only what a page can see: no module scope leaks in.
-          const sandbox = { AbortController, setTimeout, clearTimeout, Blob, fetch: script.fetch }
+          const sandbox = { AbortController, setTimeout, clearTimeout, Blob, ...page.bindings, fetch: script.fetch }
           return vm.runInNewContext(`(${fn.toString()})`, sandbox)(arg)
         })
         Promise.resolve().then(() => run(fn, arg)).then(resolve, reject)
@@ -216,7 +218,9 @@ test('egress opens a resident page on first use and runs the call as an in-page 
   assert.equal(signer.calls.filter(call => call.op === 'renew').length, 1)
   assert.equal(context.page.evaluations.length, 2)
 
-  assert.deepEqual(await health(), { ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16 })
+  assert.deepEqual(await health(), {
+    ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell'
+  })
 
   // Opening the page IS a renewal: the session cache holds what it settled on.
   const cached = await (await post('/renew', { email })).json()
@@ -323,7 +327,8 @@ test('normalizeEgress pins the target to whatever origin the worker is configure
   assert.deepEqual(normalizeEgress({ url: '/x', method: 'post', headers: { 'X-A': '1' }, body: '' }, lab), {
     url: 'http://127.0.0.1:8080/x',
     init: { method: 'POST', headers: { 'x-a': '1' }, body: undefined },
-    timeoutMs: 1000
+    timeoutMs: 1000,
+    stream: false
   })
 })
 
@@ -647,7 +652,9 @@ test('an explicit invalidation (/renew with force) is answered live although the
   assert.equal(renews(), 2)
   // On the resident page: no second launch on the locked profile.
   assert.equal(signer.calls.filter(call => call.op === 'open').length, 1)
-  assert.deepEqual(await health(), { ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16 })
+  assert.deepEqual(await health(), {
+    ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell'
+  })
 
   // Another explicit invalidation is another reload; an explicit false is a plain renew.
   assert.equal((await (await post('/renew', { email, force: true })).json()).token, 'token-renew-3')

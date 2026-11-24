@@ -31,18 +31,21 @@ const parseApiKeys = (apiKeyEnv = process.env.API_KEY) => {
 const { apiKeys, adminKey } = parseApiKeys()
 
 /**
- * 解析 COMPLETIONS_TRANSPORT（completions 的 TLS 传输选择）：
+ * 解析 COMPLETIONS_TRANSPORT（completions 的传输选择）：
  * auto（默认，有 curl-impersonate 就用，否则 axios + 一次性警告）|
- * impersonate（强制，缺二进制直接报错）| axios（纯 Node TLS，旧行为）。
+ * impersonate（强制，缺二进制直接报错）| axios（纯 Node TLS，旧行为）|
+ * browser（Qwen2API-3ue.3：从 signin-worker 的常驻页面里发出；要求
+ * V2_SESSION_MODE=browser）。
  * 拼错直接拒绝启动：静默回落到 axios 会把 Baxia 风控带回来且无从排查。
  * @returns {string}
  */
 const parseCompletionsTransport = (value = process.env.COMPLETIONS_TRANSPORT) => {
     const raw = value == null || String(value).trim() === '' ? 'auto' : String(value).trim().toLowerCase()
-    if (!['auto', 'impersonate', 'axios'].includes(raw)) {
+    if (!['auto', 'impersonate', 'axios', 'browser'].includes(raw)) {
         throw new Error(
-            `COMPLETIONS_TRANSPORT="${value}" 无效：只接受 auto | impersonate | axios。` +
-            'auto = 找到 curl-impersonate 就用 Chrome TLS 指纹，否则 axios；impersonate = 强制；axios = 旧行为。'
+            `COMPLETIONS_TRANSPORT="${value}" 无效：只接受 auto | impersonate | axios | browser。` +
+            'auto = 找到 curl-impersonate 就用 Chrome TLS 指纹，否则 axios；impersonate = 强制；axios = 旧行为；' +
+            'browser = 从 signin-worker 的常驻页面发出（需要 V2_SESSION_MODE=browser）。'
         )
     }
     return raw
@@ -238,6 +241,7 @@ const config = {
     antidetectTier1Enabled: process.env.ANTIDETECT_TIER1_ENABLED !== 'false',
     // completions 传输（src/utils/impersonate-transport.js）：纯 Node TLS 会被
     // Baxia 风控（2026-11-21 实测），curl-impersonate 的 Chrome 指纹可通过。
+    // browser — изнутри резидентной страницы воркера (Qwen2API-3ue.3, src/utils/browser-egress.js)。
     // curlImpersonateBin 显式指定二进制路径，留空则按 PATH 查找。
     completionsTransport: parseCompletionsTransport(),
     curlImpersonateBin: process.env.CURL_IMPERSONATE_BIN || null,
@@ -253,8 +257,13 @@ const config = {
 // 暴露解析器本身以便测试空槽位的拒绝逻辑（config 对象是模块级单例，无法重复解析）。
 // A forced browser transport has no sessions to carry without browser mode:
 // refuse at startup rather than answer every chat creation with session_lost.
+// The same for completions through the worker (Qwen2API-3ue.3): the call rides
+// the account's v2 session.
 if (config.chatCreationTransport === 'browser' && v2SessionMode !== 'browser') {
     throw new Error('CHAT_CREATION_TRANSPORT=browser requires V2_SESSION_MODE=browser')
+}
+if (config.completionsTransport === 'browser' && v2SessionMode !== 'browser') {
+    throw new Error('COMPLETIONS_TRANSPORT=browser requires V2_SESSION_MODE=browser')
 }
 
 config.parseApiKeys = parseApiKeys

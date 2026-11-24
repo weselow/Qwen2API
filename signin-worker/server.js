@@ -6,7 +6,7 @@
  *
  *   POST /session {email, password, proxy?, force?} -> {token, expiresAt, cookies[]}
  *   POST /renew   {email, proxy?, force?}   -> {token, expiresAt, cookies[]}
- *   GET  /health                             -> {ok, sessions, residentPages}
+ *   GET  /health                             -> {ok, sessions, residentPages, headlessMode}
  *
  * One persistent context (userDataDir) per account on the SIGNIN_DATA_DIR
  * volume: auth cookies survive restarts and renewal is a silent reload.
@@ -30,6 +30,10 @@
  *   POST /egress {email, url, method, headers, body, timeoutMs, proxy?}
  *                                          -> {status, headers, body, cookies[]}
  *
+ * With `stream: true` (Qwen2API-3ue.3) /egress answers with a relay instead:
+ * one JSON event per line while qwen.ai's answer arrives, and the app cutting
+ * its connection cuts the fetch inside the page (relayEgress).
+ *
  * Design: docs/browser-egress-design.md.
  */
 const http = require('node:http')
@@ -40,6 +44,7 @@ const { WorkerError, STATUS_FOR_CODE } = require('./lib/worker-errors')
 const { normalizeEgress } = require('./lib/egress-fetch')
 const { createResidents } = require('./lib/resident-pages')
 const { createLoginPacer } = require('./lib/login-pacer')
+const { parseHeadlessMode } = require('./lib/browser-identity')
 
 const envInt = (name, fallback) => {
     const raw = parseInt(process.env[name], 10)
@@ -48,6 +53,31 @@ const envInt = (name, fallback) => {
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 const REQUEST_BODY_LIMIT = 131072
+
+/**
+ * Write one event of a relay, and say when the app has taken it: at once, or
+ * once the socket drained when the app is behind. A socket that goes is as
+ * good as drained — nothing will ever drain it, and the relay is over anyway —
+ * which is what keeps a handler from waiting on an app that left.
+ * @param {http.ServerResponse} res
+ * @param {() => boolean} gone - The app left: say it is written, write nothing
+ * @returns {(event: object) => Promise<void>|undefined}
+ */
+const relayWriter = (res, gone) => event => {
+    // Gone: say it is written. The page must not wait on a socket nobody will drain.
+    if (gone()) return
+    if (res.write(`${JSON.stringify(event)}\n`)) return
+    // The app is behind: the page (and behind it qwen.ai) waits until it catches up.
+    return new Promise(resolve => {
+        const taken = () => {
+            res.off('drain', taken)
+            res.off('close', taken)
+            resolve()
+        }
+        res.once('drain', taken)
+        res.once('close', taken)
+    })
+}
 // Egress relays request bodies built by the app (agent contexts, images).
 const EGRESS_BODY_LIMIT = 32 * 1024 * 1024
 
@@ -57,6 +87,10 @@ function createServer(overrides = {}) {
         port: overrides.port ?? envInt('PORT', 3100),
         dataDir: overrides.dataDir || process.env.SIGNIN_DATA_DIR || path.join(__dirname, 'profiles'),
         headless: overrides.headless ?? process.env.SIGNIN_HEADLESS !== 'false',
+        // Which headless browser that is (Qwen2API-3ue.4): the shell, or the
+        // full Chromium presenting as one with a window. Nothing when headed.
+        // Strict: createServer throws on a value it does not know.
+        headlessMode: overrides.headlessMode ?? parseHeadlessMode(process.env.SIGNIN_HEADLESS_MODE),
         chatOrigin: overrides.chatOrigin || process.env.SIGNIN_CHAT_ORIGIN || 'https://chat.qwen.ai',
         timeoutMs: overrides.timeoutMs ?? envInt('SIGNIN_TIMEOUT_MS', 120000),
         renewFraction: overrides.renewFraction ?? 0.6,
@@ -75,6 +109,9 @@ function createServer(overrides = {}) {
         // An /egress timeoutMs is clamped to this; unset, it is config.timeoutMs.
         egressMaxTimeoutMs: overrides.egressMaxTimeoutMs ?? envInt('SIGNIN_EGRESS_MAX_TIMEOUT_MS', 600000),
         egressMaxBytes: overrides.egressMaxBytes ?? 8 * 1024 * 1024,
+        // A stream is relayed, not buffered: the whole-answer cap is not its.
+        // Off unless set.
+        egressMaxStreamBytes: overrides.egressMaxStreamBytes ?? envInt('SIGNIN_EGRESS_MAX_STREAM_BYTES', 0),
         // Grace periods, all bounded so a wedged browser cannot stall a request.
         drainMs: overrides.drainMs ?? 5000,
         backstopMs: overrides.backstopMs ?? 5000,
@@ -94,6 +131,8 @@ function createServer(overrides = {}) {
     // email -> the full sign-in now running for it. A /session that lands on
     // an account whose sign-in is already in flight takes that result.
     const logins = new Map()
+    // What names a stream while it runs: the app going away aborts "its" stream.
+    let streamSequence = 0
     const pacer = createLoginPacer({
         minIntervalMs: config.minLoginIntervalMs,
         maxWaitMs: config.maxLoginWaitMs
@@ -114,7 +153,9 @@ function createServer(overrides = {}) {
     }
 
     async function withBrowser(email, proxy, operation) {
-        const context = await signer.openContext({ dataDir: profileDir(email), proxy, headless: config.headless })
+        const context = await signer.openContext({
+            dataDir: profileDir(email), proxy, headless: config.headless, headlessMode: config.headlessMode
+        })
         try {
             return await operation(context)
         } finally {
@@ -171,10 +212,12 @@ function createServer(overrides = {}) {
         profileDir,
         chatOrigin: config.chatOrigin,
         headless: config.headless,
+        headlessMode: config.headlessMode,
         openTimeoutMs: config.timeoutMs,
         maxPages: config.maxPages,
         keepAliveMs: config.keepAliveMs,
         maxBytes: config.egressMaxBytes,
+        maxStreamBytes: config.egressMaxStreamBytes,
         drainMs: config.drainMs,
         backstopMs: config.backstopMs,
         closeMs: config.closeMs,
@@ -343,7 +386,7 @@ function createServer(overrides = {}) {
         return liveRenewShared(email, proxy, force)
     }
 
-    async function handleEgress(body) {
+    async function handleEgress(req, res, body) {
         const email = parseEmail(body)
         const proxy = parseProxy(body)
         const request = normalizeEgress(body, {
@@ -355,9 +398,89 @@ function createServer(overrides = {}) {
         // runs free, so calls on one page stay concurrent.
         const entry = await serialized(email, () => residents.acquire(email,
             proxy ?? residents.get(email)?.proxy ?? sessions.get(email)?.proxy ?? null))
+        if (request.stream) return relayEgress(req, res, entry, request)
         const result = await residents.fetch(entry, request)
         log('egress', `${new URL(request.url).pathname} -> ${result.status} (${residents.stats().residentPages}/${config.maxPages} pages)`)
         return result
+    }
+
+    /**
+     * The streaming /egress: what the page reports, written out as it comes
+     * in. One JSON event per line:
+     *
+     *   {"type":"head","status":200,"url":"…","redirected":false,"headers":{…},"cookies":[…]}
+     *   {"type":"chunk","data":"<base64 of the bytes qwen.ai just delivered>"}
+     *   {"type":"end","cookies":[…]}
+     *   {"type":"error","code":"egress_timeout","message":"…"}
+     *
+     * Nothing is written until qwen.ai answered: whatever goes wrong before
+     * that is an ordinary error status, with the codes /egress always had.
+     * After it the status is spent, so a failure travels as the last event.
+     *
+     * The app cancelling is it closing the connection — the body of its own
+     * request is long gone by then. That ends the stream here AND the fetch
+     * in the page (resident-pages.js#abort): a fetch already running there is
+     * beyond a Node-side timer, let alone a socket this process no longer holds.
+     */
+    async function relayEgress(req, res, entry, request) {
+        const pathname = new URL(request.url).pathname
+        const id = ++streamSequence
+        // The app may have gone while its page was opening, before there was
+        // anything to listen with: the socket says so all the same.
+        let gone = req.socket.destroyed
+        // The socket, not the response: under Bun a server-side response
+        // never emits 'close' when its client goes.
+        const onGone = () => {
+            gone = true
+            residents.abort(id)
+        }
+        req.socket.on('close', onGone)
+        // The app may be gone by the time a frame is written. Not this handler's error.
+        res.on('error', () => {})
+        const started = Date.now()
+        const frame = relayWriter(res, () => gone)
+        try {
+            // The app gave up while its page was opening: nothing to run.
+            if (gone) return residents.release(entry)
+            const result = await residents.stream(entry, request, {
+                id,
+                onEvent: async event => {
+                    // The app left while the page was busy (reading its jar,
+                    // say): nothing is written — and nothing is logged as if it were.
+                    if (gone) return
+                    if (event.type === 'head') {
+                        res.writeHead(200, {
+                            'content-type': 'application/x-ndjson',
+                            'cache-control': 'no-cache',
+                            'x-accel-buffering': 'no'
+                        })
+                        res.flushHeaders()
+                        log('egress-stream',
+                            `${pathname} -> ${event.status} (${Date.now() - started} ms, ` +
+                            `${residents.stats().residentPages}/${config.maxPages} pages)`)
+                    }
+                    await frame(event)
+                }
+            })
+            if (result.aborted) {
+                log('egress-stream', `${pathname} cancelled (${Date.now() - started} ms)`)
+                return
+            }
+            await frame({ type: 'end', cookies: result.cookies })
+            res.end()
+            log('egress-stream', `${pathname} end (${Date.now() - started} ms)`)
+        } catch (error) {
+            const code = error.code && STATUS_FOR_CODE[error.code] ? error.code : 'browser_error'
+            if (!res.headersSent) {
+                if (!gone) throw error
+                return
+            }
+            log('egress-stream', `${pathname} ${code} (${Date.now() - started} ms)`)
+            await frame({ type: 'error', code, message: error.message || 'Signin worker failure.' })
+            res.end()
+        } finally {
+            req.socket.off('close', onGone)
+        }
     }
 
     function authorized(req) {
@@ -414,7 +537,12 @@ function createServer(overrides = {}) {
 
     async function handle(req, res) {
         if (req.method === 'GET' && req.url === '/health') {
-            return send(res, 200, { ok: true, sessions: sessions.size, ...residents.stats() })
+            // The headless mode is here to be checked after a flip, before the
+            // first request that depends on it.
+            return send(res, 200, {
+                ok: true, sessions: sessions.size, ...residents.stats(),
+                headless: config.headless, headlessMode: config.headless ? config.headlessMode : null
+            })
         }
         if ((req.method === 'POST' && req.url === '/session') || (req.method === 'POST' && req.url === '/renew')) {
             if (!authorized(req)) throw new WorkerError('unauthorized', 'Invalid worker token.')
@@ -424,7 +552,9 @@ function createServer(overrides = {}) {
         if (req.method === 'POST' && req.url === '/egress') {
             if (!authorized(req)) throw new WorkerError('unauthorized', 'Invalid worker token.')
             const body = await readJson(req, EGRESS_BODY_LIMIT)
-            return send(res, 200, await handleEgress(body))
+            // A relay answers for itself, as it goes; there is nothing left to send after it.
+            if (body.stream === true) return handleEgress(req, res, body)
+            return send(res, 200, await handleEgress(req, res, body))
         }
         throw new WorkerError('invalid_request', 'Unknown route.')
     }
@@ -458,12 +588,14 @@ function shutdownHandler(server, exit = code => process.exit(code)) {
     }
 }
 
-module.exports = { createServer, WorkerError, shutdownHandler }
+module.exports = { createServer, WorkerError, shutdownHandler, relayWriter }
 
 if (require.main === module) {
     const server = createServer()
     server.listen(server.workerConfig.port, () => {
-        console.log(`${new Date().toISOString()} signin-worker listening on :${server.workerConfig.port}`)
+        const { headless, headlessMode } = server.workerConfig
+        console.log(`${new Date().toISOString()} signin-worker listening on :${server.workerConfig.port}` +
+            ` (browser: ${headless ? `headless ${headlessMode}` : 'headed'})`)
     })
     const stop = shutdownHandler(server)
     process.on('SIGTERM', () => stop('SIGTERM'))
