@@ -7,7 +7,22 @@
  *
  *   node tools/egress-page-diag.js --profile=<userDataDir> --worker=<dir with lib/>
  *        [--origin=https://chat.qwen.ai] [--out=/tmp/egress-page-diag]
- *        [--headless-mode=shell|chrome] [--settle-ms=0] [--loopback-only=1]
+ *        [--headless-mode=shell|chrome] [--settle-ms=0] [--transport=xhr|fetch]
+ *        [--like-fe=1] [--loopback-only=1]
+ *
+ * The call goes the way the worker sends it (fetch, content-type only) unless:
+ *   --transport=xhr  through XMLHttpRequest, the way the page's own code sends.
+ *                    Its request hooks wrap XHR open() and send(): on the real
+ *                    page baxiaCommon.js signs requests to protected paths with
+ *                    bx-ua, bx-umidtoken and bx-v. The worker's fetch went out
+ *                    without them on 2026-11-24 and got a WAF challenge page.
+ *   --like-fe=1      with the headers the page sends with every API call of its
+ *                    own: accept, accept-language, source, version, timezone,
+ *                    x-request-id, and authorization from the page's localStorage.
+ *   --settle-ms=N    leaves the page alone for N ms first. The page's first
+ *                    signed request of its own was seen about 8 s after the
+ *                    browser started; whether the signature exists before that
+ *                    was not measured.
  *
  * Run it inside the worker container, as the worker's user, with the worker's
  * lib/ as --worker (on prod: /app) and the account's profile as --profile,
@@ -47,6 +62,10 @@ const OUT = args.out || '/tmp/egress-page-diag'
 const HEADLESS_MODE = args['headless-mode'] || 'shell'
 // How long to leave the page alone after it is ready, before the first call.
 const SETTLE_MS = Number(args['settle-ms'] || 0)
+// fetch: the worker's way. xhr: the page's own code's way.
+const TRANSPORT = args.transport === 'xhr' ? 'xhr' : 'fetch'
+// Send the headers the page's own code sends with its API calls.
+const LIKE_FE = args['like-fe'] === '1'
 const LOOPBACK_ONLY = args['loopback-only'] === '1'
 const MAX_BYTES = 8 * 1024 * 1024
 const BACKSTOP_MS = 5000
@@ -139,6 +158,88 @@ async function pageFetchProbe({ url, init, timeoutMs, maxBytes }) {
     }
 }
 
+/**
+ * Runs INSIDE the page. The same call through XMLHttpRequest, which is how the
+ * page's own code sends its API requests — and what its request hooks sign.
+ * `fe` asks for the headers the page's own requests carry. Like pageFetchProbe,
+ * it says every stage to the console and never throws.
+ */
+async function pageXhrProbe({ url, init, timeoutMs, maxBytes, fe }) {
+    const say = (...parts) => console.log('E4DIAG', Date.now(), ...parts)
+    const xhr = new XMLHttpRequest()
+    let timer = null
+    let timerFired = false
+    try {
+        const target = new URL(url, location.href)
+        // open() first: the page's hook decides here whether to sign this URL.
+        say('xhr: opening', init.method, target.pathname)
+        xhr.open(init.method, target.href, true)
+        const headers = { ...(init.headers || {}) }
+        if (fe) {
+            headers.accept = 'application/json, text/plain, */*'
+            headers['accept-language'] = 'en-US,en;q=0.9'
+            headers['x-request-id'] = crypto.randomUUID()
+            headers.source = 'web'
+            // The front end's own version, from the address its scripts load from.
+            const script = [...document.scripts].map(item => item.src).find(src => /qwen-chat-fe\/\d+\.\d+\.\d+\//.test(src))
+            headers.version = script ? script.match(/qwen-chat-fe\/(\d+\.\d+\.\d+)\//)[1] : ''
+            headers.timezone = new Date().toString()
+            headers['content-type'] = headers['content-type'] || 'application/json'
+            const token = localStorage.getItem('token')
+            if (token) headers.authorization = `Bearer ${token}`
+            say('xhr: asking for', Object.keys(headers).sort().join(','))
+        }
+        for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value)
+        xhr.responseType = ''
+        timer = setTimeout(() => {
+            timerFired = true
+            say('xhr: timer, aborting')
+            xhr.abort()
+        }, timeoutMs)
+        // abort() before send() does not fire the abort event, so the caller's
+        // own backstop remains the last resort for a hook that never sends.
+        await new Promise((resolve, reject) => {
+            xhr.onload = () => resolve()
+            xhr.onerror = () => reject(Object.assign(new Error('network error'), { name: 'Error' }))
+            xhr.onabort = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+            xhr.ontimeout = () => reject(Object.assign(new Error('timed out'), { name: 'TimeoutError' }))
+            // send() is where the page's hook steps in and signs the request.
+            say('xhr: sending')
+            xhr.send(init.body === undefined ? null : init.body)
+        })
+        const responseHeaders = {}
+        xhr.getAllResponseHeaders().trim().split(/\r?\n/).filter(Boolean).forEach(line => {
+            const at = line.indexOf(':')
+            responseHeaders[line.slice(0, at).toLowerCase()] = line.slice(at + 1).trim()
+        })
+        const body = xhr.responseText
+        say('xhr: answered', xhr.status, `${body.length} chars`)
+        if (body.length > maxBytes) return { ok: false, error: 'too_large', status: xhr.status }
+        return {
+            ok: true,
+            status: xhr.status,
+            url: xhr.responseURL,
+            redirected: Boolean(xhr.responseURL) && xhr.responseURL !== target.href,
+            headers: responseHeaders,
+            body
+        }
+    } catch (error) {
+        const aborted = error && error.name === 'AbortError'
+        say('xhr: error', error && error.name, cutInPage(error && error.message), `timerFired=${timerFired}`)
+        return {
+            ok: false,
+            error: aborted ? (timerFired ? 'timeout' : 'aborted') : 'network_error',
+            message: String((error && error.message) || error)
+        }
+    } finally {
+        clearTimeout(timer)
+        say('xhr: leaving')
+    }
+    function cutInPage(value) {
+        return String(value || '').slice(0, 120)
+    }
+}
+
 const alive = pid => {
     try {
         process.kill(pid, 0)
@@ -216,7 +317,7 @@ async function main() {
             entry.got = Object.keys(got).sort().map(name => (OPAQUE_HEADERS.test(name) ? `${name}(${String(got[name]).length})` : name))
             entry.contentType = got['content-type'] || ''
             // The answer to this run's own call: what qwen.ai said to it.
-            if (entry.path.endsWith('/chats/new') && entry.method === 'POST' && entry.type === 'fetch') {
+            if (entry.path.endsWith('/chats/new') && entry.method === 'POST' && ['fetch', 'xhr'].includes(entry.type)) {
                 entry.answer = cut((await response.text()).replace(/\s+/g, ' '), 420)
             }
         } catch {
@@ -345,11 +446,12 @@ async function main() {
         }
     }
 
-    /** The worker's fetch() step for step, with a ping every 2 s while it runs. */
+    /** The worker's call step for step, with a ping every 2 s while it runs. */
     async function attempt(label) {
         const started = Date.now()
-        log(label, 'in-page fetch starts')
-        const running = page.evaluate(pageFetchProbe, { ...request, maxBytes: MAX_BYTES })
+        log(label, `in-page call starts (${TRANSPORT}${LIKE_FE ? ', with the headers of the page' : ''})`)
+        const call = TRANSPORT === 'xhr' ? pageXhrProbe : pageFetchProbe
+        const running = page.evaluate(call, { ...request, maxBytes: MAX_BYTES, fe: LIKE_FE })
             .then(outcome => ({ outcome }), error => ({ error }))
         const backstop = new Promise(resolve => {
             const id = setTimeout(() => resolve({ backstop: true }), request.timeoutMs + BACKSTOP_MS)
@@ -394,9 +496,14 @@ async function main() {
         let shape
         try {
             const parsed = JSON.parse(outcome.body)
-            shape = parsed && typeof parsed === 'object' ? `json keys: ${Object.keys(parsed).slice(0, 8).join(',')}` : 'json'
+            shape = parsed && typeof parsed === 'object'
+                ? `json keys: ${Object.keys(parsed).slice(0, 8).join(',')}${'success' in parsed ? ` (success: ${parsed.success})` : ''}`
+                : 'json'
         } catch {
-            shape = outcome.body ? `not json, starts: ${cut(outcome.body.replace(/\s+/g, ' '), 80)}` : 'empty body'
+            const text = outcome.body.replace(/\s+/g, ' ')
+            // What qwen.ai's WAF answers instead of JSON — on 2026-11-24 under status 200.
+            const challenge = /aliyun_waf|acw_sc__v2|_____tmd_____|punish/i.test(text)
+            shape = text ? `NOT JSON${challenge ? ' — A WAF CHALLENGE PAGE' : ''}, starts: ${cut(text, 80)}` : 'empty body'
         }
         return `ok: HTTP ${outcome.status} ${outcome.redirected ? '(redirected to ' + hostPath(outcome.url) + ')' : ''}, ${shape}`
     }
@@ -429,7 +536,7 @@ async function main() {
         }
     }
 
-    const out = { origin: ORIGIN, headlessMode: HEADLESS_MODE, tOpen, tReady }
+    const out = { origin: ORIGIN, headlessMode: HEADLESS_MODE, transport: TRANSPORT, likeFe: LIKE_FE, settleMs: SETTLE_MS, tOpen, tReady }
     out.screenshotReady = await shot('ready.png')
     out.factsReady = await facts()
     log('facts', JSON.stringify(out.factsReady))
@@ -530,6 +637,7 @@ async function main() {
 
     // ---- summary ------------------------------------------------------------------------------
     console.log(`=== resident page diagnostic: ${ORIGIN}, headless mode ${HEADLESS_MODE}, profile ${path.basename(PROFILE)}`)
+    console.log(`call sent via ${TRANSPORT}${LIKE_FE ? ' with the headers of the page' : ' with the headers the worker sends'}${SETTLE_MS ? `, after ${SETTLE_MS} ms of waiting` : ''}`)
     console.log(`browser open ${tOpen} ms, page ready ${tReady} ms, finished ${ms()} ms`)
     console.log('--- timeline (ms since launch)')
     for (const event of events) console.log(`${String(event.t).padStart(7)}  ${event.kind.padEnd(13)} ${event.text}`)
@@ -552,7 +660,8 @@ async function main() {
         const key = `${entry.type} ${entry.method} ${entry.sent.join(',')}`
         if (shown.has(key)) continue
         shown.add(key)
-        console.log(`${entry.type} ${entry.method} ${entry.path.slice(0, 44)}  sent: ${entry.sent.join(' ')}`)
+        const type = entry.contentType.split(';')[0] || 'no content-type'
+        console.log(`${String(entry.t).padStart(7)} ${entry.type} ${entry.method} ${entry.path.slice(0, 44)}  [${type}]  sent: ${entry.sent.join(' ')}`)
         if (entry.answer !== undefined) console.log(`    answered: ${entry.answer}`)
     }
     const foreignFailed = list.filter(e => e.failed && e.host !== originHost)
