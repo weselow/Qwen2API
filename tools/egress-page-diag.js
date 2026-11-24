@@ -12,17 +12,18 @@
  *
  * The call goes the way the worker sends it (fetch, content-type only) unless:
  *   --transport=xhr  through XMLHttpRequest, the way the page's own code sends.
- *                    Its request hooks wrap XHR open() and send(): on the real
- *                    page baxiaCommon.js signs requests to protected paths with
- *                    bx-ua, bx-umidtoken and bx-v. The worker's fetch went out
- *                    without them on 2026-11-24 and got a WAF challenge page.
+ *                    Its request hooks wrap XHR open() and send() (baxiaCommon.js),
+ *                    so whatever they add to the page's requests they add to this
+ *                    one: bx-v always, bx-ua and bx-umidtoken when they decide to.
  *   --like-fe=1      with the headers the page sends with every API call of its
  *                    own: accept, accept-language, source, version, timezone,
  *                    x-request-id, and authorization from the page's localStorage.
- *   --settle-ms=N    leaves the page alone for N ms first. The page's first
- *                    signed request of its own was seen about 8 s after the
- *                    browser started; whether the signature exists before that
- *                    was not measured.
+ *   --settle-ms=N    leaves the page alone for N ms first.
+ * On 2026-11-24 the worker's way (fetch, content-type only) got a WAF challenge
+ * page under status 200 and the page showed a puzzle captcha; the page's way
+ * (--transport=xhr --like-fe=1, after 20 s) got {"success":true}. Which single
+ * header matters was not isolated; nor whether fetch would do with the same
+ * headers, nor whether the wait mattered.
  *
  * Run it inside the worker container, as the worker's user, with the worker's
  * lib/ as --worker (on prod: /app) and the account's profile as --profile,
