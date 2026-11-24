@@ -13,6 +13,11 @@
  *   node tools/worker-identity-probe.js [--playwright <dir>] [--modes shell,full,chrome]
  *                                        [--headed] [--memory]
  *
+ * The page carries a frame from another site (the second address): that is
+ * where a captcha lives, and what the frame sees of itself is part of what the
+ * page presents. An override on the page alone leaves the frame calling itself
+ * HeadlessChrome to its own scripts and in the calls it makes.
+ *
  * Modes: `shell` is what the worker runs by default, `full` the full Chromium
  * left as it is, `chrome` the worker's SIGNIN_HEADLESS_MODE=chrome — the real
  * openContext, as the worker launches it. `--headed` adds the reference, the
@@ -52,7 +57,7 @@ const headed = process.argv.includes('--headed')
 const WANTED = (argument('--modes') || 'shell,full,chrome').split(',')
 const WITH_MEMORY = process.argv.includes('--memory')
 
-const PAGE = `<!doctype html><html><body>stand-in<script>
+const PAGE = `<!doctype html><html><body>stand-in<iframe src="__OTHER__/frame" style="width:20px;height:20px;border:0"></iframe><script>
 (async () => {
   const data = navigator.userAgentData
   const high = data ? await data.getHighEntropyValues(
@@ -84,15 +89,34 @@ const PAGE = `<!doctype html><html><body>stand-in<script>
 })()
 </script></body></html>`
 
+// What the frame reports about itself, posted to its own origin.
+const FRAME_PAGE = `<!doctype html><html><body>frame<script>
+(async () => {
+  const data = navigator.userAgentData
+  const high = data ? await data.getHighEntropyValues(['platformVersion', 'fullVersionList']) : {}
+  await fetch('/api/echo?frame', { method: 'POST', credentials: 'include',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ userAgent: navigator.userAgent, brands: data ? data.brands : null, ...high }) })
+})()
+</script></body></html>`
+
 const REQUEST_HEADERS = [
     'user-agent', 'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform', 'sec-ch-ua-full-version-list',
     'sec-ch-ua-arch', 'sec-ch-ua-bitness', 'sec-ch-ua-model', 'sec-ch-ua-platform-version', 'accept-language'
 ]
 const pick = headers => Object.fromEntries(REQUEST_HEADERS.map(name => [name, headers[name] ?? null]))
 
+// Each stand-in is told where the other one is, once both listen.
+const ORIGINS = {}
+
 function startStandIn(host) {
-    const seen = { document: null, request: null, page: null, late: null }
+    const seen = { document: null, request: null, page: null, late: null, frame: null, iframe: null }
     const server = http.createServer((req, res) => {
+        if (req.method === 'GET' && req.url === '/frame') {
+            seen.frame = pick(req.headers)
+            res.writeHead(200, { 'content-type': 'text/html' })
+            return res.end(FRAME_PAGE)
+        }
         if (req.method === 'GET' && req.url === '/') {
             seen.document = pick(req.headers)
             res.writeHead(200, {
@@ -101,14 +125,15 @@ function startStandIn(host) {
                 'accept-ch': 'Sec-CH-UA-Full-Version-List, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, ' +
                     'Sec-CH-UA-Model, Sec-CH-UA-Platform-Version'
             })
-            return res.end(PAGE)
+            return res.end(PAGE.replace('__OTHER__', ORIGINS[host === '127.0.0.1' ? '127.0.0.2' : '127.0.0.1']))
         }
         if (req.method === 'POST' && req.url.startsWith('/api/echo')) {
-            seen.request ||= pick(req.headers)
+            const frame = req.url.includes('frame')
+            if (!frame) seen.request ||= pick(req.headers)
             let body = ''
             req.on('data', chunk => { body += chunk })
             req.on('end', () => {
-                seen[req.url.includes('late') ? 'late' : 'page'] = JSON.parse(body)
+                seen[frame ? 'iframe' : req.url.includes('late') ? 'late' : 'page'] = JSON.parse(body)
                 res.writeHead(200, { 'content-type': 'application/json' })
                 res.end('{}')
             })
@@ -117,14 +142,19 @@ function startStandIn(host) {
         res.writeHead(404)
         res.end()
     })
-    return new Promise(resolve => server.listen(0, host, () => resolve({ server, seen,
-        origin: `http://${host}:${server.address().port}` })))
+    return new Promise(resolve => server.listen(0, host, () => {
+        ORIGINS[host] = `http://${host}:${server.address().port}`
+        resolve({ server, seen, origin: ORIGINS[host] })
+    }))
 }
 
-async function settled(seen) {
+async function settled(seen, frameSeen) {
     const deadline = Date.now() + 10000
-    while (!seen.late && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25))
+    while ((!seen.late || (frameSeen && !frameSeen())) && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 25))
+    }
     if (!seen.late) throw new Error('the page never reported')
+    if (frameSeen && !frameSeen()) throw new Error('the frame on the page never reported')
 }
 
 // How each mode is launched. shell, chrome and headed are the worker's own
@@ -203,8 +233,8 @@ Write-Output "$(($p | Measure-Object).Count) $(($p | Measure-Object PrivatePageC
 }
 
 async function measure(mode) {
-    const standIn = await startStandIn('127.0.0.1')
     const otherSite = await startStandIn('127.0.0.2')
+    const standIn = await startStandIn('127.0.0.1')
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwen-identity-probe-'))
     const started = Date.now()
     let context
@@ -213,12 +243,18 @@ async function measure(mode) {
         const launched = Date.now() - started
         const page = context.pages()[0]
         await page.goto(standIn.origin + '/', { waitUntil: 'domcontentloaded', timeout: 30000 })
-        await settled(standIn.seen)
+        // What the frame on this page saw of itself, before the page goes anywhere.
+        await settled(standIn.seen, () => otherSite.seen.iframe)
+        const frameDocument = otherSite.seen.frame
+        const iframe = otherSite.seen.iframe
         const loaded = Date.now() - started
         const memory = WITH_MEMORY ? memoryOf(dataDir) : null
         await page.goto(otherSite.origin + '/', { waitUntil: 'domcontentloaded', timeout: 30000 })
         await settled(otherSite.seen)
-        return { mode, launched, loaded, memory, pages: context.pages().length, ...standIn.seen, otherSite: otherSite.seen }
+        return {
+            mode, launched, loaded, memory, pages: context.pages().length,
+            ...standIn.seen, otherSite: otherSite.seen, frameDocument, iframe
+        }
     } finally {
         if (context) await context.close().catch(() => {})
         await Promise.all([standIn, otherSite].map(item => new Promise(resolve => item.server.close(resolve))))
@@ -249,10 +285,17 @@ const FIELDS = [
     ['hardwareConcurrency', r => r.page.hardwareConcurrency],
     ['deviceMemory', r => r.page.deviceMemory],
     ['window outer/inner', r => JSON.stringify(r.late.window)],
+    ['frame: document user-agent', r => r.frameDocument?.['user-agent']],
+    ['frame: document sec-ch-ua', r => r.frameDocument?.['sec-ch-ua']],
+    ['frame: request user-agent', r => r.otherSite.request?.['user-agent']],
+    ['frame: request sec-ch-ua', r => r.otherSite.request?.['sec-ch-ua']],
+    ['frame: navigator.userAgent', r => r.iframe?.userAgent],
+    ['frame: brands', r => JSON.stringify(r.iframe?.brands)],
+    ['frame: platformVersion', r => r.iframe?.platformVersion],
     ['other site: document user-agent', r => r.otherSite.document['user-agent']],
-    ['other site: request user-agent', r => r.otherSite.request['user-agent']],
-    ['other site: request sec-ch-ua', r => r.otherSite.request['sec-ch-ua']],
-    ['other site: navigator.userAgent', r => r.otherSite.page.userAgent]
+    ['other site: request user-agent', r => r.otherSite.request?.['user-agent']],
+    ['other site: request sec-ch-ua', r => r.otherSite.request?.['sec-ch-ua']],
+    ['other site: navigator.userAgent', r => r.otherSite.page?.userAgent]
 ]
 const show = (name, value) => console.log(`  ${name.padEnd(34)} ${value === null || value === undefined ? '(absent)' : value}`)
 
@@ -275,8 +318,10 @@ async function main() {
         for (const [name, read] of FIELDS.slice(8, 10)) show(name, read(result))
         console.log('  -- what page scripts see --')
         for (const [name, read] of FIELDS.slice(10, 20)) show(name, read(result))
+        console.log('  -- a frame from another site, on the page --')
+        for (const [name, read] of FIELDS.slice(20, 27)) show(name, read(result))
         console.log('  -- after a navigation to another site --')
-        for (const [name, read] of FIELDS.slice(20)) show(name, read(result))
+        for (const [name, read] of FIELDS.slice(27)) show(name, read(result))
     }
 
     const reference = results.find(result => result.mode === 'headed')
@@ -291,7 +336,8 @@ async function main() {
     }
     console.log('\n=== "Headless" anywhere in what the page shows? ===')
     for (const result of results) {
-        const haystack = JSON.stringify([result.document, result.request, result.page, result.late, result.otherSite]).toLowerCase()
+        const haystack = JSON.stringify([result.document, result.request, result.page, result.late, result.otherSite,
+            result.frameDocument, result.iframe]).toLowerCase()
         console.log(`  ${LABELS[result.mode].padEnd(38)} ${haystack.includes('headless') ? 'YES' : 'no'}`)
     }
     console.log('\nIDENTITY PROBE OK — loopback only; qwen.ai was not contacted')

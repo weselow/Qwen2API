@@ -4,38 +4,18 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const vm = require('node:vm')
 
 const { createServer } = require('../signin-worker/server')
 const { openContext, BrowserSigninError } = require('../signin-worker/lib/browser-signin')
-const { parseHeadlessMode, IDENTITY_URL } = require('../signin-worker/lib/browser-identity')
+const { parseHeadlessMode, presentedUserAgent } = require('../signin-worker/lib/browser-identity')
 const { createResidents } = require('../signin-worker/lib/resident-pages')
 
 const AUTH = { authorization: 'Bearer secret' }
-const OVERRIDE = 'Emulation.setUserAgentOverride'
 
-// What a full Chromium on Linux reports about itself, as measured in the
-// worker's image (Qwen2API-3ue.4).
-const IDENTITY = {
-  userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/159.0.0.0 Safari/537.36',
-  brands: [{ brand: 'Chromium', version: '159' }, { brand: 'Not/A)Brand', version: '8' }],
-  mobile: false,
-  platform: 'Linux',
-  architecture: 'x86',
-  model: '',
-  platformVersion: '',
-  fullVersionList: [
-    { brand: 'Chromium', version: '159.0.8154.6' }, { brand: 'Not/A)Brand', version: '8.0.0.0' }
-  ]
-}
-const HINTS = {
-  brands: IDENTITY.brands,
-  fullVersionList: IDENTITY.fullVersionList,
-  platform: 'Linux',
-  platformVersion: '',
-  architecture: 'x86',
-  model: '',
-  mobile: false
-}
+// What the full Chromium calls itself when it is launched headless on Linux
+// and left alone, as measured in the worker's image (Qwen2API-3ue.4).
+const STOCK = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/159.0.0.0 Safari/537.36'
 // The window frame per platform, as the headed browser has it.
 const FRAME = { win32: [16, 134], linux: [8, 131], darwin: [2, 126] }[process.platform] || [24, 134]
 
@@ -48,79 +28,66 @@ const emitter = () => {
 }
 
 /**
- * A fake "Playwright" in the jik.3 mold: a context whose pages record what
- * the worker does. What the browser says about itself is scripted; whether
- * the real browser answers the in-page function is the real browser's smoke
- * to show (tools/worker-egress-local-smoke.js).
+ * A fake "Playwright" in the jik.3 mold: every launch makes a context of its
+ * own, whose pages record what the worker does. What the browser answers when
+ * it is asked for its User-Agent is scripted; whether the real browser answers
+ * at all is the real browser's smoke to show (tools/worker-egress-local-smoke.js).
  */
 function fakeChromium(script = {}) {
-  const calls = {
-    launches: [], pages: [], routes: [], gotos: [], evaluations: [], closedPages: [],
-    sent: [], sessions: [], newPages: 0
-  }
-  const makePage = kind => {
-    const page = { kind, ...emitter() }
-    page.route = async (url, handler) => {
-      calls.routes.push({ page, url, handler })
-      if (script.route) await script.route()
-    }
-    page.goto = async (url, options) => {
-      calls.gotos.push({ page, url, options })
-      if (script.goto) await script.goto()
-    }
+  const calls = { launches: [], contexts: [], evaluations: [], sent: [], sessions: [], newPages: 0 }
+  const makeContext = () => {
+    const page = { ...emitter() }
     page.evaluate = async fn => {
       calls.evaluations.push({ page, fn })
-      return Object.hasOwn(script, 'identity') ? script.identity : IDENTITY
+      return Object.hasOwn(script, 'userAgent') ? script.userAgent : STOCK
     }
-    // As in the browser: a closed page is gone from context.pages().
-    page.close = async () => {
-      calls.closedPages.push(page)
-      context.open = context.open.filter(open => open !== page)
+    // A fresh context opens with a page; `firstPage: false` is for the one that is really launched.
+    const context = {
+      ...emitter(), closed: 0, open: script.firstPage === false && calls.contexts.length > 0 ? [] : [page]
     }
-    calls.pages.push(page)
-    return page
-  }
-  const context = {
-    ...emitter(), closed: 0, open: [makePage('first')]
-  }
-  context.pages = () => context.open
-  context.newPage = async () => {
-    calls.newPages++
-    const page = makePage('later')
-    context.open.push(page)
-    context.emit('page', page)
-    return page
-  }
-  context.newCDPSession = async page => {
-    const session = {
-      page, detached: 0, sends: [],
-      async send(method, params) {
-        session.sends.push({ method, params })
-        calls.sent.push({ page, method, params })
-        if (script.send) return script.send(method, params)
-        if (method === 'Browser.getWindowForTarget') return { windowId: 7 }
-        return {}
-      },
-      async detach() { session.detached++ }
+    context.pages = () => context.open
+    context.newPage = async () => {
+      calls.newPages++
+      context.open.push(page)
+      context.emit('page', page)
+      return page
     }
-    calls.sessions.push(session)
-    return session
+    context.newCDPSession = async target => {
+      const session = {
+        page: target, detached: 0,
+        async send(method, params) {
+          calls.sent.push({ page: target, method, params })
+          if (script.send) return script.send(method, params)
+          if (method === 'Browser.getWindowForTarget') return { windowId: 7 }
+          return {}
+        },
+        async detach() { session.detached++ }
+      }
+      calls.sessions.push(session)
+      return session
+    }
+    context.close = async () => { context.closed++; context.emit('close') }
+    calls.contexts.push(context)
+    return context
   }
-  context.close = async () => { context.closed++; context.emit('close') }
   return {
-    calls, context,
+    calls, script,
     chromium: {
       async launchPersistentContext(dataDir, options) {
-        calls.launches.push({ dataDir, options })
-        return context
+        if (script.launch) await script.launch({ dataDir, options })
+        // What the directory was when the browser was started on it.
+        calls.launches.push({ dataDir, options, present: fs.existsSync(dataDir) })
+        return makeContext()
       }
     }
   }
 }
 
-// What the first page was told to present.
-const overrideOf = fake => fake.calls.sent.find(call => call.method === OVERRIDE && call.page.kind === 'first')
-const windowBoundsOf = fake => fake.calls.sent
+// One launch in the chrome mode: asks the browser for its User-Agent, then launches it.
+const openChrome = (fake, extra = {}) => openContext({
+  dataDir: '/profiles/a', proxy: null, headless: true, headlessMode: 'chrome', launcher: fake.chromium, ...extra
+})
+const boundsOf = fake => fake.calls.sent
   .filter(call => call.method === 'Browser.setWindowBounds').map(call => call.params.bounds)
 
 test('SIGNIN_HEADLESS_MODE is shell unless it says chrome, and refuses everything else', () => {
@@ -145,167 +112,169 @@ test('the default launches the headless shell and touches nothing else', async (
   const context = await openContext({
     dataDir: '/profiles/a', proxy: 'http://p:8080', headless: true, launcher: fake.chromium
   })
-  assert.equal(context, fake.context)
+  assert.equal(context, fake.calls.contexts[0])
   assert.equal(fake.calls.launches.length, 1)
-  const { options } = fake.calls.launches[0]
+  const { dataDir, options } = fake.calls.launches[0]
+  assert.equal(dataDir, '/profiles/a')
   assert.equal(options.channel, undefined)
+  assert.equal(options.userAgent, undefined)
   assert.equal(options.headless, true)
   assert.deepEqual(options.viewport, { width: 1280, height: 800 })
   assert.deepEqual(options.proxy, { server: 'http://p:8080' })
-  // No identity read, no CDP: the page is whatever the shell makes of it.
+  // No browser asked, no page opened, no CDP: the page is whatever the shell makes of it.
+  assert.equal(fake.calls.evaluations.length, 0)
   assert.equal(fake.calls.newPages, 0)
   assert.equal(fake.calls.sessions.length, 0)
   assert.equal(fake.calls.sent.length, 0)
   assert.equal(context.closed, 0)
 })
 
-test('chrome launches the full Chromium and presents it as a browser with a window', async () => {
+test('chrome asks the full Chromium what it calls itself, then launches it saying Chrome', async () => {
   const fake = fakeChromium()
-  const context = await openContext({
-    dataDir: '/profiles/a', proxy: null, headless: true, headlessMode: 'chrome', launcher: fake.chromium
-  })
-  assert.equal(context, fake.context)
-  assert.equal(fake.calls.launches[0].options.channel, 'chromium')
-  assert.equal(context.closed, 0)
+  const context = await openChrome(fake, { proxy: 'http://p:8080', timeoutMs: 45000 })
+  const [asking, real] = fake.calls.launches
+  assert.equal(fake.calls.contexts.length, 2)
 
-  // The identity came from a throwaway page, served by a route — the real
-  // page was never navigated anywhere for it.
-  assert.equal(fake.calls.newPages, 1)
-  const [scratch] = fake.calls.closedPages
-  assert.equal(scratch.kind, 'later')
-  assert.deepEqual(fake.calls.routes, [{ page: scratch, url: '**/*', handler: fake.calls.routes[0].handler }])
-  assert.deepEqual(fake.calls.gotos, [{
-    page: scratch, url: IDENTITY_URL, options: { waitUntil: 'domcontentloaded' }
-  }])
+  // Asked on a throwaway profile — never the real one — started the same way
+  // (headless, the full build) and with nothing else, and closed.
+  assert.equal(asking.present, true)
+  assert.notEqual(asking.dataDir, real.dataDir)
+  assert.equal(fs.existsSync(asking.dataDir), false, 'the throwaway profile is removed')
+  assert.deepEqual(asking.options, { headless: true, channel: 'chromium', chromiumSandbox: false, timeout: 45000 })
   assert.equal(fake.calls.evaluations.length, 1)
-  assert.equal(fake.calls.evaluations[0].page, scratch)
-  assert.deepEqual(fake.calls.gotos.filter(call => call.page.kind === 'first'), [])
-  assert.equal(context.open.length, 1)
+  assert.equal(fake.calls.evaluations[0].page, fake.calls.contexts[0].open[0])
+  assert.equal(fake.calls.contexts[0].closed, 1)
+  // It is asked in the page, for the User-Agent and nothing else.
+  const { fn } = fake.calls.evaluations[0]
+  assert.equal(vm.runInNewContext(`(${fn.toString()})`, { navigator: { userAgent: 'asked and answered' } })(), 'asked and answered')
 
-  // One word of the User-Agent changed; every hint is the browser's own, and nothing else is sent.
-  const override = overrideOf(fake)
-  assert.deepEqual(override.params, {
-    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/159.0.0.0 Safari/537.36',
-    userAgentMetadata: HINTS
-  })
-  assert.deepEqual(override.params.userAgent, IDENTITY.userAgent.replace('HeadlessChrome', 'Chrome'))
-  assert.doesNotMatch(override.params.userAgent, /Headless/i)
+  // The real launch: the full build, on the real profile, with one word of the
+  // User-Agent changed — and Playwright's option is what carries it into every frame.
+  assert.equal(real.dataDir, '/profiles/a')
+  assert.equal(real.options.channel, 'chromium')
+  assert.equal(real.options.userAgent, STOCK.replace('HeadlessChrome', 'Chrome'))
+  assert.equal(real.options.headless, true)
+  assert.equal(real.options.timeout, 45000)
+  assert.deepEqual(real.options.viewport, { width: 1280, height: 800 })
+  assert.deepEqual(real.options.proxy, { server: 'http://p:8080' })
+  // Nothing was done to the context for it: no page opened, nothing navigated, no override sent.
+  assert.equal(context, fake.calls.contexts[1])
+  assert.equal(fake.calls.newPages, 0)
+  assert.equal(context.closed, 0)
+  assert.equal(fake.calls.sent.filter(call => call.method.startsWith('Emulation.')).length, 0)
 
   // The window is framed as a headed one: larger than the viewport by the platform's frame.
-  assert.deepEqual(fake.calls.sent.filter(call => call.method === 'Browser.getWindowForTarget')
-    .map(call => call.page.kind), ['first'])
-  assert.deepEqual(windowBoundsOf(fake), [
+  assert.deepEqual(fake.calls.sent.map(call => call.method),
+    ['Browser.getWindowForTarget', 'Browser.setWindowBounds', 'Browser.setWindowBounds'])
+  assert.deepEqual(boundsOf(fake), [
     { windowState: 'normal' },
     { width: 1280 + FRAME[0], height: 800 + FRAME[1] }
   ])
-
-  // The session that set it stays for the life of the context, and goes with it.
-  const session = fake.calls.sessions[0]
-  assert.equal(session.page.kind, 'first')
-  assert.equal(session.detached, 0)
-  context.emit('close')
-  assert.equal(session.detached, 1)
+  // The session was only ever for that.
+  assert.equal(fake.calls.sessions.length, 1)
+  assert.equal(fake.calls.sessions[0].page, context.open[0])
+  assert.equal(fake.calls.sessions[0].detached, 1)
 })
 
-test('a page opened later in a chrome context is presented the same way', async () => {
+test('the User-Agent is asked for once per browser, not once per launch', async () => {
   const fake = fakeChromium()
-  const context = await openContext({
-    dataDir: '/profiles/a', proxy: null, headless: true, headlessMode: 'chrome', launcher: fake.chromium
-  })
-  const later = await context.newPage()
-  const overrides = fake.calls.sent.filter(call => call.method === OVERRIDE)
-  assert.deepEqual(overrides.map(call => call.page.kind), ['first', 'later'])
-  assert.deepEqual(overrides[1].params, overrides[0].params)
-  // Its window is its own business: the frame was asked for the first page only.
-  assert.deepEqual(fake.calls.sent.filter(call => call.page === later).map(call => call.method), [OVERRIDE])
-  assert.equal(later.closed, undefined)
+  await openChrome(fake)
+  await openChrome(fake)
+  await openChrome(fake, { proxy: 'socks5://127.0.0.1:1080' })
+  assert.deepEqual(fake.calls.launches.map(launch => launch.options.userAgent === undefined),
+    [true, false, false, false])
+  assert.equal(fake.calls.evaluations.length, 1)
+  // Another browser (another Playwright, in a test) is asked in its turn.
+  const other = fakeChromium({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/160.0.0.0 Safari/537.36' })
+  await openChrome(other)
+  assert.equal(other.calls.launches.length, 2)
+  assert.equal(other.calls.launches[1].options.userAgent,
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/160.0.0.0 Safari/537.36')
 })
 
-test('every hint is carried as the browser reported it, mobile included', async () => {
-  const fake = fakeChromium({ identity: { ...IDENTITY, mobile: true, platformVersion: '6.1.0' } })
-  await openContext({
-    dataDir: '/profiles/a', proxy: null, headless: true, headlessMode: 'chrome', launcher: fake.chromium
-  })
-  assert.deepEqual(overrideOf(fake).params.userAgentMetadata, { ...HINTS, mobile: true, platformVersion: '6.1.0' })
+test('a context that opens without a page gets one, for its window', async () => {
+  const fake = fakeChromium({ firstPage: false })
+  const context = await openChrome(fake)
+  assert.equal(fake.calls.newPages, 1, 'the real context had no page to size')
+  assert.equal(fake.calls.sessions[0].page, context.open[0])
+  assert.equal(context.closed, 0)
 })
 
-test('a User-Agent that does not say HeadlessChrome goes out as it is', async () => {
-  const fake = fakeChromium({ identity: {
-    ...IDENTITY, userAgent: IDENTITY.userAgent.replace('HeadlessChrome', 'Chrome')
+test('a User-Agent that is not a browser\'s fails the launch before the real profile is touched', async () => {
+  for (const userAgent of [undefined, null, '', 159, {}, 'Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/120.0',
+    'HeadlessChrome', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome']) {
+    const fake = fakeChromium({ userAgent })
+    await assert.rejects(openChrome(fake), error => {
+      assert.ok(error instanceof BrowserSigninError, String(error))
+      assert.equal(error.code, 'browser_error')
+      assert.match(error.message, /^Could not make the browser present as Chrome: The browser did not report its User-Agent\.$/)
+      return true
+    }, String(userAgent))
+    // The real profile was never launched on; the throwaway one is closed and gone.
+    assert.equal(fake.calls.launches.length, 1)
+    assert.equal(path.dirname(fake.calls.launches[0].dataDir), os.tmpdir().replace(/[\\/]+$/, ''))
+    assert.ok(path.basename(fake.calls.launches[0].dataDir).startsWith('signin-worker-identity-'))
+    assert.equal(fake.calls.contexts.length, 1)
+    assert.equal(fake.calls.contexts[0].closed, 1)
+    assert.equal(fs.existsSync(fake.calls.launches[0].dataDir), false)
+    assert.equal(fake.calls.sent.length, 0)
+    // A reading that failed is not kept: the next launch asks again.
+    fake.script.userAgent = STOCK
+    const context = await openChrome(fake)
+    assert.equal(context.closed, 0)
+    assert.equal(fake.calls.launches.length, 3)
+    assert.equal(fake.calls.launches[2].options.userAgent, STOCK.replace('HeadlessChrome', 'Chrome'))
+  }
+})
+
+test('a browser that cannot be started to be asked fails the launch the same way', async () => {
+  const fake = fakeChromium({ launch: async ({ options }) => {
+    if (options.userAgent === undefined) throw new Error('Executable doesn\'t exist at /opt/pw-browsers/chromium-1255')
   } })
-  await openContext({ dataDir: '/profiles/a', proxy: null, headless: true, headlessMode: 'chrome', launcher: fake.chromium })
-  assert.equal(overrideOf(fake).params.userAgent, IDENTITY.userAgent.replace('HeadlessChrome', 'Chrome'))
+  await assert.rejects(openChrome(fake), error => {
+    assert.equal(error.code, 'browser_error')
+    assert.equal(error.message, 'Could not make the browser present as Chrome: Executable doesn\'t exist at /opt/pw-browsers/chromium-1255')
+    return true
+  })
+  assert.equal(fake.calls.launches.length, 0)
+  assert.equal(fake.calls.contexts.length, 0)
+})
+
+test('only the one word of the User-Agent changes', () => {
+  assert.equal(presentedUserAgent(STOCK), STOCK.replace('HeadlessChrome', 'Chrome'))
+  // A browser that does not say HeadlessChrome goes out as it is.
+  const headed = STOCK.replace('HeadlessChrome', 'Chrome')
+  assert.equal(presentedUserAgent(headed), headed)
 })
 
 test('chrome mode means nothing to a browser with a window', async () => {
   const fake = fakeChromium()
-  const context = await openContext({
-    dataDir: '/profiles/a', proxy: null, headless: false, headlessMode: 'chrome', launcher: fake.chromium
-  })
+  const context = await openChrome(fake, { headless: false })
+  assert.equal(fake.calls.launches.length, 1, 'nobody was asked')
   assert.equal(fake.calls.launches[0].options.headless, false)
   assert.equal(fake.calls.launches[0].options.channel, undefined)
-  assert.equal(fake.calls.newPages, 0)
+  assert.equal(fake.calls.launches[0].options.userAgent, undefined)
+  assert.equal(fake.calls.evaluations.length, 0)
   assert.equal(fake.calls.sent.length, 0)
   assert.equal(context.closed, 0)
 })
 
 test('a value that is not a mode is refused before any browser starts', async () => {
   const fake = fakeChromium()
-  await assert.rejects(openContext({
-    dataDir: '/profiles/a', proxy: null, headlessMode: 'chrom', launcher: fake.chromium
-  }), /SIGNIN_HEADLESS_MODE/)
+  await assert.rejects(openChrome(fake, { headlessMode: 'chrom' }), /SIGNIN_HEADLESS_MODE/)
   assert.equal(fake.calls.launches.length, 0)
-})
-
-test('a browser that does not report its hints is closed and fails the launch', async () => {
-  for (const identity of [
-    undefined, {}, { ...IDENTITY, brands: undefined }, { ...IDENTITY, brands: [] },
-    { ...IDENTITY, fullVersionList: [] }, { ...IDENTITY, platformVersion: undefined },
-    { ...IDENTITY, mobile: undefined }, { ...IDENTITY, userAgent: 159 }
-  ]) {
-    const fake = fakeChromium({ identity })
-    await assert.rejects(openContext({
-      dataDir: '/profiles/a', proxy: null, headless: true, headlessMode: 'chrome', launcher: fake.chromium
-    }), error => {
-      assert.ok(error instanceof BrowserSigninError, String(error))
-      assert.equal(error.code, 'browser_error')
-      assert.match(error.message, /client hints/)
-      return true
-    }, JSON.stringify(identity))
-    // Closed — a browser left open holds the profile against the next launch —
-    // and nothing half-made was sent.
-    assert.equal(fake.context.closed, 1)
-    assert.equal(fake.calls.sent.length, 0)
-    // The throwaway page is gone too.
-    assert.deepEqual(fake.calls.closedPages.map(page => page.kind), ['later'])
-  }
-})
-
-test('a refused override fails the launch the same way', async () => {
-  const fake = fakeChromium({ send: method => {
-    if (method === OVERRIDE) throw new Error('Protocol error (Emulation.setUserAgentOverride): Invalid parameters')
-  } })
-  await assert.rejects(openContext({
-    dataDir: '/profiles/a', proxy: null, headless: true, headlessMode: 'chrome', launcher: fake.chromium
-  }), error => {
-    assert.equal(error.code, 'browser_error')
-    assert.match(error.message, /present as Chrome: Protocol error/)
-    return true
-  })
-  assert.equal(fake.context.closed, 1)
-  assert.equal(fake.context.open.length, 1)
 })
 
 test('a window that will not resize costs the frame, not the launch', async () => {
   const fake = fakeChromium({ send: method => {
-    if (method === 'Browser.setWindowBounds') throw new Error('Browser.setWindowBounds is not allowed')
+    if (method === 'Browser.getWindowForTarget') throw new Error('Browser.getWindowForTarget is not allowed')
   } })
-  const context = await openContext({
-    dataDir: '/profiles/a', proxy: null, headless: true, headlessMode: 'chrome', launcher: fake.chromium
-  })
-  assert.equal(context, fake.context)
+  const context = await openChrome(fake)
+  assert.equal(context, fake.calls.contexts[1])
   assert.equal(context.closed, 0)
-  assert.ok(overrideOf(fake), 'the override stands')
+  assert.deepEqual(boundsOf(fake), [])
+  // It still says Chrome.
+  assert.equal(fake.calls.launches[1].options.userAgent, STOCK.replace('HeadlessChrome', 'Chrome'))
 })
 
 test('the resident pages on their own open with the shell, and pass on what they are given', async t => {

@@ -12,7 +12,9 @@
  * Credentials never reach logs, screenshots or error messages.
  */
 
-const { parseHeadlessMode, presentAsChrome } = require('./browser-identity')
+const {
+    parseHeadlessMode, stockUserAgentOf, presentedUserAgent, frameWindow
+} = require('./browser-identity')
 
 const jwtExp = token => {
     const part = String(token).split('.')[1]
@@ -66,10 +68,19 @@ async function openContext({
     const asChrome = headless && parseHeadlessMode(headlessMode) === 'chrome'
     const { chromium } = launcher ? { chromium: launcher } : require('playwright')
     const viewport = { width: 1280, height: 800 }
+    let presented
+    if (asChrome) {
+        try {
+            presented = presentedUserAgent(await stockUserAgentOf(chromium, timeoutMs))
+        } catch (error) {
+            throw new BrowserSigninError('browser_error', `Could not make the browser present as Chrome: ${error.message}`)
+        }
+    }
     const context = await chromium.launchPersistentContext(dataDir, {
         headless,
-        // The full Chromium, not the headless shell it would otherwise start.
-        ...(asChrome ? { channel: 'chromium' } : {}),
+        // The full Chromium, not the headless shell it would otherwise start,
+        // saying "Chrome" where it says "HeadlessChrome" — in every frame.
+        ...(asChrome ? { channel: 'chromium', userAgent: presented } : {}),
         viewport,
         locale: 'en-US',
         // Container runs without CAP_SYS_ADMIN; a real display keeps the sandbox off anyway.
@@ -79,14 +90,7 @@ async function openContext({
         proxy: parseProxy(proxy),
         timeout: timeoutMs
     })
-    if (!asChrome) return context
-    try {
-        await presentAsChrome(context, viewport)
-    } catch (error) {
-        // Left open, this browser would hold the profile's lock against the next launch.
-        await context.close().catch(() => {})
-        throw new BrowserSigninError('browser_error', `Could not make the browser present as Chrome: ${error.message}`)
-    }
+    if (asChrome) await frameWindow(context, viewport)
     return context
 }
 

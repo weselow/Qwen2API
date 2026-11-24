@@ -41,13 +41,38 @@ const SSE_FRAMES = [
 
 /**
  * The stand-in: a root page that settles a token the way the chat FE does,
- * and API routes that report what actually reached the server.
+ * and API routes that report what actually reached the server. The root page
+ * carries a frame from another site — another loopback address, so it is
+ * another site to the browser — because that is where a captcha lives, and
+ * what that frame sees of itself is part of what the page presents.
  */
 function startStandIn() {
     let pageLoads = 0
     // What /api/sse-long saw when its client went away — which, for a relay,
     // is the fetch inside the page being aborted.
     const longStream = { sent: 0, closedAt: 0 }
+    // What the third-party frame saw of itself, the last time it loaded.
+    const frame = { document: null, request: null, page: null }
+    const other = http.createServer((req, res) => {
+        if (req.url === '/frame' && req.method === 'GET') {
+            frame.document = req.headers['user-agent'] || null
+            res.writeHead(200, { 'content-type': 'text/html' })
+            return res.end(`<html><body>frame<script>fetch('/api/echo',{method:'POST',headers:{
+                'content-type':'application/json'},body:JSON.stringify({userAgent:navigator.userAgent})})</script></body></html>`)
+        }
+        if (req.url === '/api/echo' && req.method === 'POST') {
+            frame.request = req.headers['user-agent'] || null
+            let body = ''
+            req.on('data', chunk => { body += chunk })
+            return req.on('end', () => {
+                frame.page = JSON.parse(body).userAgent
+                res.writeHead(200, { 'content-type': 'application/json' })
+                res.end('{}')
+            })
+        }
+        res.writeHead(404)
+        return res.end()
+    })
     const server = http.createServer((req, res) => {
         if (req.url === '/' && req.method === 'GET') {
             pageLoads++
@@ -56,7 +81,8 @@ function startStandIn() {
                 // So that the calls the page makes carry the hints a guard can ask for.
                 'accept-ch': 'Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List'
             })
-            return res.end(`<html><body>stand-in<script>localStorage.setItem('token', '${
+            return res.end(`<html><body>stand-in<iframe src="http://127.0.0.2:${
+                other.address().port}/frame" style="width:0;height:0;border:0"></iframe><script>localStorage.setItem('token', '${
                 tokenExpiringIn(3600)}')</script></body></html>`)
         }
         if (req.url === '/auth' && req.method === 'GET') {
@@ -134,12 +160,14 @@ function startStandIn() {
         res.writeHead(404)
         res.end()
     })
-    return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve({
+    return new Promise(resolve => other.listen(0, '127.0.0.2', () => server.listen(0, '127.0.0.1', () => resolve({
         server,
+        other,
         origin: `http://127.0.0.1:${server.address().port}`,
         pageLoads: () => pageLoads,
-        longStream
-    })))
+        longStream,
+        frame
+    }))));
 }
 
 // Poll until the condition holds: a relay's chunks are timed by the stand-in.
@@ -243,6 +271,9 @@ async function main() {
         assert.match(echo.secChUa || '', /"HeadlessChrome"/)
         assert.match(echo.fullVersionList || '', /"HeadlessChrome"/)
         const shell = { userAgent: echo.userAgent, hints: echo.secChUa, platformVersion: echo.platformVersion }
+        // The third-party frame on the page says the same of itself, in every way it can be seen.
+        await until(() => standIn.frame.page)
+        for (const seen of Object.values(standIn.frame)) assert.match(seen, /HeadlessChrome\//)
 
         assert.equal(echo.method, 'POST')
         assert.equal(echo.body, '{"hello":"world"}')
@@ -448,13 +479,16 @@ async function main() {
         const presentedUrl = `http://127.0.0.1:${presented.address().port}`
         const onPresented = (route, payload) => call(route, payload, presentedUrl)
         try {
-            // The first call pays for the browser, the identity read and the page load.
+            // The first call pays for asking the browser its name, the browser and the page load.
             const chromeStarted = Date.now()
+            Object.assign(standIn.frame, { document: null, request: null, page: null })
             const asChrome = await onPresented('/egress', {
                 email, url: '/api/echo', method: 'POST', headers: { 'content-type': 'application/json' }, timeoutMs: 30000
             })
             assert.equal(asChrome.status, 200, JSON.stringify(asChrome.body))
             const seen = JSON.parse(asChrome.body.body)
+            // The page loaded for this browser: the frame on it reported afresh.
+            await until(() => standIn.frame.page)
             const state = await (await fetch(`${presentedUrl}/health`)).json()
             assert.equal(state.headlessMode, 'chrome')
             assert.equal(state.residentPages, 1)
@@ -472,12 +506,24 @@ async function main() {
             assert.equal(seen.userAgent,
                 shell.userAgent.replace(/HeadlessChrome\/[\d.]+/, `Chrome/${major}.0.0.0`))
             assert.doesNotMatch(seen.userAgent, /headless/i)
-            // ...and the hints are the browser's own, not a made-up set: the
-            // full Chromium's brands, and the platform version the shell reports.
+            // ...and the hints keep the browser's own brands: the GREASE one is
+            // the build's, not something an override could invent.
             assert.doesNotMatch(seen.secChUa || '', /headless/i)
             assert.match(seen.secChUa || '', new RegExp(`"Chromium";v="${major}"`))
+            for (const [grease] of (shell.hints || '').matchAll(/"[^"]*B[Rr][Aa][Nn][Dd][^"]*";v="\d+"/g)) {
+                assert.ok(seen.secChUa.includes(grease), `${seen.secChUa} does not carry ${grease}`)
+            }
             assert.doesNotMatch(seen.fullVersionList || '', /headless/i)
-            assert.equal(seen.platformVersion, shell.platformVersion)
+            // platformVersion is the one hint the option fills in itself: empty,
+            // which is what the browser says on Linux; elsewhere the browser says more.
+            assert.equal(seen.platformVersion, process.platform === 'linux' ? shell.platformVersion : '"10.0"')
+            // The third-party frame on the page — where a captcha lives — says
+            // the same, in its document request, in the calls it makes and to its own scripts.
+            for (const [what, value] of Object.entries(standIn.frame)) {
+                assert.doesNotMatch(value || '', /headless/i, `the frame's ${what}`)
+            }
+            assert.match(standIn.frame.request, /Chrome\/[\d.]+/)
+            console.log(`   the third-party frame saw User-Agent: ${standIn.frame.page}`)
 
             // A reload (a live renewal) is a navigation: the identity must survive it.
             const reloaded = await onPresented('/renew', { email, force: true })
@@ -488,7 +534,8 @@ async function main() {
             assert.equal(afterReload.status, 200, JSON.stringify(afterReload.body))
             assert.equal(JSON.parse(afterReload.body.body).userAgent, seen.userAgent)
             console.log('ok chrome mode: the profile the shell wrote is resumed, "Headless" is gone from the User-Agent' +
-                ' and from the hints, the hints are the browser\'s own, and a reload keeps it so')
+                ' and from the hints, the hints keep the browser\'s own brands, the third-party frame says the same,' +
+                ' and a reload keeps it so')
         } finally {
             await presented.workerShutdown()
             await new Promise(resolve => presented.close(resolve))
@@ -499,7 +546,8 @@ async function main() {
         await server.workerShutdown()
         await Promise.all([
             new Promise(resolve => server.close(resolve)),
-            new Promise(resolve => standIn.server.close(resolve))
+            new Promise(resolve => standIn.server.close(resolve)),
+            new Promise(resolve => standIn.other.close(resolve))
         ])
         fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 })
     }
