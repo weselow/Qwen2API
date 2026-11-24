@@ -144,8 +144,9 @@ class DataPersistence {
           this._statsPersistTimers.delete(email)
           this._statsPendingPayload.delete(email)
           // 账户删除后，其 v2 会话记录（bearer token + jar）不能留在线上：
-          // 删除失败只记日志——账户本体已删，回滚它只会更糟
-          if (!(await this.deleteV2Session(email))) {
+          // 删除失败只记日志——账户本体已删，回滚它只会更糟。
+          // Already inside this account's queue: the unqueued variant.
+          if (!(await this.deleteV2SessionNow(email))) {
             logger.error(`账户已删除但其 v2 会话记录删除失败 (${email})`, 'DATA')
           }
         }
@@ -237,11 +238,18 @@ class DataPersistence {
   }
 
   /**
-   * 删除单个账户的 v2 会话记录（401/punish 失效、账户删除）
+   * 删除单个账户的 v2 会话记录（401 失效、账户删除）
+   * 与保存走同一条 per-account 队列：晚于保存发出的删除一定晚于它落地。
+   * 否则还在排队的保存会把刚作废的会话写回线上（Qwen2API-3ue.2）。
    * @returns {Promise<boolean>} 删除是否成功
    */
   async deleteV2Session(email) {
     if (!email) return false
+    return enqueueAccountTask(this._accountKey(email), () => this.deleteV2SessionNow(email))
+  }
+
+  /** deleteV2Session для того, кто уже держит очередь аккаунта (deleteAccount). */
+  async deleteV2SessionNow(email) {
     try {
       switch (config.dataSaveMode) {
         case 'redis': {

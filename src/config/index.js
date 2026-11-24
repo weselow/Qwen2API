@@ -31,18 +31,40 @@ const parseApiKeys = (apiKeyEnv = process.env.API_KEY) => {
 const { apiKeys, adminKey } = parseApiKeys()
 
 /**
- * 解析 COMPLETIONS_TRANSPORT（completions 的 TLS 传输选择）：
+ * 解析 COMPLETIONS_TRANSPORT（completions 的传输选择）：
  * auto（默认，有 curl-impersonate 就用，否则 axios + 一次性警告）|
- * impersonate（强制，缺二进制直接报错）| axios（纯 Node TLS，旧行为）。
+ * impersonate（强制，缺二进制直接报错）| axios（纯 Node TLS，旧行为）|
+ * browser（Qwen2API-3ue.3：从 signin-worker 的常驻页面里发出；要求
+ * V2_SESSION_MODE=browser）。
  * 拼错直接拒绝启动：静默回落到 axios 会把 Baxia 风控带回来且无从排查。
  * @returns {string}
  */
 const parseCompletionsTransport = (value = process.env.COMPLETIONS_TRANSPORT) => {
     const raw = value == null || String(value).trim() === '' ? 'auto' : String(value).trim().toLowerCase()
-    if (!['auto', 'impersonate', 'axios'].includes(raw)) {
+    if (!['auto', 'impersonate', 'axios', 'browser'].includes(raw)) {
         throw new Error(
-            `COMPLETIONS_TRANSPORT="${value}" 无效：只接受 auto | impersonate | axios。` +
-            'auto = 找到 curl-impersonate 就用 Chrome TLS 指纹，否则 axios；impersonate = 强制；axios = 旧行为。'
+            `COMPLETIONS_TRANSPORT="${value}" 无效：只接受 auto | impersonate | axios | browser。` +
+            'auto = 找到 curl-impersonate 就用 Chrome TLS 指纹，否则 axios；impersonate = 强制；axios = 旧行为；' +
+            'browser = 从 signin-worker 的常驻页面发出（需要 V2_SESSION_MODE=browser）。'
+        )
+    }
+    return raw
+}
+
+/**
+ * Разбор CHAT_CREATION_TRANSPORT — каким путём идёт chats/new (Qwen2API-3ue.2):
+ * auto (по умолчанию: браузерные сессии + задан SIGNIN_WORKER_URL → изнутри
+ * резидентной страницы воркера, иначе axios) | browser (принудительно) |
+ * direct (axios, прежнее поведение). Опечатка так же отвергает запуск.
+ * @returns {string}
+ */
+const parseChatCreationTransport = (value = process.env.CHAT_CREATION_TRANSPORT) => {
+    const raw = value == null || String(value).trim() === '' ? 'auto' : String(value).trim().toLowerCase()
+    if (!['auto', 'browser', 'direct'].includes(raw)) {
+        throw new Error(
+            `CHAT_CREATION_TRANSPORT="${value}" недействителен: только auto | browser | direct. ` +
+            'auto = через /egress воркера, когда V2_SESSION_MODE=browser и задан SIGNIN_WORKER_URL, иначе axios; ' +
+            'browser = принудительно; direct = прежнее поведение.'
         )
     }
     return raw
@@ -105,6 +127,33 @@ const config = {
     v2SessionMode,
     signinWorkerUrl: process.env.SIGNIN_WORKER_URL || 'http://signin-worker:3100',
     signinWorkerToken: process.env.SIGNIN_WORKER_TOKEN || null,
+    // signin-worker 调用预算。worker 给完整登录排队（Qwen2API-43a）：/session 先等自己的
+    // 名额再做浏览器流程，所以这里必须大于 worker 的 SIGNIN_LOGIN_MAX_WAIT_MS + SIGNIN_TIMEOUT_MS，
+    // 否则应用放弃了 worker 仍在执行的登录。
+    signinWorkerTimeoutMs: Math.max(1000, parseInt(process.env.SIGNIN_WORKER_TIMEOUT_MS, 10) || 240000),
+    // У signinWorkerUrl есть значение по умолчанию, поэтому «воркер задан» видно
+    // только по самому env: auto-транспорт включает egress лишь там, где воркер
+    // действительно описан.
+    signinWorkerConfigured: Boolean(process.env.SIGNIN_WORKER_URL),
+    // Транспорт chats/new (src/utils/browser-egress.js): чистый Node TLS с
+    // egress-IP Baxia не пускает (23.11), проходит только изнутри браузера воркера.
+    chatCreationTransport: parseChatCreationTransport(),
+    // Дроссель восстановления v2-сессии (src/utils/v2-session-persistence.js,
+    // Qwen2API-3ue.2): отклонённая сессия не должна перезагружать страницу
+    // аккаунта на каждый неудачный запрос. 0 отключает.
+    sessionRecoveryMinIntervalMs: (() => {
+        const raw = parseInt(process.env.V2_SESSION_RECOVERY_MIN_INTERVAL_MS, 10)
+        return Number.isFinite(raw) && raw >= 0 ? raw : 30000
+    })(),
+    // Полный вход по паролю кормит скор Baxia (21.11: 9 входов за 3 минуты →
+    // блок IP), поэтому у него свой интервал на аккаунт. Каждая попытка, не
+    // давшая принятой сессии (вход провалился или его сессию снова отклонили),
+    // удваивает ожидание следующей — до каденса авто-refresh (15 мин), чтобы
+    // аккаунт, которому не помочь, не входил вечно. 0 отключает.
+    sessionReloginMinIntervalMs: (() => {
+        const raw = parseInt(process.env.V2_SESSION_RELOGIN_MIN_INTERVAL_MS, 10)
+        return Number.isFinite(raw) && raw >= 0 ? raw : 60000
+    })(),
     // CLI 账户初始化开关（OAuth 设备授权流程需要人工确认，默认关闭避免初始化失败刷屏）
     cliEnabled: process.env.ENABLE_CLI === 'true',
     // chat 请求重试配置（运行时可被 web UI 覆盖，见 src/utils/data-persistence.js#loadSettings）
@@ -192,6 +241,7 @@ const config = {
     antidetectTier1Enabled: process.env.ANTIDETECT_TIER1_ENABLED !== 'false',
     // completions 传输（src/utils/impersonate-transport.js）：纯 Node TLS 会被
     // Baxia 风控（2026-11-21 实测），curl-impersonate 的 Chrome 指纹可通过。
+    // browser — изнутри резидентной страницы воркера (Qwen2API-3ue.3, src/utils/browser-egress.js)。
     // curlImpersonateBin 显式指定二进制路径，留空则按 PATH 查找。
     completionsTransport: parseCompletionsTransport(),
     curlImpersonateBin: process.env.CURL_IMPERSONATE_BIN || null,
@@ -205,7 +255,19 @@ const config = {
 }
 
 // 暴露解析器本身以便测试空槽位的拒绝逻辑（config 对象是模块级单例，无法重复解析）。
+// A forced browser transport has no sessions to carry without browser mode:
+// refuse at startup rather than answer every chat creation with session_lost.
+// The same for completions through the worker (Qwen2API-3ue.3): the call rides
+// the account's v2 session.
+if (config.chatCreationTransport === 'browser' && v2SessionMode !== 'browser') {
+    throw new Error('CHAT_CREATION_TRANSPORT=browser requires V2_SESSION_MODE=browser')
+}
+if (config.completionsTransport === 'browser' && v2SessionMode !== 'browser') {
+    throw new Error('COMPLETIONS_TRANSPORT=browser requires V2_SESSION_MODE=browser')
+}
+
 config.parseApiKeys = parseApiKeys
 config.parseCompletionsTransport = parseCompletionsTransport
+config.parseChatCreationTransport = parseChatCreationTransport
 
 module.exports = config

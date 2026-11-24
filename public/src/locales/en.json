@@ -98,6 +98,7 @@
     "signin_upstream_error": "Qwen returned an unexpected sign-in response.",
     "signin_transport_error": "Could not reach Qwen during sign-in.",
     "signin_local_error": "The local sign-in request failed.",
+    "signin_busy": "Too many sign-ins in a row; sign-ins go one at a time with a pause. Wait a moment and try again.",
     "addFailed": "Failed to add account:",
     "addSuccess": "Account added successfully",
     "allDeleteFailed": "Failed to delete all accounts:",

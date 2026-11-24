@@ -4,45 +4,82 @@
  * Signin worker sidecar (jik.3): acquires and silently renews chat.qwen.ai
  * sessions in a real Chromium via Playwright.
  *
- *   POST /session {email, password, proxy?} -> {token, expiresAt, cookies[]}
- *   POST /renew   {email, proxy?}            -> {token, expiresAt, cookies[]}
- *   GET  /health                             -> {ok, sessions}
+ *   POST /session {email, password, proxy?, force?} -> {token, expiresAt, cookies[]}
+ *   POST /renew   {email, proxy?, force?}   -> {token, expiresAt, cookies[]}
+ *   GET  /health                             -> {ok, sessions, residentPages, headlessMode}
  *
  * One persistent context (userDataDir) per account on the SIGNIN_DATA_DIR
  * volume: auth cookies survive restarts and renewal is a silent reload.
  * Tokens live in memory only; passwords are never stored or logged. The
  * worker must stay on an internal network (optionally guarded by
  * SIGNIN_WORKER_TOKEN as a shared bearer secret).
+ *
+ * Full logins are the risky part: batched ones from one IP feed the Baxia
+ * score (Qwen2API-43a). So /session hands a live harvested session back
+ * instead of logging in again, joins concurrent sign-ins of one account into
+ * one, and every sign-in that does run takes a slot from the login pacer
+ * (lib/login-pacer.js). `force` asks for a real sign-in all the same, for a
+ * cached session that was just refused upstream. /renew takes the same flag
+ * (Qwen2API-3ue.2): the same explicit invalidation, answered with a live page
+ * reload.
+ *
+ * Since Qwen2API-3ue.1 it is also the egress service: a resident page per
+ * active account carries qwen.ai API calls as in-page fetches, so upstream
+ * sees the browser's TLS and its live cookies.
+ *
+ *   POST /egress {email, url, method, headers, body, timeoutMs, proxy?}
+ *                                          -> {status, headers, body, cookies[]}
+ *
+ * With `stream: true` (Qwen2API-3ue.3) /egress answers with a relay instead:
+ * one JSON event per line while qwen.ai's answer arrives, and the app cutting
+ * its connection cuts the fetch inside the page (relayEgress).
+ *
+ * Design: docs/browser-egress-design.md.
  */
 const http = require('node:http')
 const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
+const { WorkerError, STATUS_FOR_CODE } = require('./lib/worker-errors')
+const { normalizeEgress } = require('./lib/egress-fetch')
+const { createResidents } = require('./lib/resident-pages')
+const { createLoginPacer } = require('./lib/login-pacer')
+const { parseHeadlessMode } = require('./lib/browser-identity')
 
 const envInt = (name, fallback) => {
     const raw = parseInt(process.env[name], 10)
     return Number.isFinite(raw) && raw > 0 ? raw : fallback
 }
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
-// Error codes -> HTTP statuses; unknown browser failures land on 500.
-const STATUS_FOR_CODE = {
-    invalid_request: 400,
-    unauthorized: 401,
-    invalid_credentials: 401,
-    no_profile: 404,
-    session_expired: 422,
-    captcha_stuck: 502,
-    form_not_found: 502,
-    signin_timeout: 504,
-    browser_error: 500
-}
+const REQUEST_BODY_LIMIT = 131072
 
-class WorkerError extends Error {
-    constructor(code, message) {
-        super(message)
-        this.code = code
-    }
+/**
+ * Write one event of a relay, and say when the app has taken it: at once, or
+ * once the socket drained when the app is behind. A socket that goes is as
+ * good as drained — nothing will ever drain it, and the relay is over anyway —
+ * which is what keeps a handler from waiting on an app that left.
+ * @param {http.ServerResponse} res
+ * @param {() => boolean} gone - The app left: say it is written, write nothing
+ * @returns {(event: object) => Promise<void>|undefined}
+ */
+const relayWriter = (res, gone) => event => {
+    // Gone: say it is written. The page must not wait on a socket nobody will drain.
+    if (gone()) return
+    if (res.write(`${JSON.stringify(event)}\n`)) return
+    // The app is behind: the page (and behind it qwen.ai) waits until it catches up.
+    return new Promise(resolve => {
+        const taken = () => {
+            res.off('drain', taken)
+            res.off('close', taken)
+            resolve()
+        }
+        res.once('drain', taken)
+        res.once('close', taken)
+    })
 }
+// Egress relays request bodies built by the app (agent contexts, images).
+const EGRESS_BODY_LIMIT = 32 * 1024 * 1024
 
 function createServer(overrides = {}) {
     const signer = overrides.signer || require('./lib/browser-signin')
@@ -50,21 +87,56 @@ function createServer(overrides = {}) {
         port: overrides.port ?? envInt('PORT', 3100),
         dataDir: overrides.dataDir || process.env.SIGNIN_DATA_DIR || path.join(__dirname, 'profiles'),
         headless: overrides.headless ?? process.env.SIGNIN_HEADLESS !== 'false',
+        // Which headless browser that is (Qwen2API-3ue.4): the shell, or the
+        // full Chromium presenting as one with a window. Nothing when headed.
+        // Strict: createServer throws on a value it does not know.
+        headlessMode: overrides.headlessMode ?? parseHeadlessMode(process.env.SIGNIN_HEADLESS_MODE),
         chatOrigin: overrides.chatOrigin || process.env.SIGNIN_CHAT_ORIGIN || 'https://chat.qwen.ai',
         timeoutMs: overrides.timeoutMs ?? envInt('SIGNIN_TIMEOUT_MS', 120000),
         renewFraction: overrides.renewFraction ?? 0.6,
         minRenewDelayMs: overrides.minRenewDelayMs ?? envInt('SIGNIN_MIN_RENEW_DELAY_MS', 30000),
         minCacheSeconds: overrides.minCacheSeconds ?? 120,
+        // Full logins start at least this far apart, plus up to the same
+        // again as jitter; 1 turns pacing off. A /session that would wait
+        // longer than maxLoginWaitMs for its slot is refused (signin_paced).
+        minLoginIntervalMs: overrides.minLoginIntervalMs ?? envInt('SIGNIN_LOGIN_MIN_INTERVAL_MS', 30000),
+        maxLoginWaitMs: overrides.maxLoginWaitMs ?? envInt('SIGNIN_LOGIN_MAX_WAIT_MS', 120000),
         // Shared bearer secret; empty = no auth (internal network only).
-        token: overrides.token !== undefined ? overrides.token : (process.env.SIGNIN_WORKER_TOKEN || '')
+        token: overrides.token !== undefined ? overrides.token : (process.env.SIGNIN_WORKER_TOKEN || ''),
+        // Resident pages (Qwen2API-3ue.1). ~200-300 MB of Chromium each.
+        maxPages: overrides.maxPages ?? envInt('MAX_RESIDENT_PAGES', 16),
+        keepAliveMs: overrides.keepAliveMs ?? envInt('RESIDENT_KEEPALIVE_MS', 300000),
+        // An /egress timeoutMs is clamped to this; unset, it is config.timeoutMs.
+        egressMaxTimeoutMs: overrides.egressMaxTimeoutMs ?? envInt('SIGNIN_EGRESS_MAX_TIMEOUT_MS', 600000),
+        egressMaxBytes: overrides.egressMaxBytes ?? 8 * 1024 * 1024,
+        // A stream is relayed, not buffered: the whole-answer cap is not its.
+        // Off unless set.
+        egressMaxStreamBytes: overrides.egressMaxStreamBytes ?? envInt('SIGNIN_EGRESS_MAX_STREAM_BYTES', 0),
+        // Grace periods, all bounded so a wedged browser cannot stall a request.
+        drainMs: overrides.drainMs ?? 5000,
+        backstopMs: overrides.backstopMs ?? 5000,
+        closeMs: overrides.closeMs ?? 5000,
+        shutdownMs: overrides.shutdownMs ?? 8000
     }
 
     fs.mkdirSync(config.dataDir, { recursive: true })
 
     // email -> {token, exp, cookies, proxy, timer}; tokens stay in RAM only.
     const sessions = new Map()
+    // email -> the live renewal in flight; every caller of one moment shares
+    // one page reload.
+    const renewing = new Map()
     // Chromium locks a profile directory: serialize every launch per account.
     const locks = new Map()
+    // email -> the full sign-in now running for it. A /session that lands on
+    // an account whose sign-in is already in flight takes that result.
+    const logins = new Map()
+    // What names a stream while it runs: the app going away aborts "its" stream.
+    let streamSequence = 0
+    const pacer = createLoginPacer({
+        minIntervalMs: config.minLoginIntervalMs,
+        maxWaitMs: config.maxLoginWaitMs
+    })
 
     const log = (event, extra) => console.log(`${new Date().toISOString()} ${event}${extra ? ' ' + extra : ''}`)
     const profileDir = email => path.join(config.dataDir,
@@ -81,7 +153,9 @@ function createServer(overrides = {}) {
     }
 
     async function withBrowser(email, proxy, operation) {
-        const context = await signer.openContext({ dataDir: profileDir(email), proxy, headless: config.headless })
+        const context = await signer.openContext({
+            dataDir: profileDir(email), proxy, headless: config.headless, headlessMode: config.headlessMode
+        })
         try {
             return await operation(context)
         } finally {
@@ -118,16 +192,50 @@ function createServer(overrides = {}) {
         return entry
     }
 
+    // Drop the cached session together with its silent-renew timer.
+    const forget = email => {
+        clearTimeout(sessions.get(email)?.timer)
+        sessions.delete(email)
+    }
+
+    // The live page is the source of truth for the jar: what the browser holds
+    // now replaces the cached cookies, so a cached /renew never hands out a
+    // jar the browser has already rotated away from.
+    const syncCookies = (email, cookies) => {
+        const cached = sessions.get(email)
+        if (cached && Array.isArray(cookies)) cached.cookies = cookies
+    }
+
+    // email -> resident page on chat.qwen.ai; fetches run inside it.
+    const residents = createResidents({
+        signer,
+        profileDir,
+        chatOrigin: config.chatOrigin,
+        headless: config.headless,
+        headlessMode: config.headlessMode,
+        openTimeoutMs: config.timeoutMs,
+        maxPages: config.maxPages,
+        keepAliveMs: config.keepAliveMs,
+        maxBytes: config.egressMaxBytes,
+        maxStreamBytes: config.egressMaxStreamBytes,
+        drainMs: config.drainMs,
+        backstopMs: config.backstopMs,
+        closeMs: config.closeMs,
+        log,
+        onHarvest: remember,
+        onCookies: syncCookies
+    })
+
     async function silentRenew(email) {
         try {
-            const harvested = await liveRenew(email, null)
-            remember(email, harvested, null)
+            // Shared like any other renewal: a forced /renew that lands while
+            // the timer's reload is running joins it, not a second reload.
+            await liveRenewShared(email, null, false, true)
             log('silent-renew', `ok (${sessions.size} sessions)`)
-            return harvested
+            return null
         } catch (error) {
             // Drop the cache; the app re-logins with the password via /session.
-            clearTimeout(sessions.get(email)?.timer)
-            sessions.delete(email)
+            forget(email)
             log('silent-renew', `failed (${error.code || 'error'})`)
             return null
         }
@@ -144,41 +252,235 @@ function createServer(overrides = {}) {
     }
 
     async function withBrowserContext(email, proxy, operation) {
-        return serialized(email, () => withBrowser(email, proxy, operation))
+        return serialized(email, async () => {
+            // A resident page owns the profile directory (Chromium locks it):
+            // sign-in and renewal run on that page instead of a second launch.
+            // A null proxy means "whatever the account already uses".
+            const resident = residents.get(email)
+            const wanted = proxy ?? resident?.proxy ?? null
+            if (resident && resident.proxy === wanted) return residents.exclusive(resident, operation)
+            if (resident) await residents.close(resident, 'proxy_changed')
+            // The page may still be closing (crash, eviction): its browser
+            // holds the profile lock until it is gone.
+            await residents.whenClosed(email)
+            return withBrowser(email, proxy, operation)
+        })
+    }
+
+    const parseEmail = body => {
+        if (typeof body.email !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(body.email) || body.email.length > 254) {
+            throw new WorkerError('invalid_request', 'A valid email is required.')
+        }
+        return body.email
+    }
+
+    const parseProxy = body => {
+        const { proxy } = body
+        if (proxy !== undefined && proxy !== null && (typeof proxy !== 'string' || proxy.length > 2048)) {
+            throw new WorkerError('invalid_request', 'Invalid proxy URL.')
+        }
+        return proxy || null
+    }
+
+    // The session is live for as long as /renew would answer from the cache.
+    const fresh = email => {
+        const entry = sessions.get(email)
+        return entry && entry.exp - now() > config.minCacheSeconds ? entry : undefined
+    }
+
+    /** One real sign-in: in line for a slot first, the browser flow under the account lock. */
+    async function fullLogin(email, password, proxy, force) {
+        const slot = pacer.admit()
+        if (slot.waitMs > 0) {
+            log('session', `queued (${Math.ceil(slot.waitMs)}ms)`)
+            await sleep(slot.waitMs)
+        }
+        const harvested = await withBrowserContext(email, proxy, async context => {
+            // The wait above is long enough for a lazy page open or a silent
+            // renewal to have produced the session asked for here.
+            if (!force && fresh(email)) return null
+            await pacer.enter(slot)
+            return signer.signin(context, { email, password, chatOrigin: config.chatOrigin, timeoutMs: config.timeoutMs })
+        })
+        if (!harvested) {
+            log('session', 'cached')
+            return shape(sessions.get(email))
+        }
+        const entry = remember(email, harvested, proxy)
+        log('session', `acquired (${sessions.size} sessions)`)
+        return shape(entry)
+    }
+
+    /**
+     * `force` on /session and /renew is the explicit invalidation: the
+     * caller's session was refused upstream, so the answer has to be live
+     * even while the cache looks fresh.
+     */
+    const parseForce = body => {
+        if (body.force !== undefined && typeof body.force !== 'boolean') {
+            throw new WorkerError('invalid_request', 'force must be a boolean.')
+        }
+        return body.force === true
     }
 
     async function handleSession(body) {
-        const { email, password, proxy } = body
-        if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(email) || email.length > 254) {
-            throw new WorkerError('invalid_request', 'A valid email is required.')
-        }
+        const email = parseEmail(body)
+        const { password } = body
         if (typeof password !== 'string' || !password || password.length > 1024) {
             throw new WorkerError('invalid_request', 'A password is required.')
         }
-        if (proxy !== undefined && proxy !== null && (typeof proxy !== 'string' || proxy.length > 2048)) {
-            throw new WorkerError('invalid_request', 'Invalid proxy URL.')
+        const force = parseForce(body)
+        const proxy = parseProxy(body)
+        // A live session answers for the password. One "add account" is one
+        // login, however many /session calls the app makes of it.
+        const live = force ? undefined : fresh(email)
+        if (live) {
+            log('session', 'cached')
+            return shape(live)
         }
-        const harvested = await withBrowserContext(email, proxy || null,
-            context => signer.signin(context, { email, password, chatOrigin: config.chatOrigin, timeoutMs: config.timeoutMs }))
-        remember(email, harvested, proxy || null)
-        log('session', `acquired (${sessions.size} sessions)`)
-        return shape(sessions.get(email))
+        const running = logins.get(email)
+        if (running) {
+            log('session', 'joined')
+            return running
+        }
+        const login = fullLogin(email, password, proxy, force)
+        const tracked = login.finally(() => { if (logins.get(email) === tracked) logins.delete(email) })
+        logins.set(email, tracked)
+        return tracked
     }
 
+    /**
+     * One live renewal per account: callers that arrive while one is running
+     * share its result instead of queueing a reload of their own.
+     * @param {boolean} [forced] - The caller that starts it invalidated the session
+     * @param {boolean} [quiet] - The caller reports the outcome in its own words
+     */
+    function liveRenewShared(email, proxy, forced = false, quiet = false) {
+        if (!renewing.has(email)) {
+            const task = liveRenew(email, proxy).then(harvested => {
+                remember(email, harvested, proxy)
+                // One line per reload: the callers that joined it do not log
+                // their own, or a burst would read as a burst of reloads.
+                if (!quiet) log('renew', `ok${forced ? ' (forced)' : ''} (${sessions.size} sessions)`)
+                return shape(sessions.get(email))
+            }).finally(() => { renewing.delete(email) })
+            renewing.set(email, task)
+        }
+        return renewing.get(email)
+    }
+
+    /**
+     * `force` is the explicit invalidation (Qwen2API-3ue.2): the caller's
+     * session was refused upstream, so the answer has to be a live reload
+     * even while the cached token still has TTL left. Answering from the
+     * cache here is what made "unauthorized → renew" replay the refused jar
+     * for as long as that lasted. The refused entry is dropped first, so a
+     * reload that fails leaves nothing behind to hand it out again.
+     */
     async function handleRenew(body) {
-        const { email, proxy } = body
-        if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(email) || email.length > 254) {
-            throw new WorkerError('invalid_request', 'A valid email is required.')
+        const email = parseEmail(body)
+        const proxy = parseProxy(body)
+        const force = parseForce(body)
+        if (force) forget(email)
+        else if (fresh(email)) return shape(fresh(email))
+        return liveRenewShared(email, proxy, force)
+    }
+
+    async function handleEgress(req, res, body) {
+        const email = parseEmail(body)
+        const proxy = parseProxy(body)
+        const request = normalizeEgress(body, {
+            chatOrigin: config.chatOrigin,
+            defaultTimeoutMs: config.timeoutMs,
+            maxTimeoutMs: config.egressMaxTimeoutMs
+        })
+        // The lock covers finding or opening the page only; the fetch itself
+        // runs free, so calls on one page stay concurrent.
+        const entry = await serialized(email, () => residents.acquire(email,
+            proxy ?? residents.get(email)?.proxy ?? sessions.get(email)?.proxy ?? null))
+        if (request.stream) return relayEgress(req, res, entry, request)
+        const result = await residents.fetch(entry, request)
+        log('egress', `${new URL(request.url).pathname} -> ${result.status} (${residents.stats().residentPages}/${config.maxPages} pages)`)
+        return result
+    }
+
+    /**
+     * The streaming /egress: what the page reports, written out as it comes
+     * in. One JSON event per line:
+     *
+     *   {"type":"head","status":200,"url":"…","redirected":false,"headers":{…},"cookies":[…]}
+     *   {"type":"chunk","data":"<base64 of the bytes qwen.ai just delivered>"}
+     *   {"type":"end","cookies":[…]}
+     *   {"type":"error","code":"egress_timeout","message":"…"}
+     *
+     * Nothing is written until qwen.ai answered: whatever goes wrong before
+     * that is an ordinary error status, with the codes /egress always had.
+     * After it the status is spent, so a failure travels as the last event.
+     *
+     * The app cancelling is it closing the connection — the body of its own
+     * request is long gone by then. That ends the stream here AND the fetch
+     * in the page (resident-pages.js#abort): a fetch already running there is
+     * beyond a Node-side timer, let alone a socket this process no longer holds.
+     */
+    async function relayEgress(req, res, entry, request) {
+        const pathname = new URL(request.url).pathname
+        const id = ++streamSequence
+        // The app may have gone while its page was opening, before there was
+        // anything to listen with: the socket says so all the same.
+        let gone = req.socket.destroyed
+        // The socket, not the response: under Bun a server-side response
+        // never emits 'close' when its client goes.
+        const onGone = () => {
+            gone = true
+            residents.abort(id)
         }
-        if (proxy !== undefined && proxy !== null && (typeof proxy !== 'string' || proxy.length > 2048)) {
-            throw new WorkerError('invalid_request', 'Invalid proxy URL.')
+        req.socket.on('close', onGone)
+        // The app may be gone by the time a frame is written. Not this handler's error.
+        res.on('error', () => {})
+        const started = Date.now()
+        const frame = relayWriter(res, () => gone)
+        try {
+            // The app gave up while its page was opening: nothing to run.
+            if (gone) return residents.release(entry)
+            const result = await residents.stream(entry, request, {
+                id,
+                onEvent: async event => {
+                    // The app left while the page was busy (reading its jar,
+                    // say): nothing is written — and nothing is logged as if it were.
+                    if (gone) return
+                    if (event.type === 'head') {
+                        res.writeHead(200, {
+                            'content-type': 'application/x-ndjson',
+                            'cache-control': 'no-cache',
+                            'x-accel-buffering': 'no'
+                        })
+                        res.flushHeaders()
+                        log('egress-stream',
+                            `${pathname} -> ${event.status} (${Date.now() - started} ms, ` +
+                            `${residents.stats().residentPages}/${config.maxPages} pages)`)
+                    }
+                    await frame(event)
+                }
+            })
+            if (result.aborted) {
+                log('egress-stream', `${pathname} cancelled (${Date.now() - started} ms)`)
+                return
+            }
+            await frame({ type: 'end', cookies: result.cookies })
+            res.end()
+            log('egress-stream', `${pathname} end (${Date.now() - started} ms)`)
+        } catch (error) {
+            const code = error.code && STATUS_FOR_CODE[error.code] ? error.code : 'browser_error'
+            if (!res.headersSent) {
+                if (!gone) throw error
+                return
+            }
+            log('egress-stream', `${pathname} ${code} (${Date.now() - started} ms)`)
+            await frame({ type: 'error', code, message: error.message || 'Signin worker failure.' })
+            res.end()
+        } finally {
+            req.socket.off('close', onGone)
         }
-        const cached = sessions.get(email)
-        if (cached && cached.exp - now() > config.minCacheSeconds) return shape(cached)
-        const harvested = await liveRenew(email, proxy || null)
-        remember(email, harvested, proxy || null)
-        log('renew', `ok (${sessions.size} sessions)`)
-        return shape(sessions.get(email))
     }
 
     function authorized(req) {
@@ -194,20 +496,25 @@ function createServer(overrides = {}) {
         res.end(body)
     }
 
-    async function readJson(req) {
+    async function readJson(req, limit) {
         const chunks = []
         let size = 0
         for await (const chunk of req) {
             size += chunk.length
-            if (size > 131072) throw new WorkerError('invalid_request', 'Request body too large.')
+            if (size > limit) throw new WorkerError('invalid_request', 'Request body too large.')
             chunks.push(chunk)
         }
         if (!chunks.length) return {}
+        let parsed
         try {
-            return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+            parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'))
         } catch {
             throw new WorkerError('invalid_request', 'Request body must be JSON.')
         }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new WorkerError('invalid_request', 'Request body must be a JSON object.')
+        }
+        return parsed
     }
 
     const server = http.createServer((req, res) => {
@@ -216,7 +523,10 @@ function createServer(overrides = {}) {
             .catch(error => {
                 const code = error.code && STATUS_FOR_CODE[error.code] ? error.code : 'browser_error'
                 const status = STATUS_FOR_CODE[code] || 500
-                send(res, status, { code, message: error.message || 'Signin worker failure.' })
+                send(res, status, {
+                    code, message: error.message || 'Signin worker failure.',
+                    ...(Number.isFinite(error.retryAfterMs) ? { retryAfterMs: Math.ceil(error.retryAfterMs) } : {})
+                })
             })
             .finally(() => {
                 if (req.url !== '/health') {
@@ -227,25 +537,67 @@ function createServer(overrides = {}) {
 
     async function handle(req, res) {
         if (req.method === 'GET' && req.url === '/health') {
-            return send(res, 200, { ok: true, sessions: sessions.size })
+            // The headless mode is here to be checked after a flip, before the
+            // first request that depends on it.
+            return send(res, 200, {
+                ok: true, sessions: sessions.size, ...residents.stats(),
+                headless: config.headless, headlessMode: config.headless ? config.headlessMode : null
+            })
         }
         if ((req.method === 'POST' && req.url === '/session') || (req.method === 'POST' && req.url === '/renew')) {
             if (!authorized(req)) throw new WorkerError('unauthorized', 'Invalid worker token.')
-            const body = await readJson(req)
+            const body = await readJson(req, REQUEST_BODY_LIMIT)
             return send(res, 200, req.url === '/session' ? await handleSession(body) : await handleRenew(body))
+        }
+        if (req.method === 'POST' && req.url === '/egress') {
+            if (!authorized(req)) throw new WorkerError('unauthorized', 'Invalid worker token.')
+            const body = await readJson(req, EGRESS_BODY_LIMIT)
+            // A relay answers for itself, as it goes; there is nothing left to send after it.
+            if (body.stream === true) return handleEgress(req, res, body)
+            return send(res, 200, await handleEgress(req, res, body))
         }
         throw new WorkerError('invalid_request', 'Unknown route.')
     }
 
     server.workerConfig = config
+    server.workerShutdown = () => residents.shutdown(config.shutdownMs)
     return server
 }
 
-module.exports = { createServer, WorkerError }
+/**
+ * Handler for a stop signal (container stop).
+ *
+ * Node runs as PID 1 in the container, where a signal without a handler is
+ * ignored altogether — and the SIGKILL 10 s later would skip the clean
+ * browser close that flushes every profile (auth cookies) to disk.
+ *
+ * @param {http.Server} server created by createServer()
+ * @param {(code: number) => void} [exit]
+ * @returns {(signal: string) => void}
+ */
+function shutdownHandler(server, exit = code => process.exit(code)) {
+    let stopping = false
+    return signal => {
+        // A second signal means "now": do not wait for the first to finish.
+        if (stopping) return exit(0)
+        stopping = true
+        console.log(`${new Date().toISOString()} stopping on ${signal}`)
+        server.close()
+        // Either way the process goes: a shutdown that failed has nothing left to say.
+        server.workerShutdown().then(() => exit(0), () => exit(0))
+    }
+}
+
+module.exports = { createServer, WorkerError, shutdownHandler, relayWriter }
 
 if (require.main === module) {
     const server = createServer()
     server.listen(server.workerConfig.port, () => {
-        console.log(`${new Date().toISOString()} signin-worker listening on :${server.workerConfig.port}`)
+        const { headless, headlessMode } = server.workerConfig
+        console.log(`${new Date().toISOString()} signin-worker listening on :${server.workerConfig.port}` +
+            ` (browser: ${headless ? `headless ${headlessMode}` : 'headed'})`)
     })
+    const stop = shutdownHandler(server)
+    process.on('SIGTERM', () => stop('SIGTERM'))
+    process.on('SIGINT', () => stop('SIGINT'))
 }

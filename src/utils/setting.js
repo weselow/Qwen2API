@@ -23,8 +23,9 @@ const saveAccounts = async (email, password, token, expires, proxy = null) => {
       return false
     }
 
-    // 使用账户管理器的统一方法
-    const success = await accountManager.addAccount(email, password, proxy)
+    // 路由刚刚已经登录拿到 token，这里只保存它。以前这里会再登录一次：一次「添加账号」
+    // 就变成 qwen.ai 上的两次完整登录（Qwen2API-43a）。
+    const success = await accountManager.addAccountWithToken(email, password, token, expires, proxy)
 
     if (success) {
       logger.success(`账户 ${email} 保存成功`, 'SETTING')

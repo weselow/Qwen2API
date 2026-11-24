@@ -23,7 +23,8 @@ answer against real qwen.ai; instant rollback to the current v1 path via config.
 
 - V2_SESSION_MODE=off|lab|browser   (off = current v1 path; lab = existing .test behavior;
   browser = hybrid described here). One flag switches TokenManager.login/refresh and
-  the session source; COMPLETIONS_TRANSPORT=auto|impersonate|axios (auto = use
+  the session source; COMPLETIONS_TRANSPORT=auto|impersonate|axios|browser (browser = from the
+  worker's resident page, streamed; Qwen2API-3ue.3, docs/browser-egress-design.md; auto = use
   impersonate when the binary is present, else axios + warn once).
 - SIGNIN_WORKER_URL (default http://signin-worker:3100).
 

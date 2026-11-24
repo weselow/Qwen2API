@@ -12,6 +12,10 @@
  * Credentials never reach logs, screenshots or error messages.
  */
 
+const {
+    parseHeadlessMode, stockUserAgentOf, presentedUserAgent, frameWindow
+} = require('./browser-identity')
+
 const jwtExp = token => {
     const part = String(token).split('.')[1]
     if (!part) return null
@@ -52,12 +56,32 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 /**
  * Launch a persistent Chromium context. One userDataDir per account; Chromium
  * locks the profile, so callers must serialize access per directory.
+ *
+ * `headlessMode` says which headless browser (lib/browser-identity.js): the
+ * shell, as before, or the full Chromium presenting as one with a window. It
+ * means nothing when `headless` is false. `launcher` is the Playwright chromium
+ * object, for the tests; the real one is required on first use.
  */
-async function openContext({ dataDir, proxy, headless = true, timeoutMs = 30000 }) {
-    const { chromium } = require('playwright')
-    return chromium.launchPersistentContext(dataDir, {
+async function openContext({
+    dataDir, proxy, headless = true, timeoutMs = 30000, headlessMode = 'shell', launcher
+}) {
+    const asChrome = headless && parseHeadlessMode(headlessMode) === 'chrome'
+    const { chromium } = launcher ? { chromium: launcher } : require('playwright')
+    const viewport = { width: 1280, height: 800 }
+    let presented
+    if (asChrome) {
+        try {
+            presented = presentedUserAgent(await stockUserAgentOf(chromium, timeoutMs))
+        } catch (error) {
+            throw new BrowserSigninError('browser_error', `Could not make the browser present as Chrome: ${error.message}`)
+        }
+    }
+    const context = await chromium.launchPersistentContext(dataDir, {
         headless,
-        viewport: { width: 1280, height: 800 },
+        // The full Chromium, not the headless shell it would otherwise start,
+        // saying "Chrome" where it says "HeadlessChrome" — in every frame.
+        ...(asChrome ? { channel: 'chromium', userAgent: presented } : {}),
+        viewport,
         locale: 'en-US',
         // Container runs without CAP_SYS_ADMIN; a real display keeps the sandbox off anyway.
         chromiumSandbox: false,
@@ -66,6 +90,8 @@ async function openContext({ dataDir, proxy, headless = true, timeoutMs = 30000 
         proxy: parseProxy(proxy),
         timeout: timeoutMs
     })
+    if (asChrome) await frameWindow(context, viewport)
+    return context
 }
 
 /** Wait until the FE settles on a stable token (it may rotate it shortly

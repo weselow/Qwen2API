@@ -28,12 +28,23 @@ services:
       - CACHE_MODE=${CACHE_MODE:-file}
       # v2 session pipeline: browser sessions come from the sidecar,
       # completions ride curl-impersonate (auto = binary from the image).
+      # browser = completions streamed from the worker's resident page
+      # (Qwen2API-3ue.3): switched on explicitly, never by auto.
       # Rollback to the v1 path: set V2_SESSION_MODE=off and
       # COMPLETIONS_TRANSPORT=axios, redeploy; nothing else changes.
       - V2_SESSION_MODE=${V2_SESSION_MODE:-browser}
       - COMPLETIONS_TRANSPORT=${COMPLETIONS_TRANSPORT:-auto}
+      # chats/new through the worker's resident page (docs/browser-egress-
+      # design.md). Ships OFF: browser egress is switched on explicitly
+      # (CHAT_CREATION_TRANSPORT=browser) and rolled back the same way.
+      # Session recovery throttles; 0 disables either.
+      - CHAT_CREATION_TRANSPORT=${CHAT_CREATION_TRANSPORT:-direct}
+      - V2_SESSION_RECOVERY_MIN_INTERVAL_MS=${V2_SESSION_RECOVERY_MIN_INTERVAL_MS:-30000}
+      - V2_SESSION_RELOGIN_MIN_INTERVAL_MS=${V2_SESSION_RELOGIN_MIN_INTERVAL_MS:-60000}
       - SIGNIN_WORKER_URL=http://signin-worker:3100
       - SIGNIN_WORKER_TOKEN=${SIGNIN_WORKER_TOKEN:-}
+      # Must stay above the worker's SIGNIN_LOGIN_MAX_WAIT_MS + SIGNIN_TIMEOUT_MS.
+      - SIGNIN_WORKER_TIMEOUT_MS=${SIGNIN_WORKER_TIMEOUT_MS:-240000}
     dns:
       - ${DNS_SIDECAR_IP:?Set an unused IP inside DNS_SUBNET}
     depends_on:
@@ -52,6 +63,22 @@ services:
     environment:
       - SIGNIN_WORKER_TOKEN=${SIGNIN_WORKER_TOKEN:-}
       - SIGNIN_HEADLESS=${SIGNIN_HEADLESS:-true}
+      # Which headless browser: the shell, as before, or the full Chromium
+      # presenting as one with a window (docs/browser-egress-design.md,
+      # "HeadlessChrome"). The latter takes about twice the memory.
+      - SIGNIN_HEADLESS_MODE=${SIGNIN_HEADLESS_MODE:-shell}
+      # Resident pages for browser egress (docs/browser-egress-design.md).
+      # ~200-300 MB of Chromium each: keep the cap above the number of
+      # accounts that generate at the same time.
+      - MAX_RESIDENT_PAGES=${MAX_RESIDENT_PAGES:-16}
+      - RESIDENT_KEEPALIVE_MS=${RESIDENT_KEEPALIVE_MS:-300000}
+      - SIGNIN_EGRESS_MAX_TIMEOUT_MS=${SIGNIN_EGRESS_MAX_TIMEOUT_MS:-600000}
+      # 0 = no cap: a streamed answer is relayed, not buffered.
+      - SIGNIN_EGRESS_MAX_STREAM_BYTES=${SIGNIN_EGRESS_MAX_STREAM_BYTES:-0}
+      # Full logins go one at a time, this far apart (+ up to the same again
+      # as jitter): batched sign-ins from one IP feed the Baxia score.
+      - SIGNIN_LOGIN_MIN_INTERVAL_MS=${SIGNIN_LOGIN_MIN_INTERVAL_MS:-30000}
+      - SIGNIN_LOGIN_MAX_WAIT_MS=${SIGNIN_LOGIN_MAX_WAIT_MS:-120000}
     # One Chromium profile per account; keep them on a volume so auth.qwen.ai
     # sessions survive restarts and renewal stays a silent reload.
     volumes:

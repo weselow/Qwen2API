@@ -389,7 +389,9 @@ const impersonatePostJson = (url, payload, { headers = {}, timeoutMs = 10 * 60 *
  * the binary and fails loudly when it is missing (silently degrading would
  * bring the Baxia punish back and hide the cause); 'auto' (default) uses the
  * impersonating transport when the binary is present and falls back to axios
- * with a single warning per process.
+ * with a single warning per process; 'browser' (Qwen2API-3ue.3) sends the
+ * call from inside the account's resident page in the signin worker, which
+ * needs the account and its session's token (browser-egress.js).
  *
  * @param {string} url
  * @param {object} payload
@@ -397,10 +399,20 @@ const impersonatePostJson = (url, payload, { headers = {}, timeoutMs = 10 * 60 *
  * @param {object} [options]
  * @param {string|null} [options.proxyUrl] - Proxy for the impersonate path; the
  *   axios path takes it from requestConfig agents instead.
+ * @param {Object} [options.account] - For 'browser': whose page the call leaves from
+ * @param {string} [options.token] - For 'browser': the session's token
  * @returns {Promise<object>} axios-shaped response with data as a Readable
  */
-const postCompletions = async (url, payload, requestConfig, { proxyUrl = null } = {}) => {
+const postCompletions = async (url, payload, requestConfig, { proxyUrl = null, account = null, token = null } = {}) => {
     const mode = config.completionsTransport
+    if (mode === 'browser') {
+        // Taken here, not at the top: the egress carries the session store in,
+        // which the other transports have no use for.
+        const browserEgress = require('./browser-egress.js')
+        return browserEgress.postCompletions({
+            url, body: JSON.stringify(payload ?? {}), account, token, timeoutMs: requestConfig?.timeout
+        })
+    }
     if (mode === 'axios') return axios.post(url, payload, requestConfig)
     const binary = resolveImpersonateBinary()
     if (!binary) {
