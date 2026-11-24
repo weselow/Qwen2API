@@ -101,7 +101,11 @@ const STREAM_ABORTS = '__qwenEgressAborts'
  * `timeoutMs` is a budget of SILENCE here, not for the whole call: a stream
  * may legitimately run for minutes, and every chunk upstream delivers re-arms
  * the timer. A stream that stops producing is cut at timeoutMs; one that
- * keeps producing is not cut at all.
+ * keeps producing is not cut at all. The app's turn is not silence: while it
+ * has not taken a report nothing is read from qwen.ai, and the timer waits.
+ *
+ * `maxBytes` caps the body. 0 is no cap — a stream's default: nothing is
+ * buffered for a stream, so it needs none.
  */
 async function pageFetchStream({ url, init, timeoutMs, maxBytes, channel, registry, id, reasons }) {
     const controller = new AbortController()
@@ -134,21 +138,26 @@ async function pageFetchStream({ url, init, timeoutMs, maxBytes, channel, regist
         const response = await fetch(url, { ...init, credentials: 'include', signal: controller.signal })
         const headers = {}
         response.headers.forEach((value, name) => { headers[name] = value })
-        arm()
-        await report({ type: 'head', status: response.status, url: response.url, redirected: response.redirected, headers })
+        // The app's turn: while it has not taken a report, qwen.ai is not being
+        // read, and waiting for the app is not qwen.ai falling silent.
+        const tell = async event => {
+            clearTimeout(timer)
+            await report(event)
+            arm()
+        }
+        await tell({ type: 'head', status: response.status, url: response.url, redirected: response.redirected, headers })
         const reader = response.body ? response.body.getReader() : null
         let size = 0
         if (reader) {
             for (;;) {
                 const { done, value } = await reader.read()
-                arm()
                 if (done) break
                 size += value.byteLength
-                if (size > maxBytes) {
+                if (maxBytes && size > maxBytes) {
                     await reader.cancel().catch(() => {})
                     return { ok: false, error: 'too_large', status: response.status }
                 }
-                await report({ type: 'chunk', data: toBase64(value) })
+                await tell({ type: 'chunk', data: toBase64(value) })
             }
         }
         return { ok: true }

@@ -23,9 +23,11 @@ const store = require('../src/utils/v2-session-store')
 const sessionPersistence = require('../src/utils/v2-session-persistence')
 const accountManager = require('../src/utils/account')
 const browserEgress = require('../src/utils/browser-egress')
+const transport = require('../src/utils/impersonate-transport')
 const { generateChatID, sendChatRequest } = require('../src/utils/request')
 const { ChatCreationError, isWafChallengeError } = require('../src/utils/upstream-error')
 const { consumeSSEStream } = require('../src/utils/sse')
+const { text } = require('node:stream/consumers')
 const { logger } = require('../src/utils/logger')
 
 const EMAIL = 'egress@example.invalid'
@@ -1144,6 +1146,8 @@ function relay() {
         chunk: data => send({ type: 'chunk', data: Buffer.from(data).toString('base64') }),
         end: (cookies = []) => finish({ type: 'end', cookies }),
         fail: code => finish({ type: 'error', code, message: `In-page fetch failed (${code}).` }),
+        // An event exactly as the test writes it, whatever it is.
+        raw: send,
         // Resolves once the app closed its side of the relay, with whether the
         // answer had ended by then. It is the server seeing the connection
         // go — which a stand-in hosted by Bun does not report (Bun 1.3.11): the
@@ -1254,7 +1258,7 @@ test('the transport answers in the shape axios and the impersonating transport u
     scripted(stream)
 
     const response = await browserEgress.postCompletions({
-        account, url: `${COMPLETIONS}chat-1`, body: '{"stream":true}', token: account.token
+        account, url: `${COMPLETIONS}chat-1`, body: '{"stream":true}', token: account.token, timeoutMs: 600000
     })
     assert.equal(response.status, 200)
     assert.equal(response.statusText, 'OK')
@@ -1369,7 +1373,10 @@ test('one recovery per interval: a completions refusal inside the window fails a
     const second = await charging(() => sendChatRequest(BODY, { currentAccount: account }))
     assert.equal(second.value.status, false)
     assert.deepEqual(second.value.failure, UNCLASSIFIED_502)
+    // (Once anything the refusal scheduled behind the request has had its say.)
+    await until(() => sessionPersistence.renewals.size === 0)
     assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress', '/egress', '/egress'])
+    assert.equal(worker.count('/session'), 0, 'and not a password either')
     assert.equal(current(), renewed)
     assert.deepEqual(second.charged, [['recordAccountError', EMAIL, 401]])
 })
@@ -1396,6 +1403,126 @@ test('a completions call refused on a token a sibling already replaced retries o
     assert.equal(result.currentToken, sibling.token)
 })
 
+test('with no session left in the store the call rides the token the caller holds', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    // A sibling's direct call may drop the session after this request was
+    // checked against it (chats/new direct, completions through the worker).
+    store.clearSessions()
+    const stream = relay()
+    stream.head()
+    stream.chunk(frame({ content: 'по' }))
+    stream.end()
+    scripted(stream)
+
+    const response = await transport.postCompletions(`${COMPLETIONS}chat-1`, {}, { timeout: 60000 },
+      { account, token: account.token })
+    assert.equal(completionsCalls()[0].headers.authorization, `Bearer ${account.token}`)
+    const events = response.data[Symbol.asyncIterator]()
+    assert.equal((await events.next()).value.toString('utf8'), frame({ content: 'по' }))
+    assert.equal((await events.next()).done, true)
+    assert.deepEqual(worker.routes(), ['/egress'])
+})
+
+test('what qwen.ai did to the stream is charged to the account, exactly as it is on the direct transports', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    Object.assign(config, { chatRetryCount: QUICK_RETRY.count, chatRetryBackoffMs: QUICK_RETRY.backoffMs })
+    const account = givenAccount()
+    // The connection dropping under the body; qwen.ai silent past its budget.
+    for (const [code, chargedAs] of [['egress_failed', 'ECONNRESET'], ['egress_timeout', 'ETIMEDOUT']]) {
+        worker.calls.length = 0
+        const failing = () => {
+            const stream = relay()
+            stream.head()
+            stream.fail(code)
+            return stream.open
+        }
+        worker.script.egress = body => (body.stream === true ? failing() : egress(chat('chat-1')))
+
+        const { value: result, charged } = await charging(() => sendChatRequest(BODY, { currentAccount: account }))
+        assert.equal(result.status, false, code)
+        assert.deepEqual(result.failure, UNCLASSIFIED_503, code)
+        assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress'], `${code}: retried once`)
+        // Not the egress's doing: the account carries it towards its cooldown,
+        // as it carries a dropped socket on the direct path.
+        assert.deepEqual(charged, [['recordAccountFailure', EMAIL, chargedAs]], code)
+    }
+})
+
+test('a handed-off stream that nobody reads is cut in time, and takes nothing down with it', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    browserEgress.setTimingForTests({ relaySilenceMs: 40 })
+    const account = givenAccount()
+    const stream = answering()
+    scripted(stream)
+
+    const response = await browserEgress.postCompletions({
+        account, url: `${COMPLETIONS}chat-1`, body: '{"stream":true}', token: account.token, timeoutMs: 30
+    })
+    // Never read, never closed: the watchdog comes for it, and an 'error'
+    // with no listener of its own would be the end of the process.
+    await until(() => response.data.destroyed === true)
+    assert.equal(response.data.errored.workerCode, 'relay_silent')
+    assert.ok(logs.some(args => String(args[0]).includes('nobody reading it')), 'it leaves a line all the same')
+})
+
+test('a relay out of shape is the egress’s fault: no retry, nothing charged, a 503', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    Object.assign(config, { chatRetryCount: QUICK_RETRY.count, chatRetryBackoffMs: QUICK_RETRY.backoffMs })
+    const account = givenAccount()
+    // An old worker, which never heard of streams and answers whole.
+    const { value: result, charged } = await charging(async () => {
+        worker.script.egress = body => (body.stream === true ? egress(chat('whole')) : egress(chat('chat-1')))
+        return sendChatRequest(BODY, { currentAccount: account })
+    })
+    assert.equal(result.status, false)
+    assert.deepEqual(result.failure, UNCLASSIFIED_503)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress'])
+    assert.deepEqual(charged, [])
+    assert.ok(logs.some(args => String(args[0]).includes('relay_malformed')))
+
+    // An event of no known kind once the answer is under way: the stream's
+    // failure, and a transport's.
+    const stream = answering()
+    scripted(stream)
+    const { response: answer } = await sendChatRequest(BODY, { currentAccount: account })
+    const events = answer[Symbol.asyncIterator]()
+    await events.next()
+    stream.raw({ type: 'surprise' })
+    await assert.rejects(events.next(), { code: 'EGRESS_RELAY_MALFORMED', workerCode: 'relay_malformed' })
+})
+
+test('an answer that is over inside the first-frame grace brings its jar all the same', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    const stream = relay()
+    stream.head(200, { 'content-type': 'application/json' }, [cookie('cna', 'from-head')])
+    // Not SSE, so no frame ever completes: the whole answer is read before the hand-off.
+    stream.chunk('{"usage":{}}')
+    stream.end([cookie('ssxmod_itna', 'from-end')])
+    scripted(stream)
+
+    const { response: answer } = await sendChatRequest(BODY, { currentAccount: account })
+    assert.equal(jarPairs(COMPLETIONS).ssxmod_itna, 'from-end')
+    assert.equal((await text(answer)), '{"usage":{}}')
+})
+
+test('a relay that goes silent before its first frame is cut like one that goes silent after', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    browserEgress.setTimingForTests({ firstFrameMs: 2000, relaySilenceMs: 40 })
+    const account = givenAccount()
+    // qwen.ai answered and then said nothing — and the worker said nothing either.
+    const mute = relay()
+    mute.head()
+    scripted(mute)
+
+    await assert.rejects(browserEgress.postCompletions({
+        account, url: `${COMPLETIONS}chat-1`, body: '{"stream":true}', token: account.token, timeoutMs: 30
+    }), error => error.code === 'ETIMEDOUT' && error.workerCode === 'relay_silent')
+    // Cut before the hand-off, not parked on the first frame until its grace runs out.
+    assert.equal(await mute.hungUp, false)
+})
+
 test('a dead profile behind the page is re-logged in with the password before the retry', { timeout: 10000 }, async () => {
     config.completionsTransport = 'browser'
     const account = givenAccount()
@@ -1415,7 +1542,7 @@ test('a worker that cannot serve the call is retried, then answered with a 503 t
     config.completionsTransport = 'browser'
     Object.assign(config, { chatRetryCount: QUICK_RETRY.count, chatRetryBackoffMs: QUICK_RETRY.backoffMs })
     const account = givenAccount()
-    for (const [status, code] of [[502, 'page_closed'], [504, 'egress_timeout'], [503, 'resident_capacity']]) {
+    for (const [status, code] of [[502, 'page_closed'], [503, 'resident_capacity'], [500, 'browser_error']]) {
         worker.calls.length = 0
         worker.script.egress = body => (body.stream === true ? refused(status, code) : egress(chat('chat-1')))
 
@@ -1579,6 +1706,22 @@ test('a 429 from qwen.ai is the quota, with its Retry-After, as it is on the dir
     assert.deepEqual(result.failure, { rateLimited: true, overloaded: false, status: 429, retryAfter: 7 })
     assert.deepEqual(charged, [['recordAccountQuotaExhausted', EMAIL, 7]])
     assert.equal(worker.count('/renew'), 0)
+})
+
+test('a caller that brings no silence budget of its own gets the usual one', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    const stream = relay()
+    stream.head()
+    stream.chunk(frame({ content: 'по' }))
+    stream.end()
+    scripted(stream)
+
+    const response = await transport.postCompletions(`${COMPLETIONS}chat-1`, {}, {}, { account, token: account.token })
+    assert.equal(worker.sent('/egress')[0].timeoutMs, browserEgress.COMPLETIONS_TIMEOUT_MS)
+    // Read to the end without a trip: an undefined budget must not arm the
+    // silence watchdog for "NaN" milliseconds, which is to say at once.
+    assert.equal((await text(response.data)), frame({ content: 'по' }))
 })
 
 test('a relay that stays silent past every budget the worker has is cut by the app', { timeout: 10000 }, async () => {

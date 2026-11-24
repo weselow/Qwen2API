@@ -897,9 +897,11 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
             // cuota agotada (cooldown por defecto si el upstream no dijo cuanto esperar).
             logger.error(`发送聊天请求失败: 账户额度已耗尽`, 'REQUEST', '', lastError.message)
             accountManager.recordAccountQuotaExhausted(currentAccount.email, failure.retryAfter)
-        } else if (lastError.workerCode && !hadHttpResponse) {
-            // The signin worker could not serve the completions call (Qwen2API-3ue.3):
+        } else if (lastError.notAccountFault === true && !hadHttpResponse) {
+            // The signin worker could not carry the completions call (Qwen2API-3ue.3):
             // the egress's doing, not the account's — nothing to charge it with.
+            // (What qwen.ai itself did to the stream is charged below, as it
+            // always was: the branch after this one takes it.)
             logger.error(`发送聊天请求失败: completions через signin-worker не прошёл (${lastError.workerCode}): ${lastError.message}`, 'REQUEST')
         } else if (!hadHttpResponse && isRetryableNetworkError(lastError)) {
             // 传输层失败耗尽重试——记 failure，累计可触发 cooldown（PR #112 语义）

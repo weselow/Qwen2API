@@ -38,6 +38,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
  * @param {(email: string) => string} options.profileDir email -> userDataDir
  * @param {(email: string, harvested: object, proxy: ?string) => void} options.onHarvest a lazy open rotated the session
  * @param {(email: string, cookies: object[]) => void} options.onCookies the live jar, after a fetch or a keep-alive poll
+ * @param {number} [options.maxStreamBytes] - Cap on a streamed body. 0, the default, is none
  */
 function createResidents({
     signer,
@@ -48,6 +49,7 @@ function createResidents({
     maxPages = 16,
     keepAliveMs = 5 * 60 * 1000,
     maxBytes = 8 * 1024 * 1024,
+    maxStreamBytes = 0,
     drainMs = 5000,
     backstopMs = 5000,
     closeMs = 5000,
@@ -205,7 +207,7 @@ function createResidents({
         if (stopped) throw new WorkerError('page_closed', 'The worker is shutting down.')
         const entry = {
             email, proxy, context: null, page: null, state: 'opening',
-            lastUsed: Date.now(), inflight: 0, exclusive: false, polling: false, keepAlive: null, streams: 0
+            lastUsed: Date.now(), inflight: 0, exclusive: false, polling: false, keepAlive: null
         }
         pages.set(email, entry)
         try {
@@ -348,13 +350,13 @@ function createResidents({
         }
         streams.set(id, live)
         entry.inflight--
-        entry.streams++
         arm()
-        // The race settles the caller; whichever leg loses must not be left
-        // as a rejection nobody sees.
-        const running = entry.page.evaluate(pageFetchStream, {
-            ...request, maxBytes, channel: STREAM_CHANNEL, registry: STREAM_ABORTS, id, reasons: ABORT_REASON
-        }).then(outcome => ({ outcome }), error => ({ error }))
+        // What the page ends up saying, however it ends: a value either way,
+        // so the race below can only reject from the backstop. Deferred by a
+        // microtask, so that even a page.evaluate throwing outright is caught.
+        const running = Promise.resolve().then(() => entry.page.evaluate(pageFetchStream, {
+            ...request, maxBytes: maxStreamBytes, channel: STREAM_CHANNEL, registry: STREAM_ABORTS, id, reasons: ABORT_REASON
+        })).then(outcome => ({ outcome }), error => ({ error }))
         try {
             let settled
             try {
@@ -380,7 +382,6 @@ function createResidents({
         } finally {
             clearTimeout(timer)
             streams.delete(id)
-            entry.streams--
         }
     }
 

@@ -164,14 +164,32 @@ async function egress(email, account, { url, method = 'POST', headers = {}, body
 // JSON is a few hundred bytes.
 const ERROR_BODY_LIMIT = 16384
 
-// One line of the relay, as the worker wrote it: a JSON object with a `type`.
+// What each event of the relay has to look like (signin-worker/server.js#relayEgress).
+const RELAY_EVENTS = {
+    head: event => Number.isInteger(event.status) && event.headers !== null && typeof event.headers === 'object',
+    chunk: event => typeof event.data === 'string',
+    end: () => true,
+    error: event => typeof event.code === 'string'
+}
+
+// A line that is not an event — an old worker answering whole, a relay out of
+// shape. The egress's fault: never the account's, and not a thing a retry mends.
+// (The line itself stays out of the message: it may be a piece of an answer.)
+const malformedRelay = detail => Object.assign(
+    new Error(`Signin worker returned a malformed egress stream (${detail}).`),
+    { code: 'EGRESS_RELAY_MALFORMED', workerCode: 'relay_malformed', notAccountFault: true }
+)
+
 const relayEvent = line => {
     let event
     try {
         event = JSON.parse(line)
     } catch { /* not an event: reported below */ }
-    if (!event || typeof event !== 'object' || typeof event.type !== 'string') {
-        throw new SigninError('signin_upstream_error', 502, 'Signin worker returned a malformed egress stream.')
+    const shape = event && typeof event === 'object' && Object.hasOwn(RELAY_EVENTS, event.type)
+        ? RELAY_EVENTS[event.type]
+        : null
+    if (!shape || !shape(event)) {
+        throw malformedRelay(event && typeof event.type === 'string' ? `event type ${event.type}` : 'not an event')
     }
     return event
 }
@@ -249,16 +267,21 @@ async function streamWorkerFailure(error, timedOut) {
  * @param {Object} [account] - Account (its proxy opens the page)
  * @param {Object} request - What egress() takes
  * @param {number} [request.timeoutMs] - How long qwen.ai may fall silent between two chunks
+ * @param {object} [options]
+ * @param {number} [options.budgetMs] - How long the worker may take to start
+ *   the relay; by default the call's silence budget, the worker's own budget
+ *   and the page's open, as for egress()
  * @returns {Promise<{frames: AsyncGenerator<Object>, close: () => void}>}
  * @throws {SigninError} the worker could not take the call
  */
-async function egressStream(email, account, { url, method = 'POST', headers = {}, body, timeoutMs = 30000 }) {
+async function egressStream(email, account, { url, method = 'POST', headers = {}, body, timeoutMs = 30000 },
+    { budgetMs } = {}) {
     const controller = new AbortController()
     let expired = false
     const timer = setTimeout(() => {
         expired = true
         controller.abort()
-    }, timeoutMs + config.signinWorkerTimeoutMs + EGRESS_OPEN_MARGIN_MS)
+    }, budgetMs ?? (timeoutMs + config.signinWorkerTimeoutMs + EGRESS_OPEN_MARGIN_MS))
     let response
     try {
         response = await axios.post(`${config.signinWorkerUrl}/egress`, {

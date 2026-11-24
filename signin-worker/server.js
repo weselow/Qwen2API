@@ -52,6 +52,31 @@ const envInt = (name, fallback) => {
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 const REQUEST_BODY_LIMIT = 131072
+
+/**
+ * Write one event of a relay, and say when the app has taken it: at once, or
+ * once the socket drained when the app is behind. A socket that goes is as
+ * good as drained — nothing will ever drain it, and the relay is over anyway —
+ * which is what keeps a handler from waiting on an app that left.
+ * @param {http.ServerResponse} res
+ * @param {() => boolean} gone - The app left: say it is written, write nothing
+ * @returns {(event: object) => Promise<void>|undefined}
+ */
+const relayWriter = (res, gone) => event => {
+    // Gone: say it is written. The page must not wait on a socket nobody will drain.
+    if (gone()) return
+    if (res.write(`${JSON.stringify(event)}\n`)) return
+    // The app is behind: the page (and behind it qwen.ai) waits until it catches up.
+    return new Promise(resolve => {
+        const taken = () => {
+            res.off('drain', taken)
+            res.off('close', taken)
+            resolve()
+        }
+        res.once('drain', taken)
+        res.once('close', taken)
+    })
+}
 // Egress relays request bodies built by the app (agent contexts, images).
 const EGRESS_BODY_LIMIT = 32 * 1024 * 1024
 
@@ -79,6 +104,9 @@ function createServer(overrides = {}) {
         // An /egress timeoutMs is clamped to this; unset, it is config.timeoutMs.
         egressMaxTimeoutMs: overrides.egressMaxTimeoutMs ?? envInt('SIGNIN_EGRESS_MAX_TIMEOUT_MS', 600000),
         egressMaxBytes: overrides.egressMaxBytes ?? 8 * 1024 * 1024,
+        // A stream is relayed, not buffered: the whole-answer cap is not its.
+        // Off unless set.
+        egressMaxStreamBytes: overrides.egressMaxStreamBytes ?? envInt('SIGNIN_EGRESS_MAX_STREAM_BYTES', 0),
         // Grace periods, all bounded so a wedged browser cannot stall a request.
         drainMs: overrides.drainMs ?? 5000,
         backstopMs: overrides.backstopMs ?? 5000,
@@ -181,6 +209,7 @@ function createServer(overrides = {}) {
         maxPages: config.maxPages,
         keepAliveMs: config.keepAliveMs,
         maxBytes: config.egressMaxBytes,
+        maxStreamBytes: config.egressMaxStreamBytes,
         drainMs: config.drainMs,
         backstopMs: config.backstopMs,
         closeMs: config.closeMs,
@@ -401,27 +430,16 @@ function createServer(overrides = {}) {
         // The app may be gone by the time a frame is written. Not this handler's error.
         res.on('error', () => {})
         const started = Date.now()
-        const frame = event => {
-            // Gone: say it is written. The page must not wait on a socket nobody will drain.
-            if (gone) return
-            if (res.write(JSON.stringify(event) + '\n')) return
-            // The app is behind: the page (and behind it qwen.ai) waits until it catches up.
-            return new Promise(resolve => {
-                const done = () => {
-                    res.off('drain', done)
-                    res.off('close', done)
-                    resolve()
-                }
-                res.once('drain', done)
-                res.once('close', done)
-            })
-        }
+        const frame = relayWriter(res, () => gone)
         try {
             // The app gave up while its page was opening: nothing to run.
             if (gone) return residents.release(entry)
             const result = await residents.stream(entry, request, {
                 id,
                 onEvent: async event => {
+                    // The app left while the page was busy (reading its jar,
+                    // say): nothing is written — and nothing is logged as if it were.
+                    if (gone) return
                     if (event.type === 'head') {
                         res.writeHead(200, {
                             'content-type': 'application/x-ndjson',
@@ -557,7 +575,7 @@ function shutdownHandler(server, exit = code => process.exit(code)) {
     }
 }
 
-module.exports = { createServer, WorkerError, shutdownHandler }
+module.exports = { createServer, WorkerError, shutdownHandler, relayWriter }
 
 if (require.main === module) {
     const server = createServer()

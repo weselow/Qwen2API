@@ -6,7 +6,7 @@ const os = require('node:os')
 const path = require('node:path')
 const vm = require('node:vm')
 
-const { createServer } = require('../signin-worker/server')
+const { createServer, relayWriter } = require('../signin-worker/server')
 const { createResidents } = require('../signin-worker/lib/resident-pages')
 const {
     pageFetchStream, pageAbortStream, STREAM_CHANNEL, STREAM_ABORTS, ABORT_REASON
@@ -372,11 +372,14 @@ test('the page reports in order and waits for each report to be taken before rea
   assert.deepEqual(binding.reports.map(report => report.event.type), ['head', 'chunk', 'chunk', 'chunk'])
 })
 
-test('the page cuts a stream at timeoutMs of SILENCE, and every chunk re-arms that timer', async () => {
+test('the page cuts a stream at timeoutMs of qwen.ai’s silence: every chunk re-arms the timer, the app’s turn does not count', async () => {
   const clock = manualClock()
   let body
   let given
-  const binding = channel()
+  let take
+  // The app takes the second chunk slowly.
+  const held = new Promise(resolve => { take = resolve })
+  const binding = channel((event, at) => (at === 3 ? held : undefined))
   const realm = pageRealm({
     [STREAM_CHANNEL]: binding.call, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
     fetch: (url, init) => {
@@ -398,8 +401,13 @@ test('the page cuts a stream at timeoutMs of SILENCE, and every chunk re-arms th
   await feed(1)
   await clock.advance(90) // not silent for long enough
   assert.equal(given.signal.aborted, false)
-  await feed(2) // the budget starts over
-  await clock.advance(90) // 180 ms into a call with a 100 ms budget
+  // The second chunk is reported and not taken: the page is on the app's
+  // turn, however long that takes — it is not qwen.ai being silent.
+  await feed(2)
+  await clock.advance(1000)
+  assert.equal(given.signal.aborted, false, 'the app being behind was taken for qwen.ai falling silent')
+  take()
+  await clock.advance(90) // 180 ms of qwen.ai's silence into a call with a 100 ms budget
   assert.equal(given.signal.aborted, false, 'the stream was cut by a timer that counted the whole call')
   await feed(3)
   await clock.advance(99)
@@ -469,6 +477,11 @@ test('the in-page stream maps its own failures: no body, a dead network, an over
     fetch: async (url, init) => answering(init, ['x'.repeat(600), 'x'.repeat(600)], { onCancel: () => { cancelled = true } })
   }, PAGE({ maxBytes: 512 })), { ok: false, error: 'too_large', status: 200 })
   assert.equal(cancelled, true)
+  // No cap asked, none applied: a stream is not buffered, so it needs none.
+  assert.deepEqual(await inPage({
+    [STREAM_CHANNEL]: channel().call,
+    fetch: async (url, init) => answering(init, ['x'.repeat(600), 'x'.repeat(600)])
+  }, PAGE({ maxBytes: 0 })), { ok: true })
 })
 
 /* ------------------------------------------------------------------ over HTTP -- */
@@ -576,7 +589,7 @@ test('what goes wrong before qwen.ai answered is an ordinary error status, not a
 
 test('what goes wrong after qwen.ai answered is the relay’s last event', { timeout: 10000 }, async t => {
   const signer = fakeBrowser()
-  const { relay, health, dataDir } = await start(t, { signer, egressMaxBytes: 64 })
+  const { relay, health, dataDir } = await start(t, { signer, egressMaxStreamBytes: 64 })
   const email = 'late@example.invalid'
   withProfile(dataDir, email)
   const serving = async extra => {
@@ -605,7 +618,7 @@ test('what goes wrong after qwen.ai answered is the relay’s last event', { tim
   assert.equal(quiet[2].code, 'egress_timeout')
   assert.ok(Date.now() - since >= 190, 'the stream was cut before its silence ran out')
 
-  // More body than the worker relays.
+  // More body than the worker is allowed to relay.
   const big = await serving()
   big.upstream.push('x'.repeat(100))
   const tooLarge = await readAll(big.opened)
@@ -623,6 +636,21 @@ test('what goes wrong after qwen.ai answered is the relay’s last event', { tim
   assert.equal((await crashed.opened.next()).type, 'chunk')
   signer.contexts[0].page.emit('crash')
   assert.deepEqual((await readAll(crashed.opened)).map(event => [event.type, event.code]), [['error', 'page_closed']])
+})
+
+test('a stream is not held to the whole-answer size cap', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  // The whole-answer call could not carry this body.
+  const { relay, dataDir } = await start(t, { signer, egressMaxBytes: 64 })
+  const email = 'long@example.invalid'
+  withProfile(dataDir, email)
+  const upstream = feedable()
+  signer.script.fetch = upstream.fetch
+  const opened = await relay(email)
+  await upstream.opened
+  upstream.push('x'.repeat(4096))
+  upstream.finish()
+  assert.deepEqual(kinds(await readAll(opened)), ['head', 'x'.repeat(4096), 'end'])
 })
 
 test('the app closing its connection aborts the fetch inside the page, and the page stays', { timeout: 10000 }, async t => {
@@ -821,8 +849,8 @@ test('the page is held back while the app is behind: nothing is reported over an
   const signer = fakeBrowser()
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwen-signin-stream-hold-'))
   const residents = createResidents({ signer, profileDir: email => path.join(dataDir, email), drainMs: 10 })
-  t.after(() => {
-    residents.shutdown()
+  t.after(async () => {
+    await residents.shutdown()
     fs.rmSync(dataDir, { recursive: true, force: true })
   })
   fs.mkdirSync(path.join(dataDir, 'a@example.invalid'))
@@ -849,4 +877,71 @@ test('the page is held back while the app is behind: nothing is reported over an
   acknowledge()
   assert.deepEqual(await done, { cookies: [], aborted: false })
   assert.deepEqual(delivered, ['head', 'chunk', 'chunk', 'chunk'])
+})
+
+test('a frame the app has not taken counts as taken once its socket goes', { timeout: 10000 }, async () => {
+  const listeners = {}
+  let writes = 0
+  // An app that is behind: nothing it takes fits in the socket, so a write never says "done".
+  const behind = {
+    write: () => { writes++; return false },
+    once(event, handler) { (listeners[event] ||= []).push(handler) },
+    off(event, handler) { listeners[event] = (listeners[event] || []).filter(kept => kept !== handler) }
+  }
+  const taken = []
+  const writing = relayWriter(behind, () => false)({ type: 'chunk', data: '' }).then(() => taken.push(true))
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.deepEqual(taken, [], 'the frame was taken before the app caught up')
+  assert.deepEqual(Object.keys(listeners).sort(), ['close', 'drain'])
+  // The app is gone instead: its socket closes, and will never drain.
+  for (const handler of listeners.close) handler()
+  await writing
+  assert.deepEqual(taken, [true])
+  assert.deepEqual(listeners, { close: [], drain: [] }, 'nothing is left listening on a dead socket')
+
+  // An app that is already gone is not written to at all.
+  await relayWriter(behind, () => true)({ type: 'chunk', data: '' })
+  assert.equal(writes, 1)
+})
+
+test('a chunk after a long silence, taken slowly by the app, is not a hung page', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwen-signin-stream-slow-'))
+  const residents = createResidents({
+    signer, profileDir: email => path.join(dataDir, email), drainMs: 10, backstopMs: 50
+  })
+  t.after(async () => {
+    await residents.shutdown()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  })
+  fs.mkdirSync(path.join(dataDir, 'a@example.invalid'))
+  const upstream = feedable()
+  signer.script.fetch = upstream.fetch
+  const page = await residents.acquire('a@example.invalid')
+  const withApp = []
+  let take
+  const held = new Promise(resolve => { take = resolve })
+  const done = residents.stream(page, { url: COMPLETIONS, init: { method: 'POST', headers: {} }, timeoutMs: 1000 }, {
+    id: 1,
+    // The app takes the head at once, the chunk after the silence slowly.
+    onEvent: event => {
+      withApp.push(event.type)
+      return event.type === 'chunk' ? held : undefined
+    }
+  }).then(value => value, error => error)
+  await upstream.opened
+  await until(() => withApp.length === 1)
+
+  // qwen.ai falls silent for longer than the grace on top of its budget...
+  await new Promise(resolve => setTimeout(resolve, 600))
+  upstream.push('data: x\n\n')
+  upstream.finish()
+  await until(() => withApp.length === 2) // the chunk is with the app, not taken yet
+  // ...and the app sits on that chunk past where a watch left running from the
+  // head would end: the page is fine, it is the app that is behind.
+  await new Promise(resolve => setTimeout(resolve, 700))
+  assert.equal(signer.contexts[0].closed, false, 'a healthy page was dropped as unresponsive')
+  take()
+  assert.deepEqual(await done, { cookies: [], aborted: false })
+  assert.equal(signer.contexts[0].closed, false)
 })

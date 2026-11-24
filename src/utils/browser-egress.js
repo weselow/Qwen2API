@@ -187,15 +187,19 @@ const setTimingForTests = ({ firstFrameMs = FIRST_FRAME_GRACE_MS, relaySilenceMs
 
 const completionsEnabled = () => config.completionsTransport === 'browser'
 
-// A failure of the relay itself — nothing qwen.ai said — in the shape the
-// caller's transport bookkeeping knows: request.js retries these while nothing
-// reached the client, and leaves the account out of it (workerCode says whose
-// failure it is).
+// A failure of the relay, in the shape the caller's transport bookkeeping
+// knows: request.js retries these while nothing reached the client. Whether it
+// is charged to the account is said here, failure by failure.
 const NODE_CODE_FOR_WORKER_CODE = { egress_timeout: 'ETIMEDOUT', relay_silent: 'ETIMEDOUT' }
+// What qwen.ai did, or the road to it, as the page reports it. The direct
+// transports see the same as ECONNRESET / ETIMEDOUT and charge it to the
+// account; so does this. Every other way a relay ends is the egress's doing.
+const UPSTREAM_FAULTS = new Set(['egress_failed', 'egress_timeout'])
 const relayFailure = (workerCode, detail) => {
     const error = new Error(`signin-worker egress: ${workerCode}${detail ? ` (${detail})` : ''}`)
     error.code = NODE_CODE_FOR_WORKER_CODE[workerCode] || 'ECONNRESET'
     error.workerCode = workerCode
+    error.notAccountFault = !UPSTREAM_FAULTS.has(workerCode)
     return error
 }
 
@@ -268,14 +272,35 @@ async function openCompletions(context, token) {
         if (error.sessionLost) throw httpError(401, { headers: {} }, '')
         // The worker refusing the call itself (bad token, bad request) is a
         // configuration the caller cannot retry its way out of.
-        if (!(error instanceof SigninError) || error.upstreamStatus === 400 || error.upstreamStatus === 401) throw error
+        if (!(error instanceof SigninError) || error.upstreamStatus === 400 || error.upstreamStatus === 401) {
+            // (A relay out of shape arrives here too: the egress's, as well.)
+            error.notAccountFault = true
+            throw error
+        }
         throw relayFailure(error.workerCode || 'worker_unreachable', error.message)
     }
     const iterator = relay.frames[Symbol.asyncIterator]()
     let pending = null
     let ended = false
+    // One watchdog for the whole relay, re-armed by every event taken. The
+    // page cuts a silent upstream at timeoutMs and says so, and the worker's
+    // own backstop answers 5 s later: a relay still quiet past both is gone.
+    // Before the hand-off that is a retryable failure; after it, the stream's.
+    let watchdog = null
+    let silence = Promise.resolve()
+    const arm = () => {
+        clearTimeout(watchdog)
+        silence = new Promise((resolve, reject) => {
+            watchdog = setTimeout(() => reject(relayFailure('relay_silent')),
+                context.timeoutMs + relayGraceMs)
+            watchdog.unref?.()
+        })
+        // It may reject once the relay is over, with nobody left to see that.
+        silence.catch(() => {})
+    }
     const taken = async reading => {
-        const result = await reading
+        const result = await Promise.race([reading, silence])
+        arm()
         if (result.done) throw relayFailure('relay_closed', 'the worker ended the stream before it was over')
         const event = result.value
         if (event.type === 'error') throw relayFailure(event.code || 'relay_error', event.message)
@@ -293,18 +318,26 @@ async function openCompletions(context, token) {
             // It may reject after the race was lost, with nobody left to see that.
             pending.catch(() => {})
         }
-        if (!(await settlesWithin(pending, ms))) return null
+        // The grace, or the relay going quiet: whichever comes first.
+        const waited = await Promise.race([
+            settlesWithin(pending, ms),
+            silence.then(() => 'silent', () => 'silent')
+        ])
+        if (waited === false) return null
+        if (waited === 'silent') return taken(pending)
         const reading = pending
         pending = null
         return taken(reading)
     }
     const stop = () => {
+        clearTimeout(watchdog)
         relay.close()
         iterator.return?.().catch?.(() => {})
     }
 
     let head
     try {
+        arm()
         head = await read()
         if (head.type !== 'head' || !Number.isInteger(head.status)) {
             throw relayFailure('relay_malformed', 'no head event')
@@ -346,6 +379,8 @@ async function openCompletions(context, token) {
                 if (event === null) return { bytes, frame: null }
                 if (event.type === 'end') {
                     ended = true
+                    // The jar as of the end, short as this answer was.
+                    sessionPersistence.syncCookies(context.email, event.cookies)
                     return { bytes, frame: firstSseFrame(bytes) }
                 }
                 bytes.push(Buffer.from(event.data, 'base64'))
@@ -358,41 +393,44 @@ async function openCompletions(context, token) {
          * The answer in the caller's shape: {status, statusText, headers, data},
          * `data` a Readable of the body with what was read so far already in
          * it. From here on a failure is the stream's (it is destroyed with
-         * it), and the consumer closing the stream ends the relay.
+         * it), the consumer closing the stream ends the relay, and a relay
+         * that falls silent past its budgets ends the stream the same way.
          */
         handOff(readSoFar) {
             const data = new Readable({ read() {} })
             for (const bytes of readSoFar) data.push(bytes)
-            let watchdog = null
-            const arm = () => {
-                clearTimeout(watchdog)
-                watchdog = setTimeout(() => data.destroy(relayFailure('relay_silent')),
-                    context.timeoutMs + relayGraceMs)
-                watchdog.unref?.()
-            }
+            // A failure nobody is left to see must not take the process down:
+            // an 'error' with no listener is fatal. A consumer's own handling
+            // is not in the way; an answer that ended unread leaves a line.
+            data.on('error', error => {
+                if (data.listenerCount('error') === 1) {
+                    logger.warn(`COMPLETIONS_TRANSPORT=browser: the answer ended with nobody reading it` +
+                        ` (${error.workerCode || error.code})`, 'REQUEST')
+                }
+            })
             // The consumer is done with the answer — it read to the end,
             // stopped early or went away — and the relay ends with it.
-            data.on('close', () => {
-                clearTimeout(watchdog)
-                stop()
-            })
-            arm()
+            data.on('close', stop)
             ;(async () => {
                 try {
                     while (!ended) {
                         const event = await read()
-                        arm()
                         if (event.type === 'end') {
                             ended = true
                             // The jar as of the end: the last word on what the browser holds.
                             sessionPersistence.syncCookies(context.email, event.cookies)
                             continue
                         }
+                        // (No back-pressure from here on, as for the direct
+                        // transports: the controllers write to their client
+                        // without waiting, so this stream is always drained.)
                         data.push(Buffer.from(event.data, 'base64'))
                     }
                     data.push(null)
                 } catch (error) {
                     data.destroy(error)
+                } finally {
+                    clearTimeout(watchdog)
                 }
             })()
             return {
@@ -422,8 +460,8 @@ async function streamCompletions(context, token) {
         // request can answer — by the caller's retry in postCompletions.
         const first = await relay.firstFrame()
         if (isUnauthorized(first.frame?.payload)) throw httpError(401, relay.head, first.frame.text)
-        // qwen.ai took the session for a generation.
-        sessionPersistence.markSessionAccepted(context.email)
+        // (The session is not marked accepted here: chats/new did that for this
+        // very request a moment ago, and it is the call that proves a session.)
         return relay.handOff(first.bytes)
     } catch (error) {
         relay.stop()
@@ -459,7 +497,9 @@ async function postCompletions(context) {
     // The store is the source of truth for the token, as it is for chats/new.
     let session = store.sessions.get(email) || null
     let token = session ? session.token : context.token
-    const call = { ...context, email }
+    // The silence budget is the direct transports' unless the caller brings a
+    // number of its own (an undefined one would arm every timer for "NaN").
+    const call = { ...context, email, timeoutMs: context.timeoutMs ?? COMPLETIONS_TIMEOUT_MS }
     for (let attempt = 1; ; attempt++) {
         try {
             return await streamCompletions(call, token)
