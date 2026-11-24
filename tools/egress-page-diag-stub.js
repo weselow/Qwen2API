@@ -22,6 +22,11 @@
  *                         the session refused ({"code":"unauthorized"}) — the way qwen.ai answered
  *                         the first call 0.3 s after the page opened on 2026-11-24. The page
  *                         rotates its token 1.5 s after its script starts. Later calls succeed.
+ *   STUB_MODE=punish      chats/new succeeds; POST /api/v2/chat/completions is answered with the risk
+ *                         control's envelope under status 200 ({"ret":["FAIL_SYS_USER_VALIDATE",
+ *                         "RGV587_ERROR::SM::…被挤爆啦…"],"data":{"url":"…/punish?…"}}) — what qwen.ai
+ *                         answered the completions call from the page on 2026-11-24. Without it the
+ *                         stub answers completions with three SSE frames ("pon", "g", [DONE]).
  *   STUB_PORT             default 3847
  */
 const http = require('http')
@@ -31,6 +36,8 @@ const hang = mode === 'hang' || mode === 'hangfreeze'
 const waf = mode === 'waf'
 // unauthorized-first: the first chats/new is answered at once, no challenge, with the session refused; the page rotates its token 1.5 s after its script starts.
 const refuseFirst = mode === 'unauthorized-first'
+// punish: completions is answered with the risk control's envelope under status 200, as qwen.ai did from the page on 2026-11-24.
+const punish = mode === 'punish'
 let refusalsLeft = refuseFirst ? 1 : 0
 const freezeAfterMs = mode === 'freeze' ? 2500 : mode === 'hangfreeze' ? 1500 : 0
 const port = Number(process.env.STUB_PORT || 3847)
@@ -90,6 +97,19 @@ http.createServer((req, res) => {
         return
     }
     if (pathname === '/api/v2/chats/new' && hang) return // never answers
+    if (pathname === '/api/v2/chat/completions') {
+        if (punish) {
+            res.writeHead(200, { 'content-type': 'application/json' })
+            return res.end(JSON.stringify({
+                ret: ['FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试'],
+                data: { url: 'https://stub.example/_____tmd_____/punish?x5secdata=stub' }
+            }))
+        }
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        const frames = ['data: {"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"pon"}}]}\n\n',
+            'data: {"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"g"}}]}\n\n', 'data: [DONE]\n\n']
+        return frames.forEach((frame, at) => setTimeout(() => (at === frames.length - 1 ? res.end(frame) : res.write(frame)), 150 * (at + 1)))
+    }
     if (pathname === '/api/v2/chats/new' && refuseFirst && refusalsLeft-- > 0) {
         // What qwen.ai answered the first call after the page opened (24.11): at once, no challenge, the session refused.
         res.writeHead(200, { 'content-type': 'application/json' })
@@ -103,7 +123,7 @@ http.createServer((req, res) => {
     }
     res.writeHead(200, { 'content-type': 'application/json' })
     res.end(JSON.stringify(pathname === '/api/v2/chats/new'
-        ? { success: true, data: { chat_id: 'stub-chat', chat_mode: 'normal' } }
+        ? { success: true, request_id: 'stub', data: { id: 'stub-chat', chat_mode: 'normal' } }
         : { success: true, data: [] }))
 }).listen(port, '127.0.0.1', () => {
     console.log(`stub listening on http://127.0.0.1:${port} mode=${mode} pid=${process.pid}`)
