@@ -27,17 +27,26 @@
  *                         "RGV587_ERROR::SM::…被挤爆啦…"],"data":{"url":"…/punish?…"}}) — what qwen.ai
  *                         answered the completions call from the page on 2026-11-24. Without it the
  *                         stub answers completions with three SSE frames ("pon", "g", [DONE]).
+ *   STUB_MODE=ui         the page has an input and a send button, as the chat site has, and sends a message
+ *                         through them: its own chats/new, then its own completions with bx-ua / bx-umidtoken
+ *                         on it, the way the page's own code puts them. The page changes its token 3 s
+ *                         after its script starts, and a chats/new on the first one (what a renewal
+ *                         harvests) is refused, as qwen.ai refused the app's token on 2026-11-24.
+ *                         For --ui-send=1 with --signed=1 and --bearer-compare=1.
+ *   STUB_MODE=ui-punish  the same, but the page's own completions is answered with the punish envelope.
  *   STUB_PORT             default 3847
  */
 const http = require('http')
 
 const mode = process.env.STUB_MODE || 'ok'
 const hang = mode === 'hang' || mode === 'hangfreeze'
-const waf = mode === 'waf'
+// ui, ui-punish: an input and a send button on the page; a message goes out through them.
+const ui = mode === 'ui' || mode === 'ui-punish'
+const waf = mode === 'waf' || ui
 // unauthorized-first: the first chats/new is answered at once, no challenge, with the session refused; the page rotates its token 1.5 s after its script starts.
 const refuseFirst = mode === 'unauthorized-first'
 // punish: completions is answered with the risk control's envelope under status 200, as qwen.ai did from the page on 2026-11-24.
-const punish = mode === 'punish'
+const punish = mode === 'punish' || mode === 'ui-punish'
 let refusalsLeft = refuseFirst ? 1 : 0
 const freezeAfterMs = mode === 'freeze' ? 2500 : mode === 'hangfreeze' ? 1500 : 0
 const port = Number(process.env.STUB_PORT || 3847)
@@ -76,14 +85,58 @@ const hook = `
         }
     }())`
 
+// What stands in for the chat site's input, its send button, and the code that sends a message.
+const uiControls = `
+    <textarea id="chat-input" placeholder="Message" style="width: 320px; height: 40px"></textarea>
+    <button id="send-message-button" type="button" aria-label="Send" disabled><svg width="12" height="12"></svg></button>
+    <div id="thread"></div>
+    <script>
+        (function () {
+            const input = document.getElementById('chat-input')
+            const button = document.getElementById('send-message-button')
+            const thread = document.getElementById('thread')
+            const call = (url, body, done) => {
+                const xhr = new XMLHttpRequest()
+                xhr.open('POST', url)
+                xhr.setRequestHeader('content-type', 'application/json')
+                xhr.setRequestHeader('authorization', 'Bearer ' + localStorage.getItem('token'))
+                // What the page's own code puts on its completions request.
+                if (url.indexOf('/completions') !== -1) {
+                    xhr.setRequestHeader('bx-ua', 'stub-ua-' + Date.now())
+                    xhr.setRequestHeader('bx-umidtoken', 'stub-umidtoken')
+                }
+                xhr.onload = () => done(xhr.responseText)
+                xhr.send(body)
+            }
+            const send = () => {
+                const text = input.value.trim()
+                if (!text) return
+                input.value = ''
+                button.disabled = true
+                call('/api/v2/chats/new', JSON.stringify({ chatId: '', models: ['qwen3.7-plus'], chat_type: 't2t' }), answer => {
+                    const id = JSON.parse(answer).data.id
+                    thread.innerText += 'you: ' + text + ' | '
+                    call('/api/v2/chat/completions?chat_id=' + id, JSON.stringify({
+                        model: 'qwen3.7-plus', stream: true, chat_id: id, incremental_output: true,
+                        messages: [{ role: 'user', content: text }]
+                    }), out => { thread.innerText += 'assistant: ' + out.slice(0, 80) })
+                })
+            }
+            input.addEventListener('input', () => { button.disabled = !input.value.trim() })
+            button.addEventListener('click', send)
+            input.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send() } })
+        }())
+    </script>`
+
 http.createServer((req, res) => {
     const pathname = req.url.split('?')[0]
     if (pathname === '/') {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-        res.end(`<!doctype html><title>stub chat</title><body><h1>stub</h1><script>
+        res.end(`<!doctype html><title>stub chat</title><body><h1>stub</h1>${ui ? uiControls : ''}<script>
             localStorage.setItem('token', ${JSON.stringify(token)});
             ${waf ? hook : ''}
             ${refuseFirst ? `setTimeout(() => localStorage.setItem('token', ${JSON.stringify(rotated)}), 1500);` : ''}
+            ${ui ? `setTimeout(() => localStorage.setItem('token', ${JSON.stringify(rotated)}), 3000);` : ''}
             setTimeout(() => fetch('/api/v2/models'), 300);
             setTimeout(() => fetch('https://not-loopback.example/beacon', { method: 'POST' }), 500);
             setTimeout(() => fetch('/api/v2/user'), 700);
@@ -112,6 +165,12 @@ http.createServer((req, res) => {
     }
     if (pathname === '/api/v2/chats/new' && refuseFirst && refusalsLeft-- > 0) {
         // What qwen.ai answered the first call after the page opened (24.11): at once, no challenge, the session refused.
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ success: false, request_id: 'stub', data: { code: 'unauthorized', details: '401 Unauthorized' } }))
+        return
+    }
+    if (pathname === '/api/v2/chats/new' && ui && req.headers.authorization === `Bearer ${token}`) {
+        // On the token a renewal harvests (the page's first one): the session of the call is refused, as on 24.11.
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ success: false, request_id: 'stub', data: { code: 'unauthorized', details: '401 Unauthorized' } }))
         return
