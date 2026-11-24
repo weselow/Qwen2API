@@ -1104,3 +1104,5 @@ process.on('SIGINT', () => {
 
 
 module.exports = accountManager
+// Said where code that must not load this module can find it once it is loaded.
+require('./account-registry').manager = accountManager

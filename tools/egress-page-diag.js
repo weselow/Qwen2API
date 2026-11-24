@@ -8,7 +8,7 @@
  *   node tools/egress-page-diag.js --profile=<userDataDir> --worker=<dir with lib/>
  *        [--origin=https://chat.qwen.ai] [--out=/tmp/egress-page-diag]
  *        [--headless-mode=shell|chrome] [--settle-ms=0] [--transport=worker|xhr|fetch]
- *        [--like-fe=1] [--loopback-only=1]
+ *        [--like-fe=1] [--completions=1] [--loopback-only=1]
  *
  * How the call is sent:
  *   --transport=worker  exactly what the worker sends (Qwen2API-3ue.5): its
@@ -42,9 +42,13 @@
  * What it does on the network: one page load of the chat root and at most two
  * POST /api/v2/chats/new from inside the page (the second only when the first
  * got no HTTP status, nothing showed a verification and the page is still
- * responsive; never earlier than a minute after the first). This script
- * requests nothing else. Tokens and cookies are never printed: URLs are cut to
- * host and path, console text is masked and cut, secret headers by name only.
+ * responsive — or when qwen.ai answered the first but refused its session;
+ * never earlier than a minute after the first; with --completions=1, one POST
+ * /api/v2/chat/completions from inside the page, right after a chats/new
+ * passed). This script requests nothing else. Tokens and cookies are never
+ * printed: URLs are cut to host and path,
+ * console text is masked and cut, secret headers by name only, the page's
+ * token by a fingerprint (length, hash, expiry).
  *
  * Dry run first, without any network: tools/egress-page-diag-stub.js serves a
  * stub chat site on the loopback interface, and --loopback-only=1 aborts every
@@ -74,6 +78,10 @@ const SETTLE_MS = Number(args['settle-ms'] || 0)
 const TRANSPORT = ['worker', 'xhr'].includes(args.transport) ? args.transport : args.transport === 'fetch' ? 'fetch' : 'worker'
 // Send the headers the page's own code sends with its API calls.
 const LIKE_FE = args['like-fe'] === '1'
+// After a chats/new passed: one completions stream from the page too, by the
+// worker's own streaming code. Completions is guarded more strictly than
+// chats/new (24.11: punished from the page while chats/new passed).
+const COMPLETIONS = args.completions === '1'
 const LOOPBACK_ONLY = args['loopback-only'] === '1'
 const MAX_BYTES = 8 * 1024 * 1024
 const BACKSTOP_MS = 5000
@@ -264,6 +272,27 @@ const alive = pid => {
     }
 }
 
+/**
+ * Runs INSIDE the page: a fingerprint of the page's session token — its
+ * length, a hash and the token's own expiry — never the token. The token
+ * rotates as the page boots; when it does is part of whether the page is
+ * ready for a call.
+ */
+function pageTokenFingerprint() {
+    const token = localStorage.getItem('token')
+    if (!token) return null
+    let hash = 0x811c9dc5
+    for (let at = 0; at < token.length; at++) {
+        hash ^= token.charCodeAt(at)
+        hash = Math.imul(hash, 0x01000193) >>> 0
+    }
+    let exp = null
+    try {
+        exp = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).exp
+    } catch { /* not a JWT as the page writes it: no expiry to read */ }
+    return `${token.length}:${hash.toString(16)}:${exp}`
+}
+
 /** Chromium's own processes in this container: state and CPU ticks per type. */
 function chromiumProcesses() {
     const out = []
@@ -427,8 +456,29 @@ async function main() {
         : null
     if (cpuTimer) cpuTimer.unref()
 
-    // The same channel the worker exposes before the first navigation.
-    await page.exposeFunction(egress.STREAM_CHANNEL, () => {})
+    // The same channel the worker exposes before the first navigation; here
+    // it also carries the completions probe's events.
+    const relayed = []
+    await page.exposeFunction(egress.STREAM_CHANNEL, (id, event) => { relayed.push(event) })
+
+    // The page's token, watched from before its first load: when the page
+    // boots it rotates it, and a call made before that is refused.
+    let tokenNow
+    const tokenWatch = setInterval(async () => {
+        let seen
+        try {
+            seen = await page.evaluate(pageTokenFingerprint)
+        } catch {
+            return // mid-navigation: the next look lands on the new document
+        }
+        if (seen === tokenNow) return
+        const firstSight = tokenNow === undefined
+        tokenNow = seen
+        const [length, hash, exp] = seen ? seen.split(':') : [null, null, null]
+        const left = Number.isFinite(Number(exp)) && exp !== 'null' ? `exp in ${Math.round((Number(exp) * 1000 - Date.now()) / 1000)} s` : 'no expiry read'
+        log('token', `${firstSight ? 'the page has' : 'the page changed'} its token: ${seen ? `${length} chars, ${hash}, ${left}` : 'none'}`)
+    }, 250)
+    tokenWatch.unref?.()
 
     const tRenewStart = ms()
     let harvested
@@ -491,6 +541,14 @@ async function main() {
         // "Answered" means qwen.ai's status came back; a call the page itself
         // cut, or one the page never reported on, is not an answer.
         result.answered = Boolean(first.outcome && typeof first.outcome.status === 'number')
+        // The chat a passing chats/new created: what a completions call needs.
+        try {
+            const parsed = JSON.parse(first.outcome.body)
+            if (parsed?.success === true && typeof parsed.data?.id === 'string') result.chatId = parsed.data.id
+        } catch { /* no chat came of it */ }
+        // Answered, and the answer refuses the session of the call (status 200, a JSON envelope).
+        result.sessionRefused = Boolean(first.outcome && typeof first.outcome.body === 'string' &&
+            /"code":\s*"unauthorized"/.test(first.outcome.body))
         if (first.backstop) {
             // What the worker saw: no answer at all, not even from the page's own timer.
             result.outcome = 'no answer from the page (the worker closes it here)'
@@ -521,6 +579,52 @@ async function main() {
             shape = text ? `NOT JSON${challenge ? ' — A WAF CHALLENGE PAGE' : ''}, starts: ${cut(text, 80)}` : 'empty body'
         }
         return `ok: HTTP ${outcome.status} ${outcome.redirected ? '(redirected to ' + hostPath(outcome.url) + ')' : ''}, ${shape}`
+    }
+
+    /**
+     * One completions call from the page, by the worker's own streaming code
+     * (pageCall with a channel): what qwen.ai answered with its first frames.
+     */
+    async function completions(chatId) {
+        relayed.length = 0
+        const started = Date.now()
+        log('completions', 'the stream call starts (the worker\'s own code, with the headers the worker gives it)')
+        const running = page.evaluate(egress.pageCall, {
+            url: `/api/v2/chat/completions?chat_id=${chatId}`,
+            init: {
+                method: 'POST',
+                // What the app puts on it: the worker adds the page's own headers.
+                headers: { 'content-type': 'application/json', accept: 'application/json' },
+                body: JSON.stringify({
+                    model: 'qwen3.7-plus', max_tokens: 64, stream: true,
+                    chat_id: chatId, chatId, parent_id: null, parentId: null,
+                    messages: [{ role: 'user', content: 'Say pong', parent_id: null, parentId: null }]
+                })
+            },
+            timeoutMs: 120000, maxBytes: 0,
+            channel: egress.STREAM_CHANNEL, registry: egress.STREAM_ABORTS, id: 1, reasons: egress.ABORT_REASON
+        })
+        let outcome
+        try {
+            outcome = await withTimeout(running, 150000, 'the completions call')
+        } catch (error) {
+            outcome = { ok: false, error: 'no answer', message: cut(error.message, 120) }
+        }
+        const head = relayed.find(event => event.type === 'head') || null
+        const answered = relayed.filter(event => event.type === 'chunk').map(event => Buffer.from(event.data, 'base64').toString('utf8')).join('')
+        // What qwen.ai's risk control answers instead of an answer, under status 200 (21.11, 24.11).
+        const challenge = /FAIL_SYS_USER_VALIDATE|RGV587|punish|aliyun_waf|被挤爆/i.test(answered)
+        const frames = (answered.match(/^data: /gm) || []).length
+        const said = {
+            ok: outcome.ok, error: outcome.error || undefined, status: head ? head.status : null,
+            type: head ? head.headers['content-type'] : null, bytes: answered.length, frames,
+            answer: challenge ? 'A CHALLENGE' : frames ? 'an answer (SSE frames)' : answered ? 'text, no SSE frame' : 'nothing',
+            took: Date.now() - started
+        }
+        log('completions', `${said.ok ? 'ok' : `not ok: ${said.error}`} · HTTP ${said.status} · ${said.type || '-'} · ` +
+            `${said.bytes} bytes, ${said.frames} SSE frame(s) · ${said.answer} · ${said.took} ms`)
+        log('completions', `starts: ${cut(answered.replace(/\s+/g, ' '), 420)}`)
+        return said
     }
 
     async function facts() {
@@ -593,10 +697,31 @@ async function main() {
             } else {
                 log('call-2', 'skipped: the page still answers nothing')
             }
+        } else if (first.sessionRefused) {
+            // qwen.ai answered at once but refused the session of the call:
+            // the page may not have been ready that early (24.11, the first
+            // call 0.3 s after the page opened; the same call later passed).
+            // The page is left alone for the runbook's pause, then asked once more.
+            const wait = MIN_BETWEEN_CALLS_MS - (Date.now() - T0 - first.at)
+            if (wait > 0) await sleep(wait)
+            const verification = events.findIndex(event => event.kind === 'verification' && event.t >= first.at)
+            if (verification !== -1) {
+                out.verificationAt = events[verification].t
+                log('call-2', 'skipped: the page is showing a verification (a puzzle captcha) for the first call')
+            } else {
+                out.call2 = await attempt('call-2')
+            }
         } else {
             await sleep(15000)
         }
+        if (COMPLETIONS) {
+            // Right after a chats/new passed, as the app sends it.
+            const passed = [out.call1, out.call2].find(call => call && call.chatId)
+            if (passed) out.completions = await completions(passed.chatId)
+            else log('completions', 'skipped: no chats/new passed')
+        }
     }
+    clearInterval(tokenWatch)
 
     out.screenshotEnd = await shot('end.png')
     out.factsEnd = await facts()
@@ -744,6 +869,9 @@ async function main() {
         console.log(`  pings while it ran (ms, -1 = no answer in 5 s): ${call.pings.join(' ')}`)
     }
     if (out.idlePings) console.log(`pings while left alone: ${out.idlePings.join(' ')}`)
+    if (out.completions) {
+        console.log(`completions: ${JSON.stringify(out.completions)}`)
+    }
     console.log('--- page facts')
     console.log('ready:', JSON.stringify(out.factsReady))
     console.log('end:  ', JSON.stringify(out.factsEnd))
