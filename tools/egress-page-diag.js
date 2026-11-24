@@ -7,23 +7,29 @@
  *
  *   node tools/egress-page-diag.js --profile=<userDataDir> --worker=<dir with lib/>
  *        [--origin=https://chat.qwen.ai] [--out=/tmp/egress-page-diag]
- *        [--headless-mode=shell|chrome] [--settle-ms=0] [--transport=xhr|fetch]
+ *        [--headless-mode=shell|chrome] [--settle-ms=0] [--transport=worker|xhr|fetch]
  *        [--like-fe=1] [--loopback-only=1]
  *
- * The call goes the way the worker sends it (fetch, content-type only) unless:
- *   --transport=xhr  through XMLHttpRequest, the way the page's own code sends.
- *                    Its request hooks wrap XHR open() and send() (baxiaCommon.js),
- *                    so whatever they add to the page's requests they add to this
- *                    one: bx-v always, bx-ua and bx-umidtoken when they decide to.
+ * How the call is sent:
+ *   --transport=worker  exactly what the worker sends (Qwen2API-3ue.5): its
+ *                    own in-page call (lib/egress-fetch.js, pageCall) — an
+ *                    XMLHttpRequest with the page's headers, read off the page.
+ *                    The default to open a question about the worker's call.
+ *   --transport=xhr   through XMLHttpRequest as the page's own code sends it,
+ *                    by this script's own probe. Its request hooks wrap XHR
+ *                    open() and send() (baxiaCommon.js), so whatever they add
+ *                    to the page's requests they add to this one.
+ *   --transport=fetch how the worker sent it until Qwen2API-3ue.5: fetch,
+ *                    content-type only — kept to show what that got.
  *   --like-fe=1      with the headers the page sends with every API call of its
  *                    own: accept, accept-language, source, version, timezone,
  *                    x-request-id, and authorization from the page's localStorage.
  *   --settle-ms=N    leaves the page alone for N ms first.
- * On 2026-11-24 the worker's way (fetch, content-type only) got a WAF challenge
- * page under status 200 and the page showed a puzzle captcha; the page's way
- * (--transport=xhr --like-fe=1, after 20 s) got {"success":true}. Which single
- * header matters was not isolated; nor whether fetch would do with the same
- * headers, nor whether the wait mattered.
+ * On 2026-11-24 the worker's old way (fetch, content-type only) got a WAF
+ * challenge page under status 200 and the page showed a puzzle captcha; the
+ * page's way (XMLHttpRequest with its headers, after 20 s) got
+ * {"success":true}. Which single header mattered was not isolated; nor
+ * whether the wait mattered.
  *
  * Run it inside the worker container, as the worker's user, with the worker's
  * lib/ as --worker (on prod: /app) and the account's profile as --profile,
@@ -63,8 +69,9 @@ const OUT = args.out || '/tmp/egress-page-diag'
 const HEADLESS_MODE = args['headless-mode'] || 'shell'
 // How long to leave the page alone after it is ready, before the first call.
 const SETTLE_MS = Number(args['settle-ms'] || 0)
-// fetch: the worker's way. xhr: the page's own code's way.
-const TRANSPORT = args.transport === 'xhr' ? 'xhr' : 'fetch'
+// worker: the worker's own in-page call (its default). xhr: the page's own
+// code's way, by this script's probe. fetch: how the worker sent it until 3ue.5.
+const TRANSPORT = ['worker', 'xhr'].includes(args.transport) ? args.transport : args.transport === 'fetch' ? 'fetch' : 'worker'
 // Send the headers the page's own code sends with its API calls.
 const LIKE_FE = args['like-fe'] === '1'
 const LOOPBACK_ONLY = args['loopback-only'] === '1'
@@ -73,6 +80,12 @@ const BACKSTOP_MS = 5000
 // The pause the runbook asks for between two live calls.
 const MIN_BETWEEN_CALLS_MS = 60000
 const LINUX = fs.existsSync('/proc/uptime')
+// What each way of sending the call is called in the report.
+const TRANSPORT_LABEL = {
+    worker: 'the worker\'s own call: XMLHttpRequest with the page\'s headers',
+    xhr: 'xhr',
+    fetch: 'fetch, as the worker sent it until Qwen2API-3ue.5'
+}
 
 if (!WORKER || !PROFILE) {
     console.error('usage: node tools/egress-page-diag.js --profile=<dir> --worker=<dir with lib/> [--origin=] [--out=]')
@@ -102,8 +115,9 @@ const hostPath = url => {
 const apiType = entry => ['xhr', 'fetch', 'document', 'websocket', 'eventsource', 'other', 'manifest'].includes(entry.type)
 
 /**
- * Runs INSIDE the page. The worker's pageFetch (lib/egress-fetch.js) with a
- * console line at every stage, so the timeline shows where a call stands.
+ * Runs INSIDE the page. How the worker sent its call until Qwen2API-3ue.5
+ * (lib/egress-fetch.js, fetch with the caller's headers only), with a console
+ * line at every stage, so the timeline shows where a call stands.
  */
 async function pageFetchProbe({ url, init, timeoutMs, maxBytes }) {
     const say = (...parts) => console.log('E4DIAG', Date.now(), ...parts)
@@ -450,9 +464,9 @@ async function main() {
     /** The worker's call step for step, with a ping every 2 s while it runs. */
     async function attempt(label) {
         const started = Date.now()
-        log(label, `in-page call starts (${TRANSPORT}${LIKE_FE ? ', with the headers of the page' : ''})`)
-        const call = TRANSPORT === 'xhr' ? pageXhrProbe : pageFetchProbe
-        const running = page.evaluate(call, { ...request, maxBytes: MAX_BYTES, fe: LIKE_FE })
+        log(label, `in-page call starts (${TRANSPORT_LABEL[TRANSPORT]}${LIKE_FE && TRANSPORT !== 'worker' ? ', with the headers of the page' : ''})`)
+        const call = TRANSPORT === 'xhr' ? pageXhrProbe : TRANSPORT === 'fetch' ? pageFetchProbe : egress.pageCall
+        const running = page.evaluate(call, { ...request, maxBytes: MAX_BYTES, fe: LIKE_FE, reasons: egress.ABORT_REASON })
             .then(outcome => ({ outcome }), error => ({ error }))
         const backstop = new Promise(resolve => {
             const id = setTimeout(() => resolve({ backstop: true }), request.timeoutMs + BACKSTOP_MS)
@@ -638,7 +652,7 @@ async function main() {
 
     // ---- summary ------------------------------------------------------------------------------
     console.log(`=== resident page diagnostic: ${ORIGIN}, headless mode ${HEADLESS_MODE}, profile ${path.basename(PROFILE)}`)
-    console.log(`call sent via ${TRANSPORT}${LIKE_FE ? ' with the headers of the page' : ' with the headers the worker sends'}${SETTLE_MS ? `, after ${SETTLE_MS} ms of waiting` : ''}`)
+    console.log(`call sent via ${TRANSPORT_LABEL[TRANSPORT]}${LIKE_FE && TRANSPORT !== 'worker' ? ' with the headers of the page' : TRANSPORT === 'worker' ? ' with the headers the worker gives it' : ''}${SETTLE_MS ? `, after ${SETTLE_MS} ms of waiting` : ''}`)
     console.log(`browser open ${tOpen} ms, page ready ${tReady} ms, finished ${ms()} ms`)
     console.log('--- timeline (ms since launch)')
     for (const event of events) console.log(`${String(event.t).padStart(7)}  ${event.kind.padEnd(13)} ${event.text}`)

@@ -8,6 +8,12 @@
  * headless mode `chrome` (Qwen2API-3ue.4) runs here too: what the stand-in
  * sees of the full Chromium against what it saw of the shell.
  *
+ * The stand-in's page carries a request hook in the shape of the real page's
+ * (baxiaCommon.js 2.5.37): it signs every XHR, and it keeps an answer it takes
+ * for a block away from the request's onload and onloadend properties
+ * (Qwen2API-3ue.5 and .6). That is what hung /egress for 35 s on prod on
+ * 2026-11-24; here the worker has to see a challenge page through it, at once.
+ *
  * qwen.ai is never contacted: run this freely, it is not a live probe. Use it
  * after touching the worker's browser paths: signin-worker/server.js (the
  * sign-in path), lib/login-pacer.js, lib/resident-pages.js,
@@ -17,6 +23,8 @@
  *   bunx playwright install chromium     # once
  *   node tools/worker-egress-local-smoke.js
  */
+
+/* global XMLHttpRequest */
 
 const http = require('node:http')
 const fs = require('node:fs')
@@ -38,6 +46,47 @@ const SSE_FRAMES = [
     'data: {"choices":[{"delta":{"content":"вет"}}]}\n\n',
     'data: [DONE]\n\n'
 ]
+// What /api/sse-wide answers, in 7-byte pieces: every two-, three- and
+// four-byte character gets cut somewhere. A stream is read as text off the
+// request, and has to come back as the bytes that were sent.
+const WIDE = 'data: {"choices":[{"delta":{"content":"привет 中文テスト \ud83d\ude00\ud83c\udf89"}}]}\n\n' +
+    'data: {"choices":[{"delta":{"content":"конец 结束 \ud83c\udf8a"}}]}\n\n' + 'data: [DONE]\n\n'
+// What qwen.ai's WAF answered an API call with on 2026-11-24: status 200, a page.
+const CHALLENGE_PAGE = '<!doctype html> <meta charset="UTF-8"> <meta name="aliyun_waf_aa" content="stub"> ' +
+    '<script> /* v2.0.1 */ </script>'
+
+/**
+ * The stand-in page's request hook, as the real page's (baxiaCommon.js
+ * 2.5.37) behaves where it matters here. Runs in the page.
+ * @param {boolean} strict - Also hide a blocked answer from addEventListener,
+ *   which the real hook does not do: the second line of the worker's
+ *   (Qwen2API-3ue.6) is exercised with it
+ */
+function pageHook(strict) {
+    const proto = XMLHttpRequest.prototype
+    const blocked = xhr => {
+        let text = ''
+        try { text = xhr.response || xhr.responseText } catch (error) { /* nothing to read yet */ }
+        return /aliyun_waf_/.test(String(text))
+    }
+    const send = proto.send
+    proto.send = function () {
+        // What the page's hook adds to every request of the page's, this one included.
+        this.setRequestHeader('x-stub-v', '2.5.37')
+        // An answer taken for a block is never told to these.
+        for (const name of ['onload', 'onloadend']) {
+            const own = this[name]
+            if (!own) continue
+            this[name] = function (event) { if (!blocked(this)) own.call(this, event) }
+        }
+        return send.apply(this, arguments)
+    }
+    if (!strict) return
+    const add = proto.addEventListener
+    proto.addEventListener = function (type, listener, options) {
+        return add.call(this, type, function (event) { if (!blocked(this)) listener.call(this, event) }, options)
+    }
+}
 
 /**
  * The stand-in: a root page that settles a token the way the chat FE does,
@@ -53,6 +102,8 @@ function startStandIn() {
     const longStream = { sent: 0, closedAt: 0 }
     // What the third-party frame saw of itself, the last time it loaded.
     const frame = { document: null, request: null, page: null }
+    // Whether the page loaded next hides blocked answers from listeners too.
+    const state = { holdListeners: false }
     const other = http.createServer((req, res) => {
         if (req.url === '/frame' && req.method === 'GET') {
             frame.document = req.headers['user-agent'] || null
@@ -83,7 +134,18 @@ function startStandIn() {
             })
             return res.end(`<html><body>stand-in<iframe src="http://127.0.0.2:${
                 other.address().port}/frame" style="width:0;height:0;border:0"></iframe><script>localStorage.setItem('token', '${
-                tokenExpiringIn(3600)}')</script></body></html>`)
+                tokenExpiringIn(3600)}')</script></body></html>`.replace(
+                '<script>localStorage', `<script src="/scripts/qwen-chat-fe/0.3.50/js/index.js"></script>` +
+                `<script>(${pageHook})(${state.holdListeners})</script><script>localStorage`))
+        }
+        if (req.url === '/scripts/qwen-chat-fe/0.3.50/js/index.js' && req.method === 'GET') {
+            // The front end's script: only its address matters here.
+            res.writeHead(200, { 'content-type': 'application/javascript' })
+            return res.end('')
+        }
+        if (req.url === '/api/challenged') {
+            res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            return res.end(CHALLENGE_PAGE)
         }
         if (req.url === '/auth' && req.method === 'GET') {
             // What the chat FE does on /auth for a profile that is signed in:
@@ -116,6 +178,13 @@ function startStandIn() {
                     cookie: req.headers.cookie || null,
                     authorization: req.headers.authorization || null,
                     requestId: req.headers['x-request-id'] || null,
+                    // What makes the call one of the page's own requests (Qwen2API-3ue.5).
+                    accept: req.headers.accept || null,
+                    acceptLanguage: req.headers['accept-language'] || null,
+                    source: req.headers.source || null,
+                    timezone: req.headers.timezone || null,
+                    version: req.headers.version || null,
+                    signed: req.headers['x-stub-v'] || null,
                     userAgent: req.headers['user-agent'] || null,
                     secChUa: req.headers['sec-ch-ua'] || null,
                     platformVersion: req.headers['sec-ch-ua-platform-version'] ?? null,
@@ -139,6 +208,18 @@ function startStandIn() {
                 res.write(frame)
             }, 150 * (at + 1)))
             return setTimeout(() => res.end(), 150 * SSE_FRAMES.length + 50)
+        }
+        if (req.url === '/api/sse-wide') {
+            res.writeHead(200, { 'content-type': 'text/event-stream' })
+            const bytes = Buffer.from(WIDE, 'utf8')
+            let at = 0
+            const step = () => {
+                if (at >= bytes.length) return res.end()
+                res.write(bytes.subarray(at, at + 7))
+                at += 7
+                setTimeout(step, 15)
+            }
+            return setTimeout(step, 30)
         }
         if (req.url === '/api/sse-long') {
             // For as long as the client listens.
@@ -165,6 +246,7 @@ function startStandIn() {
         other,
         origin: `http://127.0.0.1:${server.address().port}`,
         pageLoads: () => pageLoads,
+        state,
         longStream,
         frame
     }))));
@@ -293,6 +375,84 @@ async function main() {
         assert.equal(standIn.pageLoads(), loads)
         console.log('ok reuse: second call answered without reloading the page')
 
+        // The call is one of the page's own requests (Qwen2API-3ue.5): the
+        // browser's jar and the app's headers, with what the page's own
+        // requests carry besides — signed by the page's hook as its own are.
+        // This is the shape qwen.ai answered with JSON on 24.11, where a fetch
+        // with nothing but content-type got a challenge page.
+        assert.equal(again.body.challenge, undefined)
+        const shaped = JSON.parse(again.body.body)
+        assert.equal(shaped.method, 'POST')
+        assert.equal(shaped.authorization, 'Bearer app-token')
+        assert.equal(shaped.accept, 'application/json, text/plain, */*')
+        assert.equal(shaped.source, 'web')
+        // The page's clock, in the front end's format ('Tue Nov 24 2026 14:19:55 GMT+0000'),
+        // in the page's own zone. (Not the very second: the call and this check may straddle one.)
+        assert.match(shaped.timezone, /^\S{3} \S{3} \d\d \d{4} \d\d:\d\d:\d\d GMT[+-]\d{4}$/)
+        const zone = (() => {
+            const minutes = -new Date().getTimezoneOffset()
+            const pad = value => String(value).padStart(2, '0')
+            return `GMT${minutes < 0 ? '-' : '+'}${pad(Math.floor(Math.abs(minutes) / 60))}${pad(Math.abs(minutes) % 60)}`
+        })()
+        assert.ok(shaped.timezone.endsWith(zone), `${shaped.timezone} is not in the page's own zone (${zone})`)
+        // The front end's version, off the address of the script the page loaded.
+        assert.equal(shaped.version, '0.3.50')
+        // The page's language in Chrome's own form for it. Set by the call: in
+        // this very browser a request left to itself says only 'en-US' (as the
+        // worker's call did on prod on 24.11), where the page's own requests
+        // say this.
+        assert.equal(shaped.acceptLanguage, 'en-US,en;q=0.9')
+        // The caller's own request id is sent, as given.
+        assert.equal(shaped.requestId, 'smoke-1')
+        assert.equal(shaped.signed, '2.5.37')
+        console.log('ok page request: an XMLHttpRequest with the page\'s headers (the language as the page\'s own requests say it), signed by the page\'s hook')
+
+        // A WAF challenge page (Qwen2API-3ue.6): qwen.ai's answer, status 200
+        // and a page. The page's hook holds it back from a request's onload
+        // and onloadend; the call listens the other way and has it at once —
+        // not 35 s later, as a page that "stopped responding".
+        const challengedAt = Date.now()
+        const challenged = await egress({ url: '/api/challenged', body: undefined, timeoutMs: 30000 })
+        assert.equal(challenged.status, 200, JSON.stringify(challenged.body))
+        const verdict = challenged.body
+        assert.equal(verdict.status, 200)
+        assert.equal(verdict.headers['content-type'], 'text/html; charset=utf-8')
+        assert.equal(verdict.body, CHALLENGE_PAGE)
+        assert.equal(verdict.challenge, 'page')
+        assert.ok(Date.now() - challengedAt < 5000, `the challenge was recognised after ${Date.now() - challengedAt} ms`)
+        assert.equal((await health()).residentPages, 1, 'a challenge closed the page')
+        console.log(`ok challenge: the page the hooks held from onload reached the call anyway (${Date.now() - challengedAt} ms); the page stayed`)
+
+        // The same answer with the hooks hiding it from listeners too — more
+        // than the real page's are known to do: the worker reads it off the
+        // page's network, which no script in the page can hold back.
+        standIn.state.holdListeners = true
+        assert.equal((await call('/renew', { email })).status, 200)
+        const keptAt = Date.now()
+        const kept = await egress({ url: '/api/challenged', body: undefined, timeoutMs: 30000 })
+        assert.equal(kept.status, 200)
+        const readOff = kept.body
+        assert.equal(readOff.body, CHALLENGE_PAGE)
+        assert.equal(readOff.challenge, 'network')
+        assert.ok(Date.now() - keptAt < 5000, `the kept challenge was read off after ${Date.now() - keptAt} ms`)
+        assert.equal((await health()).residentPages, 1, 'a kept challenge closed the page')
+        // Relayed as a stream too: whole, the head and then the page.
+        const keptStream = await relay({ url: '/api/challenged', body: undefined, timeoutMs: 30000 })
+        const keptEvents = []
+        for (;;) {
+            const event = await keptStream.next()
+            if (event.type === 'end' || event.type === 'eof') break
+            keptEvents.push(event)
+        }
+        assert.deepEqual(keptEvents.map(event => event.type), ['head', 'chunk'])
+        assert.equal(Buffer.from(keptEvents[1].data, 'base64').toString('utf8'), CHALLENGE_PAGE)
+        // ...and the page answers the next call itself, once the answer is an ordinary one.
+        assert.equal((await egress({ body: '{"after":true}' })).status, 200)
+        assert.equal(JSON.parse((await egress()).body.body).body, '{"hello":"world"}')
+        standIn.state.holdListeners = false
+        assert.equal((await call('/renew', { email })).status, 200)
+        console.log(`ok kept challenge: read off the page's network (${Date.now() - keptAt} ms), relayed whole as a stream; the page stayed`)
+
         // The in-page abort timer.
         const slow = await egress({ url: '/api/slow', method: 'GET', body: undefined, timeoutMs: 500 })
         assert.equal(slow.status, 504)
@@ -369,6 +529,26 @@ async function main() {
         assert.equal((await health()).residentPages, 1)
         assert.equal((await egress({ body: '{"after":true}' })).status, 200)
         console.log(`ok cancel: closing the relay aborted the in-page fetch (${standIn.longStream.closedAt - cancelledAt} ms); the page stayed`)
+
+        // Every kind of multi-byte character, cut by the network where it
+        // may: the bytes come back as they were sent.
+        const wide = await relay({ url: '/api/sse-wide', timeoutMs: 5000 })
+        assert.equal((await wide.next()).type, 'head')
+        const wideBytes = []
+        for (;;) {
+            const event = await wide.next()
+            if (event.type === 'end') break
+            assert.equal(event.type, 'chunk', JSON.stringify(event))
+            wideBytes.push(Buffer.from(event.data, 'base64'))
+        }
+        assert.equal(Buffer.concat(wideBytes).toString('utf8'), WIDE)
+        // How many pieces the browser reports is its own (it merges ones that
+        // come close together); that they are several, each ending wherever
+        // the network cut, is what the relay has to carry.
+        assert.ok(wideBytes.length >= 6, `the pieces came as they arrived (${wideBytes.length})`)
+        assert.ok(wideBytes.slice(0, -1).some(piece => (piece[piece.length - 1] & 0xc0) === 0x80),
+            'no piece ended inside a multi-byte character')
+        console.log(`ok stream, wide characters: ${wideBytes.length} pieces of 7 bytes, two-, three- and four-byte characters whole`)
 
         // A stream does not pin the page: a live renewal reloads it without
         // waiting, and the stream ends.
@@ -487,6 +667,13 @@ async function main() {
             })
             assert.equal(asChrome.status, 200, JSON.stringify(asChrome.body))
             const seen = JSON.parse(asChrome.body.body)
+            // That call brought no request id: the worker gave it one, by which
+            // it knows qwen.ai's answer to it whoever else asks in the page.
+            assert.match(seen.requestId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+            // That call brought no Bearer: it went on the page's own session.
+            assert.match(seen.authorization, /^Bearer eyJ/)
+            assert.equal(seen.version, '0.3.50')
+            assert.equal(seen.acceptLanguage, 'en-US,en;q=0.9')
             // The page loaded for this browser: the frame on it reported afresh.
             await until(() => standIn.frame.page)
             const state = await (await fetch(`${presentedUrl}/health`)).json()

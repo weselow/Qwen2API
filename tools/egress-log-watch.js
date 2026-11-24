@@ -14,6 +14,9 @@
  * code behind: 0 = OK, 1 = look at this, 2 = nothing to judge. It reads text
  * and does nothing else: no network, no container access of its own. What it
  * does not recognize among the app's errors is listed rather than dropped.
+ *
+ * A WAF challenge page comes under status 200 (Qwen2API-3ue.6): the worker
+ * says so on the line, and this tool counts it as a challenge, not as a 200.
  */
 
 // Terminal colors, as the logger writes them on a console.
@@ -26,6 +29,11 @@ const APP_LINE = /^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \[(ERROR|WARN|INFO|SUCCESS|D
 const FLAG_LINE = /^ {2}(chatCreationTransport|completionsTransport): (["'])([a-z]+)\2,?$/
 
 const CHATS_NEW = '/api/v2/chats/new'
+// What the worker's log says of an answer that was a WAF challenge page, and
+// of one the page's scripts kept from the call (the worker read it off the
+// page's network): signin-worker/server.js, CHALLENGE_NOTE.
+const CHALLENGE = ' — WAF challenge page'
+const KEPT = ', kept from the call by the page'
 const REFUSED_PREFIX = 'app.chatsNewRefused.'
 // Why a resident page closes other than on purpose (evicted, shut down, proxy changed).
 const PAGE_DEATHS = ['unresponsive', 'page_crashed', 'context_closed', 'keepalive_failed', 'open_failed', 'operation_failed']
@@ -49,21 +57,33 @@ function note(report, at) {
     if (!report.last || at > report.last) report.last = at
 }
 
+/**
+ * What a line's note makes of a 200: the name of a WAF challenge page, or
+ * nothing for an ordinary answer.
+ * @param {string} [said] - What the worker wrote after the status
+ * @returns {string|null}
+ */
+const challengeName = said => {
+    if (!said || !said.startsWith(CHALLENGE)) return null
+    return said.slice(CHALLENGE.length).startsWith(KEPT) ? 'challenge.kept' : 'challenge'
+}
+
 function readWorkerLine(report, event, detail) {
     report.lines.worker++
     let found
     switch (event) {
         case 'egress':
-            if ((found = /^(\S+) -> (\d{3}) \((\d+)\/(\d+) pages\)$/.exec(detail))) {
-                bump(report, `egress.${found[1] === CHATS_NEW ? 'chatsNew' : found[1]}.${found[2]}`)
+            if ((found = /^(\S+) -> (\d{3}) \((\d+)\/(\d+) pages\)( — (.+))?$/.exec(detail))) {
+                bump(report, `egress.${found[1] === CHATS_NEW ? 'chatsNew' : found[1]}.${challengeName(found[5]) || found[2]}`)
                 report.pages.peak = Math.max(report.pages.peak, Number(found[3]))
                 report.pages.cap = Number(found[4])
             } else bump(report, 'unparsed.worker')
             return
         case 'egress-stream':
             if ((found = /^(\S+) -> (\d{3}) \(/.exec(detail))) bump(report, `stream.head.${found[2]}`)
-            else if (/^(\S+) end \(/.test(detail)) bump(report, 'stream.ended')
-            else if (/^(\S+) cancelled \(/.test(detail)) bump(report, 'stream.cancelled')
+            else if ((found = /^(\S+) end \(\d+ ms\)( — (.+))?$/.exec(detail))) {
+                bump(report, challengeName(found[2]) ? `stream.${challengeName(found[2])}` : 'stream.ended')
+            } else if (/^(\S+) cancelled \(/.test(detail)) bump(report, 'stream.cancelled')
             else if ((found = /^(\S+) ([a-z_]+) \(/.exec(detail))) bump(report, `stream.failed.${found[2]}`)
             else bump(report, 'unparsed.worker')
             return
@@ -76,8 +96,10 @@ function readWorkerLine(report, event, detail) {
             } else bump(report, 'unparsed.worker')
             return
         case 'resident-open':
-            if ((found = /^ok \((\d+)\/(\d+) pages\)$/.exec(detail))) {
+            if ((found = /^ok \((\d+)\/(\d+) pages, front-end (\S+)\)$/.exec(detail))) {
                 bump(report, 'pages.opened')
+                // What front end the page runs, as the address of its scripts shows it.
+                bump(report, `pages.frontEnd.${found[3]}`)
                 report.pages.peak = Math.max(report.pages.peak, Number(found[1]))
                 report.pages.cap = Number(found[2])
             } else bump(report, 'unparsed.worker')
@@ -202,6 +224,19 @@ function complaints(report) {
         why.push(`the worker answered ${notServed.reduce((sum, [, hits]) => sum + hits, 0)} egress call(s) with HTTP ${statuses}`)
     }
     if (total(report, 'stream.failed.')) why.push(`${total(report, 'stream.failed.')} stream(s) ended with an error`)
+    // Status 200, and a page: qwen.ai asked for a verification. Counted by
+    // itself — a 200 reads as nothing wrong.
+    const challenges = [...report.counts].filter(([name]) => /^egress\..*\.challenge(\.kept)?$/.test(name))
+    const challenged = challenges.reduce((sum, [, hits]) => sum + hits, 0) + count('stream.challenge') + count('stream.challenge.kept')
+    const kept = challenges.filter(([name]) => name.endsWith('.kept')).reduce((sum, [, hits]) => sum + hits, 0) +
+        count('stream.challenge.kept')
+    if (challenged) {
+        why.push(`qwen.ai answered ${challenged} call(s) with a WAF challenge page under status 200` +
+            (kept ? `; the page's scripts kept ${kept} of them from the call (the worker read those off its network)` : ''))
+    }
+    if (count('pages.frontEnd.unknown')) {
+        why.push(`${count('pages.frontEnd.unknown')} resident page(s) showed no front-end version: their calls carry no version header`)
+    }
     // What qwen.ai answered.
     for (const [name, hits] of report.counts) {
         const found = /^(egress\..+|stream\.head)\.([1-5]\d\d)$/.exec(name)
@@ -211,9 +246,9 @@ function complaints(report) {
     // A 401 head of a stream is the app's to recover from inside the request (one
     // reload, one retry), so one is counted and not complained of. Refused more
     // often than accepted is the shape of 23.11: every call refused, the page
-    // reloaded for each, refused again.
+    // reloaded for each, refused again. A challenged stream is no accepted one.
     const refused = count('stream.head.401')
-    const accepted = count('stream.head.200')
+    const accepted = count('stream.head.200') - count('stream.challenge') - count('stream.challenge.kept')
     if (refused > accepted) why.push(`streams refused as 401 more often than accepted: ${refused} refused, ${accepted} accepted`)
     if (count('renew.forced') && total(report, 'stream.head.') && !count('stream.ended')) {
         why.push(`${count('renew.forced')} forced reload(s), and not one stream finished`)

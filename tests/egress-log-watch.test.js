@@ -18,7 +18,7 @@ const COMPLETIONS = '/api/v2/chat/completions'
 // chats/new, then the stream of the answer — which ends as `ending` says.
 function generation(minute, { first = false, ending = 'end' } = {}) {
     return [
-        ...(first ? [`${at(minute)} resident-open ok (1/16 pages)`] : []),
+        ...(first ? [`${at(minute)} resident-open ok (1/16 pages, front-end 0.3.50)`] : []),
         `${at(minute)} egress /api/v2/chats/new -> 200 (1/16 pages)`,
         `${at(minute)} request POST /egress -> 200 850ms`,
         `${at(minute)} egress-stream ${COMPLETIONS} -> 200 (900 ms, 1/16 pages)`,
@@ -339,6 +339,78 @@ test('as a command it reads stdin and leaves its verdict as the exit code', () =
     assert.match(empty.stdout, /verdict: NOTHING TO JUDGE/)
 })
 
+test('a WAF challenge page under status 200 is counted as a challenge, not as a 200, and said', () => {
+    // What the worker prints of one (Qwen2API-3ue.6): the status, and the note.
+    const lines = [
+        `${at(0)} resident-open ok (1/16 pages, front-end 0.3.50)`,
+        `${at(1)} egress /api/v2/chats/new -> 200 (1/16 pages) — WAF challenge page`,
+        `${at(2)} egress /api/v2/chats/new -> 200 (1/16 pages) — WAF challenge page, kept from the call by the page`,
+        `${at(3)} egress-stream ${COMPLETIONS} -> 200 (5 ms, 1/16 pages)`,
+        `${at(3)} egress-stream ${COMPLETIONS} end (1200 ms) — WAF challenge page`,
+        `${at(4)} egress-stream ${COMPLETIONS} -> 200 (5 ms, 1/16 pages)`,
+        `${at(4)} egress-stream ${COMPLETIONS} end (1010 ms) — WAF challenge page, kept from the call by the page`,
+        ...generation(5)
+    ]
+    const report = watch.summarize(lines)
+    assert.equal(report.counts.get('egress.chatsNew.challenge'), 1)
+    assert.equal(report.counts.get('egress.chatsNew.challenge.kept'), 1)
+    assert.equal(report.counts.get('egress.chatsNew.200'), 1)
+    assert.equal(report.counts.get('stream.challenge'), 1)
+    assert.equal(report.counts.get('stream.challenge.kept'), 1)
+    assert.equal(report.counts.get('stream.ended'), 1)
+    assert.equal(report.unparsedSize, undefined)
+    assert.equal([...report.counts].filter(([name]) => name.startsWith('unparsed.')).length, 0)
+    assert.equal(report.pages.frontEnd, undefined)
+    assert.equal(report.counts.get('pages.frontEnd.0.3.50'), 1)
+    const { verdict, why, text } = watch.render(report)
+    assert.equal(verdict, 'LOOK')
+    assert.deepEqual(why, ['qwen.ai answered 4 call(s) with a WAF challenge page under status 200; ' +
+        "the page's scripts kept 2 of them from the call (the worker read those off its network)"])
+    assert.match(text, /challenge\.kept {2}1/)
+})
+
+test('a challenged stream is no accepted one: refusals are counted against the answers qwen.ai gave', () => {
+    const lines = [
+        // One answer that was a challenge page: a 200 to the eye.
+        `${at(0)} egress-stream ${COMPLETIONS} -> 200 (5 ms, 1/16 pages)`,
+        `${at(0)} egress-stream ${COMPLETIONS} end (1200 ms) — WAF challenge page`,
+        // And two refusals of the session.
+        `${at(1)} egress-stream ${COMPLETIONS} -> 401 (5 ms, 1/16 pages)`,
+        `${at(1)} egress-stream ${COMPLETIONS} end (20 ms)`,
+        `${at(2)} egress-stream ${COMPLETIONS} -> 401 (5 ms, 1/16 pages)`,
+        `${at(2)} egress-stream ${COMPLETIONS} end (20 ms)`
+    ]
+    const { why } = watch.render(watch.summarize(lines))
+    // One answer was a challenge page, which is no accepted answer: two refusals against none.
+    assert.ok(why.includes('streams refused as 401 more often than accepted: 2 refused, 0 accepted'), why.join('\n'))
+})
+
+test('a stream a script of the page cut is said as a stream that failed; it is not the app going away', () => {
+    const { verdict, why, text } = watch.render(watch.summarize([
+        `${at(0)} resident-open ok (1/16 pages, front-end 0.3.50)`,
+        `${at(1)} egress-stream ${COMPLETIONS} -> 200 (5 ms, 1/16 pages)`,
+        `${at(1)} egress-stream ${COMPLETIONS} page_fault (120 ms)`,
+        appLine(1, 'ERROR', 'REQUEST', '发送聊天请求失败: completions через signin-worker не прошёл (page_fault): signin-worker egress: page_fault'),
+        ...generation(20)
+    ]))
+    assert.equal(verdict, 'LOOK')
+    assert.deepEqual(why, ['the worker could not serve 1 call(s)', '1 stream(s) ended with an error'])
+    assert.match(text, /failed\.page_fault {2}1/)
+    assert.match(text, /completions\.page_fault {2}1/)
+    assert.equal(watch.summarize([`${at(3)} egress-stream ${COMPLETIONS} page_fault (9 ms)`]).counts.get('stream.cancelled'), undefined)
+})
+
+test('a page that showed no front-end version is said: its calls carry no version header', () => {
+    const { verdict, why } = watch.render(watch.summarize([
+        `${at(0)} resident-open ok (1/16 pages, front-end unknown)`,
+        ...generation(1)
+    ]))
+    assert.equal(verdict, 'LOOK')
+    assert.deepEqual(why, ['1 resident page(s) showed no front-end version: their calls carry no version header'])
+    // A worker from before the front end was logged (no such word on the line) is not a shape this tool knows.
+    assert.equal(watch.summarize([`${at(0)} resident-open ok (1/16 pages)`]).counts.get('unparsed.worker'), 1)
+})
+
 test('the shapes it reads are the shapes the code prints', () => {
     const worker = read('signin-worker/server.js')
     const residents = read('signin-worker/lib/resident-pages.js')
@@ -348,12 +420,14 @@ test('the shapes it reads are the shapes the code prints', () => {
     // Reword one of these and the line stops being counted: keep the tool with it.
     const printed = [
         [worker, "log('egress', `${new URL(request.url).pathname} -> ${result.status} ("],
+        [worker, '(CHALLENGE_NOTE[result.challenge] || \'\')'],
+        [worker, "const CHALLENGE_NOTE = { page: ' — WAF challenge page', network: ' — WAF challenge page, kept from the call by the page' }"],
         [worker, '`${pathname} -> ${event.status} (${Date.now() - started} ms, `'],
         [worker, '`${pathname} cancelled (${Date.now() - started} ms)`'],
-        [worker, '`${pathname} end (${Date.now() - started} ms)`'],
+        [worker, '`${pathname} end (${Date.now() - started} ms)'],
         [worker, '`${pathname} ${code} (${Date.now() - started} ms)`'],
-        [worker, 'log(\'request\', `${req.method} ${req.url} -> ${res.statusCode} ${Date.now() - started}ms`)'],
-        [residents, "log('resident-open', `ok (${pages.size}/${maxPages} pages)`)"],
+        [worker, "log('request', `${req.method} ${req.url} -> ${res.statusCode} ${Date.now() - started}ms`)"],
+        [residents, "log('resident-open', `ok (${pages.size}/${maxPages} pages, front-end "],
         [residents, "log('resident-close', `${reason} (${pages.size} pages)`)"],
         [worker, "log('renew', `ok${forced ? ' (forced)' : ''} (${sessions.size} sessions)`)"],
         [worker, "log('session', `acquired (${sessions.size} sessions)`)"],
