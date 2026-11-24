@@ -24,15 +24,21 @@
  * reload.
  *
  * Since Qwen2API-3ue.1 it is also the egress service: a resident page per
- * active account carries qwen.ai API calls as in-page fetches, so upstream
- * sees the browser's TLS and its live cookies.
+ * active account carries qwen.ai API calls, sent from inside the page the way
+ * the page's own code sends its requests, so upstream sees the browser's TLS,
+ * its live cookies and its headers (Qwen2API-3ue.5).
  *
  *   POST /egress {email, url, method, headers, body, timeoutMs, proxy?}
  *                                          -> {status, headers, body, cookies[]}
  *
  * With `stream: true` (Qwen2API-3ue.3) /egress answers with a relay instead:
  * one JSON event per line while qwen.ai's answer arrives, and the app cutting
- * its connection cuts the fetch inside the page (relayEgress).
+ * its connection cuts the request inside the page (relayEgress).
+ *
+ * qwen.ai's status and body always travel inside a 200: a WAF challenge page
+ * too, under whatever status it came. The worker names it in its log (and
+ * hands it on whether the page's scripts did or kept it back,
+ * Qwen2API-3ue.6); what it means is the app's to say.
  *
  * Design: docs/browser-egress-design.md.
  */
@@ -81,6 +87,12 @@ const relayWriter = (res, gone) => event => {
 // Egress relays request bodies built by the app (agent contexts, images).
 const EGRESS_BODY_LIMIT = 32 * 1024 * 1024
 
+// How the log names a WAF challenge page (Qwen2API-3ue.6), by who got to see
+// qwen.ai's answer: the page's scripts handed it to the call ('page'), or
+// kept it back and the worker read it off the page's network ('network').
+// Nothing to say for any other answer. tools/egress-log-watch.js reads these.
+const CHALLENGE_NOTE = { page: ' — WAF challenge page', network: ' — WAF challenge page, kept from the call by the page' }
+
 function createServer(overrides = {}) {
     const signer = overrides.signer || require('./lib/browser-signin')
     const config = {
@@ -112,6 +124,10 @@ function createServer(overrides = {}) {
         // A stream is relayed, not buffered: the whole-answer cap is not its.
         // Off unless set.
         egressMaxStreamBytes: overrides.egressMaxStreamBytes ?? envInt('SIGNIN_EGRESS_MAX_STREAM_BYTES', 0),
+        // A WAF challenge page the page's scripts keep from the call is read
+        // off the page's network this long after qwen.ai answered
+        // (Qwen2API-3ue.6).
+        keptGraceMs: overrides.keptGraceMs ?? 1000,
         // Grace periods, all bounded so a wedged browser cannot stall a request.
         drainMs: overrides.drainMs ?? 5000,
         backstopMs: overrides.backstopMs ?? 5000,
@@ -218,6 +234,7 @@ function createServer(overrides = {}) {
         keepAliveMs: config.keepAliveMs,
         maxBytes: config.egressMaxBytes,
         maxStreamBytes: config.egressMaxStreamBytes,
+        keptGraceMs: config.keptGraceMs,
         drainMs: config.drainMs,
         backstopMs: config.backstopMs,
         closeMs: config.closeMs,
@@ -394,13 +411,14 @@ function createServer(overrides = {}) {
             defaultTimeoutMs: config.timeoutMs,
             maxTimeoutMs: config.egressMaxTimeoutMs
         })
-        // The lock covers finding or opening the page only; the fetch itself
+        // The lock covers finding or opening the page only; the call itself
         // runs free, so calls on one page stay concurrent.
         const entry = await serialized(email, () => residents.acquire(email,
             proxy ?? residents.get(email)?.proxy ?? sessions.get(email)?.proxy ?? null))
         if (request.stream) return relayEgress(req, res, entry, request)
         const result = await residents.fetch(entry, request)
-        log('egress', `${new URL(request.url).pathname} -> ${result.status} (${residents.stats().residentPages}/${config.maxPages} pages)`)
+        log('egress', `${new URL(request.url).pathname} -> ${result.status} (${residents.stats().residentPages}/${config.maxPages} pages)` +
+            (CHALLENGE_NOTE[result.challenge] || ''))
         return result
     }
 
@@ -418,8 +436,8 @@ function createServer(overrides = {}) {
      * After it the status is spent, so a failure travels as the last event.
      *
      * The app cancelling is it closing the connection — the body of its own
-     * request is long gone by then. That ends the stream here AND the fetch
-     * in the page (resident-pages.js#abort): a fetch already running there is
+     * request is long gone by then. That ends the stream here AND the request
+     * in the page (resident-pages.js#abort): a request already running there is
      * beyond a Node-side timer, let alone a socket this process no longer holds.
      */
     async function relayEgress(req, res, entry, request) {
@@ -468,7 +486,7 @@ function createServer(overrides = {}) {
             }
             await frame({ type: 'end', cookies: result.cookies })
             res.end()
-            log('egress-stream', `${pathname} end (${Date.now() - started} ms)`)
+            log('egress-stream', `${pathname} end (${Date.now() - started} ms)${CHALLENGE_NOTE[result.challenge] || ''}`)
         } catch (error) {
             const code = error.code && STATUS_FOR_CODE[error.code] ? error.code : 'browser_error'
             if (!res.headersSent) {

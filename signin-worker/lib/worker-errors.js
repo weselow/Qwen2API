@@ -23,6 +23,9 @@ const STATUS_FOR_CODE = {
     page_closed: 502,
     egress_failed: 502,
     egress_too_large: 502,
+    // A script of the page cut the call or broke its reporting: the page's
+    // doing, not qwen.ai's and not the account's (Qwen2API-3ue.6)
+    page_fault: 502,
     resident_capacity: 503,
     egress_timeout: 504
 }
