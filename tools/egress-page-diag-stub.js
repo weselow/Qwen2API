@@ -42,7 +42,10 @@
  *   STUB_MODE=own-referrer-needed
  *                         completions is answered with the punish envelope unless the request's referer is
  *                         /c/<chat>, as a fetch from that address of the page sends it
- *   In all three, as qwen.ai does (2026-11-25), a completions without the chat id in the address is
+ *   STUB_MODE=own-xhr-ok
+ *                         for --isolate-xhr=1: completions is answered with SSE frames when the request carries
+ *                         x-accel-buffering: no, and with the punish envelope when it does not
+ *   In all of them, as qwen.ai does (2026-11-25), a completions without the chat id in the address is
  *   answered with the server's own validation error, and the page has the request hook of the
  *                         waf mode.
  *   STUB_PORT             default 3847
@@ -54,7 +57,7 @@ const hang = mode === 'hang' || mode === 'hangfreeze'
 // ui, ui-punish: an input and a send button on the page; a message goes out through them.
 const ui = mode === 'ui' || mode === 'ui-punish'
 // The three modes for --like-own=1.
-const own = mode === 'own-ok' || mode === 'own-ok-control-punished' || mode === 'own-referrer-needed'
+const own = mode === 'own-ok' || mode === 'own-ok-control-punished' || mode === 'own-referrer-needed' || mode === 'own-xhr-ok'
 const waf = mode === 'waf' || ui || own
 // unauthorized-first: the first chats/new is answered at once, no challenge, with the session refused; the page rotates its token 1.5 s after its script starts.
 const refuseFirst = mode === 'unauthorized-first'
@@ -62,6 +65,8 @@ const refuseFirst = mode === 'unauthorized-first'
 const punish = mode === 'punish' || mode === 'ui-punish'
 // own-referrer-needed: completions is punished unless the request carries the page's own referer for it.
 const referrerNeeded = mode === 'own-referrer-needed'
+// own-xhr-ok: completions is punished unless the request carries x-accel-buffering: no.
+const accelNeeded = mode === 'own-xhr-ok'
 // own-ok-control-punished: the worker's own call — an XMLHttpRequest, marked by the page's hook — is punished still.
 const controlPunished = mode === 'own-ok-control-punished'
 let refusalsLeft = refuseFirst ? 1 : 0
@@ -176,7 +181,7 @@ http.createServer((req, res) => {
                 data: { code: 'RequestValidationError', details: JSON.stringify(["Field 'query -> chat_id': Field required"]) }
             }))
         }
-        if (punish || (controlPunished && req.headers['x-stub-v']) ||
+        if (punish || (controlPunished && req.headers['x-stub-v']) || (accelNeeded && req.headers['x-accel-buffering'] !== 'no') ||
             (referrerNeeded && !/\/c\/[^/]+$/.test(String(req.headers.referer || '')))) {
             res.writeHead(200, { 'content-type': 'application/json' })
             return res.end(JSON.stringify({

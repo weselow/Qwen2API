@@ -9,7 +9,7 @@
  *        [--origin=https://chat.qwen.ai] [--out=/tmp/egress-page-diag]
  *        [--headless-mode=shell|chrome] [--settle-ms=0] [--transport=worker|xhr|fetch]
  *        [--like-fe=1] [--completions=1] [--ui-send=1] [--signed=1]
- *        [--bearer-compare=1] [--like-own=1] [--loopback-only=1] [--fast=1]
+ *        [--bearer-compare=1] [--like-own=1] [--isolate-xhr=1] [--loopback-only=1] [--fast=1]
  *
  * How the call is sent:
  *   --transport=worker  exactly what the worker sends (Qwen2API-3ue.5): its
@@ -58,6 +58,12 @@
  *                    too, it is the time that changed, not the shape of the
  *                    call. (25.11: qwen.ai takes no completions without the
  *                    chat id in the address — the page's own carries it.)
+ *   --isolate-xhr=1 one completions call by the worker's own code — the XMLHttpRequest
+ *                    that was refused (25.11, 03:46 UTC) — with two things of the
+ *                    page's own request added: its body (as the app builds it)
+ *                    and x-accel-buffering: no. Nothing else differs. Tells
+ *                    whether those two are what the refusal was about, or
+ *                    whether the call has to be a fetch.
  *   --fast=1        the pause between calls cut to 2 s — for --loopback-only=1
  *                    rehearsals only; a live run refuses it.
  * On 2026-11-24 the worker's old way (fetch, content-type only) got a WAF
@@ -134,6 +140,8 @@ const SIGNED = args.signed === '1'
 const BEARER_COMPARE = args['bearer-compare'] === '1'
 // Our completions call the way the page's own front end makes it: twice, see the header.
 const LIKE_OWN = args['like-own'] === '1'
+// The worker's own completions call with the page's body and x-accel-buffering: no added.
+const ISOLATE_XHR = args['isolate-xhr'] === '1'
 const LOOPBACK_ONLY = args['loopback-only'] === '1'
 const MAX_BYTES = 8 * 1024 * 1024
 const BACKSTOP_MS = 5000
@@ -520,7 +528,7 @@ async function main() {
         }
         console.error('E4 diagnostic stopped by its own watchdog')
         process.exit(3)
-    }, UI_SEND || LIKE_OWN ? 780000 : 420000).unref()
+    }, UI_SEND || LIKE_OWN || ISOLATE_XHR ? 780000 : 420000).unref()
     const page = context.pages()[0]
     log('life', `browser open in ${tOpen} ms`)
 
@@ -723,18 +731,18 @@ async function main() {
      * One completions call from the page, by the worker's own streaming code
      * (pageCall with a channel): what qwen.ai answered with its first frames.
      */
-    async function completions(chatId, signature = {}) {
+    async function completions(chatId, signature = {}, body = null) {
         relayed.length = 0
         const started = Date.now()
-        const signed = Object.keys(signature).length ? ` and the page's own ${Object.keys(signature).join(', ')}` : ''
-        log('completions', `the stream call starts (the worker's own code, with the headers the worker gives it${signed})`)
+        const added = Object.keys(signature).length ? `, and ${Object.keys(signature).join(', ')}` : ''
+        log('completions', `the stream call starts (the worker's own code, a XMLHttpRequest with the headers the worker gives it${added}${body ? ', with the body the app builds' : ''})`)
         const running = page.evaluate(egress.pageCall, {
             url: `/api/v2/chat/completions?chat_id=${chatId}`,
             init: {
                 method: 'POST',
                 // What the app puts on it: the worker adds the page's own headers.
                 headers: { 'content-type': 'application/json', accept: 'application/json', ...signature },
-                body: JSON.stringify({
+                body: body || JSON.stringify({
                     model: 'qwen3.7-plus', max_tokens: 64, stream: true,
                     chat_id: chatId, chatId, parent_id: null, parentId: null,
                     messages: [{ role: 'user', content: 'Say pong', parent_id: null, parentId: null }]
@@ -762,7 +770,8 @@ async function main() {
         }
         log('completions', `${said.ok ? 'ok' : `not ok: ${said.error}`} · HTTP ${said.status} · ${said.type || '-'} · ` +
             `${said.bytes} bytes, ${said.frames} SSE frame(s) · ${said.answer} · ${said.took} ms`)
-        log('completions', `starts: ${cut(answered.replace(/\s+/g, ' '), 420)}`)
+        said.starts = cut(answered.replace(/\s+/g, ' '), 600)
+        log('completions', `starts: ${cut(said.starts, 420)}`)
         return said
     }
 
@@ -1049,6 +1058,21 @@ async function main() {
         return report
     }
 
+    /** All of --isolate-xhr: one chats/new, then the worker's own completions call 1.5 s later, with the page's body and x-accel-buffering: no. */
+    async function isolateXhr() {
+        const report = {}
+        await pauseBetweenCalls()
+        const created = await attempt('isolate-chats-new')
+        if (!created.chatId) report.completions = { chatsNew: created.outcome }
+        else {
+            await sleep(1500)
+            report.completions = { chatsNew: created.outcome, ...(await completions(created.chatId, { 'x-accel-buffering': 'no' }, ownStyleBody(created.chatId))) }
+        }
+        report.stateAfter = await withTimeout(page.evaluate(pageState), 8000, 'the page').catch(error => ({ error: cut(error.message, 100) }))
+        log('life', `the page shows: ${JSON.stringify(report.stateAfter)}`)
+        return report
+    }
+
     async function facts() {
         try {
             return await withTimeout(page.evaluate(async () => ({
@@ -1097,6 +1121,8 @@ async function main() {
         out.ui = await ownMessage()
     } else if (LIKE_OWN) {
         out.own = await ownLike()
+    } else if (ISOLATE_XHR) {
+        out.isolate = await isolateXhr()
     } else {
         const first = await attempt('call-1')
         out.call1 = first
@@ -1336,6 +1362,16 @@ async function main() {
             else console.log(`  ${JSON.stringify(control)}`)
             console.log('  what it says: both passed — it is the time that changed, not the shape of the call; only this one refused — the shape of the call is what was refused')
         }
+    }
+    if (out.isolate) {
+        console.log('--- the worker\'s own completions call, with the page\'s body and x-accel-buffering: no added')
+        const call = out.isolate.completions
+        console.log(`chats/new before it: ${call.chatsNew}`)
+        if (call.took !== undefined) {
+            console.log(`  XMLHttpRequest + the app's body + x-accel-buffering: no: HTTP ${call.status} [${call.type}] · ${call.bytes} bytes, ${call.frames} SSE frame(s) · ${call.answer} · ${call.took} ms`)
+            console.log(`  starts: ${cut(call.starts, 420)}`)
+        }
+        console.log(`the page shows after it: ${JSON.stringify(out.isolate.stateAfter)}`)
     }
     console.log('--- page facts')
     console.log('ready:', JSON.stringify(out.factsReady))
