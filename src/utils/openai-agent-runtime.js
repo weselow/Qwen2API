@@ -6,7 +6,8 @@ const {
   containsOrphanProtocolResidue,
   ANSWER_PHASES
 } = require('./tool-prompt.js')
-const { consumeSSEStream, createUpstreamResponseFilter } = require('./sse.js')
+const { createUpstreamResponseFilter } = require('./sse.js')
+const { consumeWhileClientStays } = require('./client-gone.js')
 const { mergeUpstreamUsage } = require('./precise-tokenizer.js')
 const { createUpstreamDeltaNormalizer, createClientToolNamePredicate } = require('./chat-helpers.js')
 const {
@@ -333,7 +334,7 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
   const pendingImages = []
   let upstreamUsage = null // 上游逐帧累计的 usage（DashScope 命名已归一化；null = 还没报）
 
-  const streamResult = await consumeSSEStream(upstreamResponse, async (frame) => {
+  const streamResult = await consumeWhileClientStays(upstreamResponse, async (frame) => {
     if (!frame.data || frame.data.trim() === '[DONE]') return
     const decoded = isJson(frame.data) ? JSON.parse(frame.data) : null
     if (decoded === null) return
@@ -460,7 +461,12 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
       if (textRunaway.cutRule()) return
     }
     await appendAnswer(normalized.content)
-  }, { shouldStop: () => stopRequested })
+  }, {
+    shouldStop: () => stopRequested,
+    // Read for as long as the client stays: it going away closes this attempt's
+    // upstream and ends the read as ClientGoneError (utils/client-gone.js).
+    client: options.client || null
+  })
 
   const textChannelCut = !!textRunaway?.cutRule()
   // Tras un corte no se hace flush de ningun parser de texto: lo que queda en el buffer es
@@ -772,6 +778,10 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       throw error
     }
   }
+  // Gone with the client: what its request says (utils/client-gone.js), or what
+  // a caller that keeps a watch of its own says. Neither a failover nor a retry
+  // is started for it.
+  const clientDisconnected = () => options.client?.gone() === true || options.isClientDisconnected?.() === true
   let attemptsMade = 0
   // 协议恢复重试（intercepted / malformed_protocol 共享）整个请求只允许一次。用过之后 el
   // snapshot se presenta sin esa evidencia, y el segundo interceptado/残缺 se juzga por las
@@ -805,7 +815,7 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
         : null
       if (!replayBody || !currentAccount?.email || !(error.accountFailureRecorded || challengeFailure) ||
           attemptNumber >= maxAttempts || typeof requestSender !== 'function' ||
-          options.isClientDisconnected?.() || (challengeFailure && challengeFailovers >= 1)) {
+          clientDisconnected() || (challengeFailure && challengeFailovers >= 1)) {
         throw error
       }
 
@@ -922,7 +932,7 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
         attempts: attemptNumber
       }
     }
-    if (attemptNumber >= maxAttempts || typeof requestSender !== 'function' || options.isClientDisconnected?.()) break
+    if (attemptNumber >= maxAttempts || typeof requestSender !== 'function' || clientDisconnected()) break
 
     if (PROTOCOL_RECOVERY_REASONS.has(evaluation.reason)) {
       protocolRecoveryRetried = true
