@@ -34,6 +34,10 @@
  *                         harvests) is refused, as qwen.ai refused the app's token on 2026-11-24.
  *                         For --ui-send=1 with --signed=1 and --bearer-compare=1.
  *   STUB_MODE=ui-punish  the same, but the page's own completions is answered with the punish envelope.
+ *   STUB_MODE=own-ok     for --like-own=1: POST /api/v2/chat/completions is answered with SSE frames whatever its referer
+ *   STUB_MODE=own-referrer-needed
+ *                         for --like-own=1: completions is answered with the punish envelope unless the request's
+ *                         referer is /c/<chat>, as a fetch from that address of the page sends it
  *   STUB_PORT             default 3847
  */
 const http = require('http')
@@ -47,6 +51,8 @@ const waf = mode === 'waf' || ui
 const refuseFirst = mode === 'unauthorized-first'
 // punish: completions is answered with the risk control's envelope under status 200, as qwen.ai did from the page on 2026-11-24.
 const punish = mode === 'punish' || mode === 'ui-punish'
+// own-referrer-needed: completions is punished unless the request carries the page's own referer for it.
+const referrerNeeded = mode === 'own-referrer-needed'
 let refusalsLeft = refuseFirst ? 1 : 0
 const freezeAfterMs = mode === 'freeze' ? 2500 : mode === 'hangfreeze' ? 1500 : 0
 const port = Number(process.env.STUB_PORT || 3847)
@@ -151,7 +157,7 @@ http.createServer((req, res) => {
     }
     if (pathname === '/api/v2/chats/new' && hang) return // never answers
     if (pathname === '/api/v2/chat/completions') {
-        if (punish) {
+        if (punish || (referrerNeeded && !/\/c\/[^/]+$/.test(String(req.headers.referer || '')))) {
             res.writeHead(200, { 'content-type': 'application/json' })
             return res.end(JSON.stringify({
                 ret: ['FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试'],
