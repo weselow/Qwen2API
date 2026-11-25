@@ -2130,3 +2130,1746 @@ test('Qwen2API-jr9: the app puts exactly content-type and x-request-id on /egres
     // The Bearer is the page's, the worker's to send: it is not the app's to bring.
     assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false])
 })
+
+/* ------------------ whole-answer calls to any address of the origin (Qwen2API-03v) -- */
+
+// The JSON calls of images/video and of file upload — chat info, video task
+// status, STS token, file parse — behind the flag of chats/new (enabled()).
+const CHAT_INFO = 'https://chat.qwen.ai/api/v2/chats/chat-1'
+const TASK_STATUS = 'https://chat.qwen.ai/api/v1/tasks/status/task-1'
+const STS_TOKEN = 'https://chat.qwen.ai/api/v1/files/getstsToken'
+const CHAT = { success: true, data: { chat: { id: 'chat-1' } } }
+// What qwen.ai answers a file's parse with, and what it is asked for.
+const STS = {
+    access_key_id: 'test-access-key', access_key_secret: 'test-access-secret', security_token: 'test-security-token',
+    file_url: 'https://example.invalid/upload.txt', file_path: 'test/upload.txt', bucketname: 'upload-proxy-test',
+    region: 'oss-cn-hangzhou', file_id: 'upload-proxy-file'
+}
+const STS_ASK = { filename: 'upload.txt', filesize: 14, filetype: 'document' }
+// A JSON call's answer as the test scripts it: qwen.ai's status and body inside.
+const json = (payload, status = 200) => egress(payload, [], status)
+const punish = () => json({ ret: ['FAIL_SYS_USER_VALIDATE'], data: { url: `https://chat.qwen.ai/punish?${SECRET}` } })
+// The page's answer to a whole-answer call: one reply for every call, or as
+// many as the array holds (its last one then, for every call after).
+const pageAnswering = replies => {
+    worker.script.egress = () => (typeof replies === 'function' ? replies() : Array.isArray(replies) ? (replies.length > 1 ? replies.shift() : replies[0]) : replies)
+}
+// What a failed whole-answer call is to the client, for the callers that
+// answer ChatCreationError by code: the category, the status, and the fixed
+// message — never a body, a cause or a worker's detail.
+const callRefused = (code, status) => error => {
+    assert.ok(error instanceof browserEgress.EgressCallError, `an EgressCallError, not ${error?.name}`)
+    assert.ok(error instanceof ChatCreationError)
+    assert.equal(error.code, code)
+    assert.equal(error.status, status)
+    assert.equal(error.response, undefined)
+    assert.equal(error.cause, undefined)
+    assert.doesNotMatch(JSON.stringify(error), new RegExp(SECRET))
+    return true
+}
+
+test('egressJson: a GET leaves from the page, on the page\'s own session, and comes back in axios\' shape', async () => {
+    const account = givenAccount()
+    pageAnswering(() => egress(CHAT, [cookie('cna', 'from-page')]))
+
+    const response = await browserEgress.egressJson({ account, url: CHAT_INFO })
+    assert.deepEqual(response, {
+        status: 200, statusText: 'OK', headers: { 'content-type': 'application/json' }, data: CHAT
+    })
+    // The jar the page holds now is the session's.
+    assert.equal(jarPairs(CHAT_INFO).cna, 'from-page')
+
+    assert.deepEqual(direct, [], 'no axios call reaches qwen.ai')
+    const [call] = worker.sent('/egress')
+    assert.equal(call.url, CHAT_INFO)
+    assert.equal(call.method, 'GET')
+    assert.equal(call.body, undefined, 'nothing to carry')
+    assert.equal(call.proxy, null)
+    assert.equal(call.timeoutMs, browserEgress.JSON_TIMEOUT_MS)
+    assert.equal(call.stream, undefined, 'a whole-answer call: the page makes it an XMLHttpRequest, as chats/new')
+    // A call without a body states no content-type. No Bearer either: the page's token is its own (Qwen2API-jr9).
+    assert.deepEqual(Object.keys(call.headers), ['x-request-id'])
+    assert.match(call.headers['x-request-id'], /^[0-9a-f-]{36}$/)
+    assert.deepEqual(logs, [])
+})
+
+test('egressJson: a POST carries its body as text, with content-type, and no Bearer', async () => {
+    const account = givenAccount()
+    pageAnswering(json({ success: true, data: {} }))
+
+    const response = await browserEgress.egressJson({
+        account, url: STS_TOKEN, method: 'POST', body: JSON.stringify(STS_ASK), timeoutMs: 25000
+    })
+    assert.deepEqual(response.data, { success: true, data: {} })
+    const [call] = worker.sent('/egress')
+    assert.equal(call.method, 'POST')
+    assert.equal(call.timeoutMs, 25000, 'the caller\'s budget where it brings one')
+    assert.deepEqual(JSON.parse(call.body), STS_ASK)
+    assert.deepEqual(Object.keys(call.headers).sort(), ['content-type', 'x-request-id'])
+    assert.equal(call.headers['content-type'], 'application/json')
+    assert.equal(bringsBearer(call), false)
+    assert.deepEqual(direct, [])
+})
+
+test('egressJson: an answer that is no JSON comes back as its text', async () => {
+    const account = givenAccount()
+    // A page, but no challenge: nothing to recover from, and the caller's to read.
+    const maintenance = '<!doctype html><html><title>Maintenance</title></html>'
+    pageAnswering(() => egress(maintenance))
+
+    const response = await browserEgress.egressJson({ account, url: CHAT_INFO })
+    assert.equal(response.status, 200)
+    assert.equal(response.data, maintenance)
+    assert.deepEqual(worker.routes(), ['/egress'])
+})
+
+test('egressJson: a session refused is recovered inside the call — live reload, then exactly one retry', async () => {
+    const account = givenAccount()
+    pageAnswering([unauthorized(), egress(CHAT)])
+    worker.script.renew = body => sessionOnPage(body, harvested('renewed'))
+
+    const response = await browserEgress.egressJson({ account, url: CHAT_INFO })
+    assert.deepEqual(response.data, CHAT)
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'])
+    assert.deepEqual(worker.sent('/renew')[0], { email: EMAIL, proxy: null, force: true })
+    // The retry rides the page's session, not a token of the store's.
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false])
+    assert.equal(current().token, tokenWith('renewed'))
+})
+
+test('egressJson: refused again after the reload — one retry, then the failure as chats/new names it, and no password', async () => {
+    const account = givenAccount()
+    pageAnswering(() => unauthorized())
+
+    await assert.rejects(browserEgress.egressJson({ account, url: CHAT_INFO }),
+        callRefused('upstream_session_unauthorized', 502))
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'])
+    // Not now, and not once the reload's bookkeeping has settled: this call
+    // escalates to nothing — chats/new accepted the session for its request.
+    await until(() => sessionPersistence.renewals.size === 0)
+    assert.equal(worker.count('/session'), 0)
+    // The reload did what it does — the session is the one it published — and qwen.ai refused that one too.
+    assert.equal(current().token, tokenWith('renewed'))
+})
+
+test('egressJson: an HTTP 401 is the refused session too', async () => {
+    const account = givenAccount()
+    pageAnswering(() => json('', 401))
+
+    await assert.rejects(browserEgress.egressJson({ account, url: TASK_STATUS }),
+        callRefused('upstream_session_unauthorized', 502))
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'])
+})
+
+test('egressJson: a dead profile is re-logged in with the password before the retry', async () => {
+    const account = givenAccount()
+    // The page cannot be opened, and the reload finds it logged out.
+    worker.script.renew = () => refused(422, 'session_expired')
+    pageAnswering([refused(404, 'no_profile'), egress(CHAT)])
+
+    const response = await browserEgress.egressJson({ account, url: CHAT_INFO })
+    assert.deepEqual(response.data, CHAT)
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/session', '/egress'])
+    assert.equal(worker.sent('/session')[0].force, true)
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false])
+})
+
+test('egressJson: a WAF challenge page gets the live reload and exactly one retry', async () => {
+    const account = givenAccount()
+    pageAnswering([challenged(), egress(CHAT)])
+    worker.script.renew = body => sessionOnPage(body, harvested('renewed'))
+
+    const response = await browserEgress.egressJson({ account, url: CHAT_INFO })
+    assert.deepEqual(response.data, CHAT)
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'])
+    // A challenge is not the session's doing: a reload, and never a password.
+    assert.equal(worker.count('/session'), 0)
+})
+
+test('egressJson: the punish envelope under status 200 is a challenge too', async () => {
+    const account = givenAccount()
+    pageAnswering([punish(), egress(CHAT)])
+
+    const response = await browserEgress.egressJson({ account, url: TASK_STATUS })
+    assert.deepEqual(response.data, CHAT)
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'])
+})
+
+test('egressJson: a challenge that outlasts the reload is the 503 of chats/new — and never costs a password', async () => {
+    const account = givenAccount()
+    pageAnswering(() => challenged())
+
+    await assert.rejects(browserEgress.egressJson({ account, url: CHAT_INFO }), error => {
+        callRefused('upstream_waf_challenge', 503)(error)
+        // The wait every chat challenge is answered with: the client's Retry-After.
+        assert.equal(error.retryAfter, 30)
+        return true
+    })
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'])
+    await until(() => sessionPersistence.renewals.size === 0)
+    assert.equal(worker.count('/session'), 0)
+})
+
+test('egressJson: a challenge page served as an HTTP 401 is a challenge — read before the session, so that it never costs a password', async () => {
+    const account = givenAccount()
+    const page = `<html><head><meta name="aliyun_waf_aa" content="${SECRET}"></head></html>`
+    pageAnswering(() => ok({
+        status: 401, headers: { 'content-type': 'text/html' }, body: page, url: CHAT_INFO, redirected: false, cookies: []
+    }))
+    // The page cannot be reloaded. For a refused SESSION that is the password's moment; for a challenge it never is.
+    worker.script.renew = () => refused(404, 'no_profile')
+
+    await assert.rejects(browserEgress.egressJson({ account, url: CHAT_INFO }), callRefused('upstream_waf_challenge', 503))
+    // One call, the reload, and — the profile being gone — nothing more: no retry, no password.
+    assert.deepEqual(worker.routes(), ['/egress', '/renew'])
+    await until(() => sessionPersistence.renewals.size === 0)
+    assert.equal(worker.count('/session'), 0)
+})
+
+test('egressJson: a non-2xx of qwen.ai is rejected as axios rejects one, and recovers nothing', async () => {
+    const account = givenAccount()
+    const session = current()
+    const body = JSON.stringify({ success: false, data: { code: 'Forbidden', details: SECRET } })
+    pageAnswering(() => ok({
+        status: 403, headers: { 'content-type': 'application/json' }, body, url: TASK_STATUS, redirected: false, cookies: []
+    }))
+
+    await assert.rejects(browserEgress.egressJson({ account, url: TASK_STATUS }), error => {
+        assert.equal(error.isAxiosError, true)
+        assert.equal(error.message, 'Request failed with status code 403')
+        assert.equal(error.code, 'ERR_BAD_REQUEST')
+        assert.equal(error.response.status, 403)
+        assert.equal(error.response.statusText, 'Forbidden')
+        // The body as the direct path gets it with responseType json: the caller classifies it.
+        assert.deepEqual(error.response.data, { success: false, data: { code: 'Forbidden', details: SECRET } })
+        return true
+    })
+    // A status of qwen.ai's is the caller's to classify: no reload, no retry, no direct request.
+    assert.deepEqual(worker.routes(), ['/egress'])
+    assert.equal(current(), session)
+    assert.deepEqual(direct, [])
+})
+
+test('egressJson: a 429 keeps its Retry-After, as the direct transports hand it on', async () => {
+    const account = givenAccount()
+    pageAnswering(() => ok({
+        status: 429, headers: { 'content-type': 'application/json', 'retry-after': '7' },
+        body: '{"success":false,"data":{"code":"RateLimited","num":5}}', url: STS_TOKEN, redirected: false, cookies: []
+    }))
+
+    await assert.rejects(browserEgress.egressJson({ account, url: STS_TOKEN, method: 'POST', body: '{}' }), error => {
+        assert.equal(error.response.status, 429)
+        assert.equal(error.response.headers['retry-after'], '7')
+        assert.deepEqual(error.response.data, { success: false, data: { code: 'RateLimited', num: 5 } })
+        return true
+    })
+    assert.deepEqual(worker.routes(), ['/egress'])
+})
+
+test('egressJson: a worker that cannot carry the call is a retryable 503 with the worker\'s code — never an empty answer, never a direct request', async () => {
+    const account = givenAccount()
+    const session = current()
+    for (const [status, code] of [
+        [502, 'page_closed'], [502, 'page_fault'], [502, 'egress_too_large'], [503, 'resident_capacity'], [504, 'egress_timeout']
+    ]) {
+        worker.calls.length = 0
+        logs.length = 0
+        pageAnswering(refused(status, code))
+
+        await assert.rejects(browserEgress.egressJson({ account, url: TASK_STATUS }), error => {
+            callRefused('upstream_transport_error', 503)(error)
+            assert.equal(error.workerCode, code)
+            assert.equal(error.message, 'Qwen upstream call failed in the signin worker')
+            return true
+        }, code)
+        // Nothing in the page is wrong with it: no reload, no password, and no retry of the worker's.
+        assert.deepEqual(worker.routes(), ['/egress'], code)
+        assert.ok(logs.some(args => String(args[0]).includes(code) && String(args[0]).includes('/api/v1/tasks/status/task-1')),
+            `${code}: the log names the call and the worker's code`)
+        assert.deepEqual(direct, [], code)
+    }
+    assert.equal(current(), session)
+})
+
+test('egressJson: a worker that cannot be reached at all is the same 503', async () => {
+    const account = givenAccount()
+    const unreachable = config.signinWorkerUrl
+    config.signinWorkerUrl = 'http://127.0.0.1:1'
+
+    try {
+        await assert.rejects(browserEgress.egressJson({ account, url: CHAT_INFO }), callRefused('upstream_transport_error', 503))
+    } finally {
+        config.signinWorkerUrl = unreachable
+    }
+    assert.deepEqual(direct, [])
+})
+
+test('egressJson: an answer out of shape is the egress\'s failure, not an answer', async () => {
+    const account = givenAccount()
+    // An old worker, say, answering something else under its 200.
+    pageAnswering(ok({ status: 200, headers: {} }))
+
+    await assert.rejects(browserEgress.egressJson({ account, url: CHAT_INFO }), callRefused('upstream_transport_error', 503))
+    assert.deepEqual(worker.routes(), ['/egress'])
+})
+
+test('egressJson: a target off the chat origin is refused before the worker hears about it', async () => {
+    const account = givenAccount()
+
+    await assert.rejects(browserEgress.egressJson({ account, url: 'https://files.stand.test/api/v2/chats/chat-1' }),
+        callRefused('upstream_transport_error', 503))
+    assert.equal(worker.calls.length, 0)
+    assert.deepEqual(direct, [])
+})
+
+test('egressJson: one recovery per interval — a refusal inside the window fails as it is, with no second reload', async () => {
+    config.sessionRecoveryMinIntervalMs = 60000
+    const account = givenAccount()
+    pageAnswering(() => unauthorized())
+
+    await assert.rejects(browserEgress.egressJson({ account, url: CHAT_INFO }), callRefused('upstream_session_unauthorized', 502))
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'])
+    await until(() => sessionPersistence.renewals.size === 0)
+
+    await assert.rejects(browserEgress.egressJson({ account, url: CHAT_INFO }), callRefused('upstream_session_unauthorized', 502))
+    // A refusal that got no recovery schedules nothing of its own behind the
+    // request either — no reload, and no password: a call escalates to nothing.
+    await until(() => sessionPersistence.renewals.size === 0)
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress', '/egress'])
+    assert.equal(worker.count('/session'), 0)
+})
+
+test('egressJson: a refusal that lands after a sibling replaced the session retries after that recovery, with no reload of its own', async () => {
+    const account = givenAccount()
+    const sibling = harvested('sibling')
+    pageAnswering(() => {
+        // The store moved on while this call was on its way out.
+        if (current().token !== sibling.token) {
+            store.setSession(EMAIL, { token: sibling.token, expiresAt: EXPIRES_AT, jar: store.jarFromCookies(sibling.cookies) })
+            return unauthorized()
+        }
+        return egress(CHAT)
+    })
+
+    const response = await browserEgress.egressJson({ account, url: CHAT_INFO })
+    assert.deepEqual(response.data, CHAT)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress'])
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false])
+})
+
+test('egressJson: with no session left in the store the call still goes out, on the page\'s session', async () => {
+    const account = givenAccount()
+    store.clearSessions()
+    pageAnswering(() => egress(CHAT))
+
+    const response = await browserEgress.egressJson({ account, url: TASK_STATUS })
+    assert.deepEqual(response.data, CHAT)
+    assert.deepEqual(worker.routes(), ['/egress'])
+    assert.equal(worker.count('/renew'), 0)
+})
+
+test('egressJson: with no account to name, the worker\'s dead profile is the refused session — and nothing can recover it', async () => {
+    // No account at all: the worker refuses the call before any page is touched.
+    pageAnswering(refused(404, 'no_profile'))
+
+    await assert.rejects(browserEgress.egressJson({ url: TASK_STATUS }), callRefused('upstream_session_unauthorized', 502))
+    // There is no account to reload one for.
+    assert.deepEqual(worker.routes(), ['/egress'])
+})
+
+test('callFailure: what a failed egress call is to the client, and what is left to the caller', () => {
+    const { SigninError } = require('../src/utils/signin-error')
+    const transport = { status: 503, error: 'Qwen upstream call failed in the signin worker', code: 'upstream_transport_error' }
+    const unauthorized = { status: 502, error: 'Qwen session authorization rejected; this is not Qwen2API client authentication', code: 'upstream_session_unauthorized' }
+    // The relay's own failures carry the worker's code.
+    assert.deepEqual(browserEgress.callFailure(Object.assign(new Error(`signin-worker egress: page_closed ${SECRET}`), { code: 'ECONNRESET', workerCode: 'page_closed' })), transport)
+    // A worker refusing the call itself.
+    assert.deepEqual(browserEgress.callFailure(new SigninError('signin_transport_error', 502, SECRET)), transport)
+    assert.deepEqual(browserEgress.callFailure(new SigninError('signin_upstream_error', 502, SECRET, 400)), transport)
+    // A session qwen.ai refused twice, as postCompletions rejects it.
+    assert.deepEqual(browserEgress.callFailure(Object.assign(new Error(SECRET), {
+        isAxiosError: true, code: 'ERR_BAD_REQUEST', response: { status: 401, data: SECRET }
+    })), unauthorized)
+    // Any other status of qwen.ai's is the caller's to classify, and so is anything else.
+    assert.equal(browserEgress.callFailure(Object.assign(new Error(SECRET), { isAxiosError: true, response: { status: 429 } })), null)
+    assert.equal(browserEgress.callFailure(Object.assign(new Error(SECRET), { isAxiosError: true, response: { status: 503 } })), null)
+    assert.equal(browserEgress.callFailure(Object.assign(new Error(SECRET), { response: { status: 401 } })), null)
+    assert.equal(browserEgress.callFailure(new Error(SECRET)), null)
+    assert.equal(browserEgress.callFailure(null), null)
+})
+
+/* -------------------- images/video: the generation call and its polls (Qwen2API-03v) -- */
+
+const {
+    handleImageVideoCompletion, handleOpenAIImagesGeneration, handleOpenAIVideoGeneration,
+    getChatDetail, getVideoTaskStatus
+} = require('../src/controllers/chat.image.video')
+const { setChatChallengeClockForTests } = require('../src/utils/upstream-error')
+
+const IMAGE_URL = 'https://cdn.example.com/a.png'
+const VIDEO_URL = 'https://cdn.example.com/v.mp4'
+const TASK_STATUS_URL = 'https://chat.qwen.ai/api/v1/tasks/status/task-1'
+const GENERATION_TIMEOUT_MS = 5 * 60 * 1000
+const T2I = { stream: false, chat_type: 't2i', model: MODEL, messages: [{ role: 'user', content: 'a cat' }] }
+const T2V = { ...T2I, chat_type: 't2v' }
+const TRANSPORT_FAILURE = { error: 'Qwen upstream call failed in the signin worker', code: 'upstream_transport_error' }
+// The Bearer a direct call carries, whatever the case of its header's name.
+const bearerOf = call => Object.entries(call.headers || {}).find(([name]) => name.toLowerCase() === 'authorization')?.[1]
+
+// The media controller picks its account itself: hand it the test's.
+async function withAccount(account, fn) {
+    const real = accountManager.getAccount
+    accountManager.getAccount = () => account
+    try {
+        return await fn()
+    } finally {
+        accountManager.getAccount = real
+    }
+}
+
+// An Express response, as the controllers write one.
+const response = () => ({
+    headers: {}, headersSent: false, writableEnded: false, statusCode: 200, output: '',
+    set(key, value) { if (typeof key === 'object') Object.assign(this.headers, key); else this.headers[key] = value; return this },
+    status(value) { this.statusCode = value; return this },
+    json(body) { this.body = body; this.headersSent = true; this.writableEnded = true; return this },
+    write(chunk) { this.headersSent = true; this.output += chunk; return true },
+    end(chunk = '') { this.output += chunk; this.writableEnded = true },
+    on() { return this }
+})
+
+// An image's answer from the relay: SSE, one frame carrying the picture's link.
+const picture = (url = IMAGE_URL) => {
+    const stream = relay()
+    stream.head()
+    stream.chunk(frame({ choices: [{ delta: { phase: 'image_gen', content: `![image](${url})` } }] }))
+    stream.end()
+    return stream
+}
+// A video's answer from the relay: the JSON the direct path had Axios parse — a task to poll.
+const task = () => {
+    const stream = relay()
+    stream.head(200, { 'content-type': 'application/json' })
+    stream.chunk(JSON.stringify({ success: true, data: { task_id: 'task-1' } }))
+    stream.end()
+    return stream
+}
+// The task's status: done, with the video.
+const done = () => json({ task_status: 'success', content: VIDEO_URL })
+// A relay the worker ends with a failure of its own, before qwen.ai answered.
+const broken = code => {
+    const stream = relay()
+    stream.fail(code)
+    return stream
+}
+// The chat, as its detail comes back with the picture in its history.
+const withPictureInHistory = () => egress({
+    success: true,
+    data: { chat: { history: { messages: {
+        m1: { response_id: 'r1', content: [{ type: 'image', image: { url: IMAGE_URL } }] }
+    } } } }
+})
+
+// qwen.ai behind the page as the stand-in answers it: chats/new, the chat and
+// the task's status as whole answers, and the generation as a relay — one per
+// call, each taken from `generations` in its turn.
+function qwenBehindThePage({ generations = [], chatDetail, taskStatus = done }) {
+    worker.script.egress = body => {
+        if (body.stream === true) {
+            assert.ok(generations.length, 'more generation calls than the script has relays for')
+            return generations.shift().open
+        }
+        const pathname = new URL(body.url).pathname
+        if (pathname === '/api/v2/chats/new') return egress(chat('chat-1'))
+        if (pathname === '/api/v2/chats/chat-1') return chatDetail()
+        // The status of the task named in the address.
+        if (pathname.startsWith('/api/v1/tasks/status/')) return taskStatus(pathname.slice('/api/v1/tasks/status/'.length))
+        throw new Error(`nothing on the page answers ${pathname}`)
+    }
+}
+const generations = () => worker.sent('/egress').filter(body => body.stream === true)
+const polls = () => worker.sent('/egress').filter(body => body.url === TASK_STATUS_URL)
+
+// Both flags as prod has them since 2026-11-25. A video's answer is JSON with
+// no frame in it: nothing holds it back for the first-frame grace.
+function throughThePage() {
+    config.completionsTransport = 'browser'
+    browserEgress.setTimingForTests({ firstFrameMs: 20 })
+}
+
+test('Qwen2API-03v: an image is generated from the page — the completions call is the page\'s own fetch, and nothing of axios is sent', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    qwenBehindThePage({ generations: [picture()] })
+
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.body.choices[0].message.content, `![image](${IMAGE_URL})`)
+
+    // chats/new, whole as ever; the generation, relayed.
+    assert.deepEqual(worker.routes(), ['/egress', '/egress'])
+    assert.deepEqual(direct, [])
+    const [creation, generation] = worker.sent('/egress')
+    assert.equal(creation.stream, undefined)
+    // The one address qwen.ai takes from a fetch alone (Qwen2API-3ue.9): never a whole-answer XMLHttpRequest.
+    assert.equal(generation.stream, true)
+    assert.equal(generation.url, `${COMPLETIONS}chat-1`)
+    assert.equal(generation.method, 'POST')
+    assert.equal(generation.timeoutMs, GENERATION_TIMEOUT_MS)
+    assert.deepEqual(Object.keys(generation.headers).sort(), ['accept', 'content-type', 'x-request-id'])
+    assert.equal(generation.headers.accept, 'application/json')
+    // The body the direct path built, unchanged.
+    assert.deepEqual(JSON.parse(generation.body), {
+        stream: true, version: '2.1', incremental_output: true, chat_id: 'chat-1', model: MODEL,
+        messages: [{ role: 'user', content: 'a cat', files: [], chat_type: 't2i', feature_config: { output_schema: 'phase' } }]
+    })
+    // Not the app's Bearer on either (Qwen2API-jr9).
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false])
+})
+
+test('Qwen2API-03v: a video is generated from the page — the relayed answer read whole, the task polled through the page', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    qwenBehindThePage({ generations: [task()] })
+
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2V }, res))
+    assert.equal(res.statusCode, 200)
+    assert.ok(res.body.choices[0].message.content.includes(VIDEO_URL))
+
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress'])
+    assert.deepEqual(direct, [])
+    const [creation, generation, poll] = worker.sent('/egress')
+    assert.deepEqual([creation.stream, generation.stream, poll.stream], [undefined, true, undefined])
+    assert.equal(generation.url, `${COMPLETIONS}chat-1`)
+    // The video's body asks for no stream; the call is the page's fetch all the same.
+    assert.equal(JSON.parse(generation.body).stream, false)
+    assert.equal(JSON.parse(generation.body).messages[0].chat_type, 't2v')
+    // The poll is a whole-answer call, as chats/new is one.
+    assert.equal(poll.url, TASK_STATUS_URL)
+    assert.equal(poll.method, 'GET')
+    assert.equal(poll.body, undefined)
+    assert.deepEqual(Object.keys(poll.headers), ['x-request-id'])
+    assert.equal(poll.timeoutMs, browserEgress.JSON_TIMEOUT_MS)
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false, false])
+})
+
+test('Qwen2API-03v: an image whose link is not in the answer is looked up in the chat — through the page', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    qwenBehindThePage({ generations: [picture('')], chatDetail: withPictureInHistory })
+
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.body.choices[0].message.content, `![image](${IMAGE_URL})`)
+
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress'])
+    const [lookup] = worker.sent('/egress').filter(body => body.url === CHAT_INFO)
+    assert.equal(lookup.method, 'GET')
+    assert.equal(lookup.body, undefined)
+    assert.deepEqual(Object.keys(lookup.headers), ['x-request-id'])
+    assert.equal(bringsBearer(lookup), false)
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: a transient internal error from the page is retried once, as it was from axios', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    const internal = () => {
+        const stream = relay()
+        stream.head(200, { 'content-type': 'application/json' })
+        stream.chunk(JSON.stringify({ success: false, data: { code: 'Bad_Request', details: 'internal error' }, request_id: 'req-1' }))
+        stream.end()
+        return stream
+    }
+    qwenBehindThePage({ generations: [internal(), task()] })
+
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2V }, res))
+    assert.equal(res.statusCode, 200)
+    assert.ok(res.body.choices[0].message.content.includes(VIDEO_URL))
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress', '/egress'])
+    assert.equal(generations().length, 2, 'the one retry the direct path gives an internal error')
+})
+
+test('Qwen2API-03v: a WAF challenge page on the generation gets the live reload and exactly one retry', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    qwenBehindThePage({ generations: [challenging(), picture()] })
+
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.body.choices[0].message.content, `![image](${IMAGE_URL})`)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
+    assert.equal(worker.count('/session'), 0, 'a reload is all a challenge is worth')
+})
+
+test('Qwen2API-03v: a challenge that outlasts the reload is one retryable 503 — never an image, never a password', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    qwenBehindThePage({ generations: [challenging(), challenging()] })
+
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+    assert.equal(res.statusCode, 503)
+    assert.ok(Number(res.headers['Retry-After']) > 0)
+    assert.equal(res.body.code, 'upstream_waf_challenge')
+    // Not the challenge page's own picture, passed off as the generation.
+    assert.doesNotMatch(JSON.stringify(res.body), /cdn\.example|alicdn|punish/)
+    assert.equal(res.body.choices, undefined)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
+    await until(() => sessionPersistence.renewals.size === 0)
+    assert.equal(worker.count('/session'), 0)
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: a session refused in the generation is recovered with one reload and one retry', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    qwenBehindThePage({ generations: [refusing(), picture()] })
+
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.body.choices[0].message.content, `![image](${IMAGE_URL})`)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
+})
+
+test('Qwen2API-03v: refused again after the reload — the 502 with its code, and no password', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    qwenBehindThePage({ generations: [refusing(), refusing()] })
+
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+    assert.equal(res.statusCode, 502)
+    assert.deepEqual(res.body, {
+        error: 'Qwen session authorization rejected; this is not Qwen2API client authentication',
+        code: 'upstream_session_unauthorized'
+    })
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
+    await until(() => sessionPersistence.renewals.size === 0)
+    assert.equal(worker.count('/session'), 0)
+})
+
+test('Qwen2API-03v: a worker that cannot carry the generation is one retryable 503 — not a 500 with the relay\'s words in it', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    for (const code of ['page_closed', 'page_fault', 'egress_timeout', 'relay_malformed']) {
+        worker.calls.length = 0
+        qwenBehindThePage({ generations: [broken(code), broken(code)] })
+
+        const res = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+        assert.equal(res.statusCode, 503, code)
+        assert.deepEqual(res.body, TRANSPORT_FAILURE, code)
+        assert.doesNotMatch(JSON.stringify(res.body), /signin-worker egress/, code)
+        // The controller's one retry is for an internal error of qwen.ai's, not for this.
+        assert.equal(generations().length, 1, code)
+        assert.equal(worker.count('/renew'), 0, code)
+        assert.ok(JSON.stringify(logs).includes(code), `${code}: the log names the worker's code`)
+        assert.deepEqual(direct, [], code)
+    }
+    // A worker that is not there at all is the same failure.
+    qwenBehindThePage({ generations: [picture()] })
+    const unreachable = config.signinWorkerUrl
+    config.signinWorkerUrl = 'http://127.0.0.1:1'
+    try {
+        const res = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+        assert.equal(res.statusCode, 503)
+        assert.deepEqual(res.body, {
+            error: 'Qwen chat creation transport failed', code: 'upstream_transport_error'
+        })
+    } finally {
+        config.signinWorkerUrl = unreachable
+    }
+})
+
+test('Qwen2API-03v: a 429 on the generation is the quota, with its wait, as it was from axios', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    const limited = () => {
+        const stream = relay()
+        stream.head(429, { 'content-type': 'application/json', 'retry-after': '18000' })
+        stream.chunk(JSON.stringify({ success: false, data: { code: 'RateLimited', num: 5 } }))
+        stream.end()
+        return stream
+    }
+    qwenBehindThePage({ generations: [limited()] })
+
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2V }, res))
+    assert.equal(res.statusCode, 429)
+    assert.equal(res.body.code, 'RateLimited')
+    assert.equal(res.body.wait_hours, 5)
+    assert.equal(generations().length, 1)
+})
+
+test('Qwen2API-03v: a poll of the video task the worker cannot carry ends the wait at once — it is not polled on as "not done"', { timeout: 15000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    qwenBehindThePage({ generations: [task()], taskStatus: () => refused(502, 'page_closed') })
+
+    const started = Date.now()
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2V }, res))
+    // Not the sixty polls, twenty seconds apart, that the task is given.
+    assert.ok(Date.now() - started < 10000)
+    assert.equal(res.statusCode, 503)
+    assert.deepEqual(res.body, TRANSPORT_FAILURE)
+    assert.equal(polls().length, 1, 'one poll, and it was the last')
+    assert.equal(worker.count('/renew'), 0, 'nothing in the page is wrong with it')
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: the task\'s status refused as unauthorized is recovered with one reload and one retry, and polled on', { timeout: 15000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    const statuses = [unauthorized(), done()]
+    qwenBehindThePage({ generations: [task()], taskStatus: () => statuses.shift() })
+
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2V }, res))
+    assert.equal(res.statusCode, 200)
+    assert.ok(res.body.choices[0].message.content.includes(VIDEO_URL))
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress', '/renew', '/egress'])
+    assert.deepEqual(polls().map(bringsBearer), [false, false])
+})
+
+test('Qwen2API-03v: the task\'s status challenged twice is the 503 of the challenge — and no polling on, no password', { timeout: 15000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    qwenBehindThePage({ generations: [task()], taskStatus: () => challenged() })
+
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2V }, res))
+    assert.equal(res.statusCode, 503)
+    assert.deepEqual(res.body, {
+        error: 'Qwen requires WAF/CAPTCHA verification', code: 'upstream_waf_challenge', retry_after: 30
+    })
+    assert.equal(res.headers['Retry-After'], '30', 'the wait every chat challenge is answered with')
+    assert.equal(polls().length, 2, 'the poll and its one retry')
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress', '/renew', '/egress'])
+    await until(() => sessionPersistence.renewals.size === 0)
+    assert.equal(worker.count('/session'), 0)
+})
+
+test('Qwen2API-03v: a video whose task is in the chat, not in the answer, is found through the page', { timeout: 15000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    qwenBehindThePage({
+        generations: [picture('')],
+        chatDetail: () => egress({ success: true, data: { chat: { history: { messages: { m1: { response_id: 'r1', task_id: 'task-1' } } } } } })
+    })
+
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2V }, res))
+    assert.equal(res.statusCode, 200)
+    assert.ok(res.body.choices[0].message.content.includes(VIDEO_URL))
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress', '/egress'])
+})
+
+test('Qwen2API-03v: the OpenAI image and video endpoints generate through the page too', { timeout: 15000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    qwenBehindThePage({ generations: [picture()] })
+    const image = response()
+    await withAccount(account, () => handleOpenAIImagesGeneration({ body: { model: MODEL, prompt: 'a cat' } }, image))
+    assert.equal(image.statusCode, 200)
+    assert.deepEqual(image.body.data, [{ url: IMAGE_URL }])
+
+    qwenBehindThePage({ generations: [task()] })
+    const video = response()
+    await withAccount(account, () => handleOpenAIVideoGeneration({ body: { model: MODEL, prompt: 'a cat' } }, video))
+    assert.equal(video.statusCode, 200)
+    assert.deepEqual(video.body.data, [{ url: VIDEO_URL }])
+    assert.deepEqual(direct, [])
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), worker.sent('/egress').map(() => false))
+})
+
+test('Qwen2API-03v: with the transports off, images and video stay on axios — the direct call is not touched', { timeout: 10000 }, async () => {
+    config.chatCreationTransport = 'direct'
+    config.completionsTransport = 'auto'
+    const account = givenAccount()
+    const directCalls = []
+    const realGet = axios.get
+    axios.get = async (url, requestConfig) => {
+        directCalls.push({ how: 'GET', url, requestConfig })
+        return { data: { task_status: 'success', content: VIDEO_URL } }
+    }
+    directReply = async (url, data, requestConfig) => {
+        if (url.endsWith('/chats/new')) return { status: 200, data: chat('direct-chat'), headers: {} }
+        directCalls.push({ how: 'POST', url, data, requestConfig })
+        return requestConfig.responseType === 'json'
+            ? { status: 200, data: { success: true, data: { task_id: 'task-1' } }, headers: {} }
+            : { status: 200, data: Readable.from([Buffer.from(frame({ choices: [{ delta: { phase: 'image_gen', content: `![image](${IMAGE_URL})` } }] }))]), headers: {} }
+    }
+
+    try {
+        const image = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, image))
+        assert.equal(image.statusCode, 200)
+        assert.equal(image.body.choices[0].message.content, `![image](${IMAGE_URL})`)
+
+        const video = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2V }, video))
+        assert.equal(video.statusCode, 200)
+        assert.ok(video.body.choices[0].message.content.includes(VIDEO_URL))
+    } finally {
+        axios.get = realGet
+    }
+    assert.equal(worker.calls.length, 0, 'the worker is not involved')
+    const posts = directCalls.filter(call => call.how === 'POST')
+    // chats/new and each generation, in their turn.
+    assert.deepEqual(direct.map(call => new URL(call.url).pathname), [
+        '/api/v2/chats/new', '/api/v2/chat/completions', '/api/v2/chats/new', '/api/v2/chat/completions'
+    ])
+    // The direct generation calls, built as they were before the egress: on the
+    // app's Bearer, each with its own response type, the same budget.
+    const [imageCall, videoCall] = posts.filter(call => call.url.endsWith('chat_id=direct-chat'))
+    assert.equal(new URL(imageCall.url).search, '?chat_id=direct-chat')
+    assert.equal(imageCall.requestConfig.responseType, 'stream', 'an image: read as a stream')
+    assert.equal(videoCall.requestConfig.responseType, 'json', 'a video: parsed by axios')
+    assert.deepEqual([imageCall, videoCall].map(call => call.requestConfig.timeout), [GENERATION_TIMEOUT_MS, GENERATION_TIMEOUT_MS])
+    assert.deepEqual([imageCall, videoCall].map(call => bearerOf({ headers: call.requestConfig.headers })),
+        [`Bearer ${account.token}`, `Bearer ${account.token}`])
+    assert.equal(videoCall.requestConfig.headers['bx-v'], '2.5.36')
+    // The direct poll: axios, on the app's Bearer.
+    const [poll] = directCalls.filter(call => call.how === 'GET')
+    assert.equal(poll.url, TASK_STATUS_URL)
+    assert.equal(bearerOf({ headers: poll.requestConfig.headers }), `Bearer ${account.token}`)
+})
+
+test('Qwen2API-03v: each call follows its own flag — with chats/new direct, the generation goes from the page and the polls stay on axios', { timeout: 10000 }, async () => {
+    throughThePage()
+    config.chatCreationTransport = 'direct'
+    // The account has a proxy of its own: that the direct poll found the account
+    // is known by the poll carrying it.
+    const account = { ...givenAccount(), proxy: 'http://127.0.0.1:9' }
+    accountManager.accountTokens = [account]
+    directReply = async url => (url.endsWith('/chats/new')
+        ? { status: 200, data: chat('chat-1'), headers: {} }
+        : assert.fail(`no direct completions: ${url}`))
+    const realGet = axios.get
+    const polled = []
+    axios.get = async (url, requestConfig) => {
+        polled.push({ url, proxied: Boolean(requestConfig?.httpsAgent) })
+        return { data: { task_status: 'success', content: VIDEO_URL } }
+    }
+
+    try {
+        // The page's session is refused once: the reload rotates the token before the task is named.
+        qwenBehindThePage({
+            generations: [refusing(), task()],
+            taskStatus: () => assert.fail('the poll does not go through the page')
+        })
+        const res = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2V }, res))
+        assert.equal(res.statusCode, 200)
+        assert.ok(res.body.choices[0].message.content.includes(VIDEO_URL))
+    } finally {
+        axios.get = realGet
+    }
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'], 'the generation alone, with its recovery')
+    // The poll follows the token the store holds now — the renewed one — so it
+    // finds the account, and the account's proxy (Qwen2API-3ue.3, as in request.js).
+    assert.equal(account.token, tokenWith('renewed'))
+    assert.deepEqual(polled, [{ url: TASK_STATUS_URL, proxied: true }])
+})
+
+test('Qwen2API-03v: the chat breaker counts what the page answered, on the account\'s egress — and an answered image closes its probe', { timeout: 20000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    let now = Date.now()
+    setChatChallengeClockForTests(() => now)
+    const generate = async () => {
+        const res = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+        return res
+    }
+    const challengedEveryTime = () => qwenBehindThePage({ generations: [challenging(), challenging()] })
+
+    try {
+        // Three challenged requests open the breaker: one strike each.
+        for (let i = 1; i <= 3; i++) {
+            challengedEveryTime()
+            worker.calls.length = 0
+            assert.equal((await generate()).statusCode, 503, `request ${i}`)
+            assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'], `request ${i}: one challenge, one strike`)
+        }
+        // Open: nothing reaches the page.
+        challengedEveryTime()
+        worker.calls.length = 0
+        const held = await generate()
+        assert.equal(held.statusCode, 503)
+        assert.equal(held.body.code, 'upstream_waf_challenge')
+        assert.deepEqual(worker.routes(), [])
+
+        // Cooled down: the first request through is the one probe, and qwen.ai's answer closes the breaker.
+        now += 60_000
+        worker.calls.length = 0
+        qwenBehindThePage({ generations: [picture()] })
+        const probe = await generate()
+        assert.equal(probe.statusCode, 200)
+        assert.deepEqual(worker.routes(), ['/egress', '/egress'])
+
+        // Closed again: the next request is none of the breaker's business, a challenge included.
+        challengedEveryTime()
+        worker.calls.length = 0
+        const answered = await generate()
+        assert.equal(answered.statusCode, 503)
+        assert.equal(answered.body.code, 'upstream_waf_challenge')
+        assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
+    } finally {
+        setChatChallengeClockForTests(() => Date.now())
+    }
+})
+
+test('Qwen2API-03v: a failed generation leaves the next probe available', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    let now = Date.now()
+    setChatChallengeClockForTests(() => now)
+    try {
+        // Three challenges open the breaker, and the cooldown ends.
+        for (let i = 0; i < 3; i++) {
+            qwenBehindThePage({ generations: [challenging(), challenging()] })
+            await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, response()))
+        }
+        now += 60_000
+        // The probe is the request that follows — and the worker cannot carry it.
+        qwenBehindThePage({ generations: [broken('page_closed')] })
+        const failed = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, failed))
+        assert.equal(failed.statusCode, 503)
+        assert.equal(failed.body.code, 'upstream_transport_error')
+        // So the breaker does not stay armed on a probe that never got its answer.
+        // Inside the window that probe armed, the next request must go through.
+        now += 30_000
+        qwenBehindThePage({ generations: [picture()] })
+        const next = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, next))
+        assert.equal(next.statusCode, 200)
+    } finally {
+        setChatChallengeClockForTests(() => Date.now())
+    }
+})
+
+test('Qwen2API-03v: a streaming client gets a failed generation as its status — never a 200 with the failure for its picture', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    const T2V_STREAMED = { ...T2V, stream: true }
+    // Nothing of the stream was written yet: the status is still the client's to get.
+    for (const [body, relays, code, status] of [
+        [T2I, [broken('page_closed')], 'upstream_transport_error', 503],
+        [T2V_STREAMED, [broken('page_closed')], 'upstream_transport_error', 503],
+        [T2I, [refusing(), refusing()], 'upstream_session_unauthorized', 502],
+        [T2V_STREAMED, [refusing(), refusing()], 'upstream_session_unauthorized', 502]
+    ]) {
+        worker.calls.length = 0
+        qwenBehindThePage({ generations: relays })
+        const res = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body }, res))
+        assert.equal(res.statusCode, status, code)
+        assert.equal(res.body.code, code)
+        assert.equal(res.headers['Content-Type'], 'application/json', code)
+        assert.equal(res.output, '', `${code}: no SSE was written`)
+        assert.equal(res.body.choices, undefined, `${code}: the failure is not an answer`)
+    }
+
+    // A video's keep-alive may have committed the stream already: the status is
+    // spent, and the failure travels in the stream, as an error.
+    qwenBehindThePage({ generations: [broken('page_closed')] })
+    const committed = response()
+    committed.headersSent = true
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2V_STREAMED }, committed))
+    const frame = committed.output.split('\n').find(line => line.startsWith('data: {'))
+    assert.deepEqual(JSON.parse(frame.slice(6)).error, {
+        message: TRANSPORT_FAILURE.error, code: 'upstream_transport_error', type: 'server_error'
+    })
+    assert.ok(committed.output.endsWith('data: [DONE]\n\n'))
+    assert.doesNotMatch(committed.output, /choices/, 'the failure is not passed off as an answer')
+})
+
+test('Qwen2API-03v: an image edit is generated from the page too — with its picture in the body, as the direct path sends it', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    qwenBehindThePage({ generations: [picture('https://cdn.example.com/edited.png')] })
+
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: { ...T2I, chat_type: 'image_edit', messages: [{
+        role: 'user', content: [{ type: 'text', text: 'a cat, in red' }, { type: 'image', image: IMAGE_URL }]
+    }] } }, res))
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.body.choices[0].message.content, '![image](https://cdn.example.com/edited.png)')
+    const [generation] = generations()
+    assert.equal(generation.stream, true)
+    assert.deepEqual(JSON.parse(generation.body).messages[0], {
+        role: 'user', content: 'a cat, in red', files: [{ type: 'image', url: IMAGE_URL }],
+        chat_type: 'image_edit', feature_config: { output_schema: 'phase' }
+    })
+})
+
+test('Qwen2API-03v: a relay that fails midway through a video\'s answer is the 503 — half an answer is nobody\'s', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    // The head and a first piece, then the failure: after the first-frame grace,
+    // so that the answer was the caller's already.
+    const stream = relay()
+    stream.head(200, { 'content-type': 'application/json' })
+    stream.chunk('{"success":true,"data":{"task_')
+    const opened = {
+        open: (res, req) => {
+            stream.open(res, req)
+            setTimeout(() => stream.fail('page_closed'), 80)
+        }
+    }
+    qwenBehindThePage({ generations: [opened], taskStatus: () => assert.fail('no task was named: nothing to poll') })
+
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2V }, res))
+    assert.equal(res.statusCode, 503)
+    assert.deepEqual(res.body, TRANSPORT_FAILURE)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress'])
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: a chat lookup the worker cannot carry ends the request at once — it is not looked up five times over', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    qwenBehindThePage({ generations: [picture('')], chatDetail: () => refused(502, 'page_closed') })
+
+    const res = response()
+    await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+    assert.equal(res.statusCode, 503)
+    assert.deepEqual(res.body, TRANSPORT_FAILURE)
+    assert.equal(worker.sent('/egress').filter(call => call.url === CHAT_INFO).length, 1, 'one lookup, and it was the last')
+})
+
+test('Qwen2API-03v: the chat lookup and the task poll tell qwen.ai\'s own answers from what the egress could not get answered', async () => {
+    const account = givenAccount()
+    const token = account.token
+    // qwen.ai's own answers, read as they always were: not ready, and nobody's failure.
+    for (const [reply, poll, lookup, what] of [
+        [() => json({}, 404), null, null, 'an HTTP error'],
+        [() => json({ success: false, data: { code: 'Not_Found' } }, 400), null, null, 'a refused answer'],
+        [() => json({ task_status: 'running' }), null, { task_status: 'running' }, 'an answer with no task done']
+    ]) {
+        pageAnswering(reply)
+        assert.equal(await getVideoTaskStatus('task-1', token, account), poll, `poll: ${what}`)
+        assert.deepEqual(await getChatDetail('chat-1', token, account), lookup, `lookup: ${what}`)
+    }
+    assert.equal(worker.count('/renew'), 0, 'an answer of qwen.ai\'s recovers nothing')
+    pageAnswering(() => json({ task_status: 'success', content: VIDEO_URL }))
+    assert.equal(await getVideoTaskStatus('task-1', token, account), VIDEO_URL)
+    pageAnswering(() => egress(CHAT))
+    assert.deepEqual(await getChatDetail('chat-1', token, account), CHAT)
+
+    // What the egress could not get answered is thrown by both: a worker that
+    // could not carry the call; a session refused with its recovery spent; a challenge likewise.
+    for (const [reply, code, status, routes] of [
+        [() => refused(502, 'page_closed'), 'upstream_transport_error', 503, ['/egress']],
+        [() => unauthorized(), 'upstream_session_unauthorized', 502, ['/egress', '/renew', '/egress']],
+        [() => challenged(), 'upstream_waf_challenge', 503, ['/egress', '/renew', '/egress']]
+    ]) {
+        worker.calls.length = 0
+        pageAnswering(reply)
+        await assert.rejects(getChatDetail('chat-1', token, account), callRefused(code, status))
+        assert.deepEqual(worker.routes(), routes, `lookup: ${code}`)
+        worker.calls.length = 0
+        await assert.rejects(getVideoTaskStatus('task-1', token, account), callRefused(code, status))
+        assert.deepEqual(worker.routes(), routes, `poll: ${code}`)
+    }
+    assert.equal(worker.count('/session'), 0, 'none of it costs a password')
+    assert.deepEqual(direct, [])
+
+    // With chats/new direct both are axios', and both swallow as they always did.
+    config.chatCreationTransport = 'direct'
+    const realGet = axios.get
+    axios.get = async () => { throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }) }
+    try {
+        assert.equal(await getChatDetail('chat-1', token, account), null)
+        assert.equal(await getVideoTaskStatus('task-1', token, account), null)
+    } finally {
+        axios.get = realGet
+    }
+})
+
+test('Qwen2API-03v: an error qwen.ai itself gives a poll is "not done", and the poll goes on', { timeout: 15000 }, async t => {
+    throughThePage()
+    const account = givenAccount()
+    // The pause between two polls is the task's own, twenty seconds: the clock is the test's here.
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const statuses = [() => json({}, 404), () => done()]
+    let polledOnce
+    const firstPoll = new Promise(resolve => { polledOnce = resolve })
+    try {
+        qwenBehindThePage({
+            generations: [task()],
+            taskStatus: () => {
+                const reply = statuses.shift()
+                if (statuses.length === 1) polledOnce()
+                return reply()
+            }
+        })
+        const res = response()
+        const handled = withAccount(account, () => handleImageVideoCompletion({ body: T2V }, res))
+        await firstPoll
+        // The poll's answer still has to reach the app, and the pause to start:
+        // give it the real event loop, then the task's own pause, until the poll that follows.
+        for (let i = 0; i < 200 && polls().length < 2; i++) {
+            await new Promise(resolve => setImmediate(resolve))
+            t.mock.timers.tick(20000)
+        }
+        await handled
+        assert.equal(res.statusCode, 200)
+        assert.ok(res.body.choices[0].message.content.includes(VIDEO_URL))
+        assert.equal(polls().length, 2)
+        assert.equal(worker.count('/renew'), 0)
+    } finally {
+        t.mock.timers.reset()
+    }
+})
+
+/* -------- images/video: qwen.ai silent on a poll is a poll let go by, not the request's end -- */
+
+const SILENT_POLL = 'опрос пропущен'
+const GIVEN_UP = 'запрос завершается отказом'
+// qwen.ai said nothing for the call's whole budget; the road to it failed.
+const silent = () => refused(504, 'egress_timeout')
+const failedRoad = () => refused(502, 'egress_failed')
+// qwen.ai's own answer: the task is not done. It is an answer all the same.
+const running = () => json({ task_status: 'running' })
+// The chat, as its detail comes back: with nothing in it yet, with the task in its history,
+// with two tasks — a video's answer can name more than one.
+const emptyChat = () => egress({ success: true, data: { chat: { history: { messages: {} } } } })
+const withTaskInHistory = () => egress({
+    success: true,
+    data: { chat: { history: { messages: { m1: { task_id: 'task-1' } } } } }
+})
+const withTwoTasksInHistory = () => egress({
+    success: true,
+    data: { chat: { history: { messages: { m1: { task_id: 'task-1' }, m2: { task_id: 'task-2' } } } } }
+})
+const lookups = () => worker.sent('/egress').filter(call => call.url === CHAT_INFO)
+const pollsOf = id => worker.sent('/egress').filter(call => call.url === `https://chat.qwen.ai/api/v1/tasks/status/${id}`).length
+
+// What the app warns of while `fn` runs, a line each.
+async function withWarnings(fn) {
+    const warned = []
+    const warn = logger.warn
+    logger.warn = (...args) => { warned.push(args.map(String).join(' ')); warn(...args) }
+    try {
+        await fn()
+    } finally {
+        logger.warn = warn
+    }
+    return warned
+}
+const skippedSaid = () => logs.some(args => String(args[0]).includes(SILENT_POLL))
+
+// A video request to its end with the clock in the test's hand: the task's
+// twenty seconds between two polls are ticked off as the app asks for them.
+// The clock has to be the test's (t.mock.timers) before this is called.
+async function videoToItsEnd(t, { generations: relayed, chatDetail, taskStatus }) {
+    qwenBehindThePage({ generations: relayed, chatDetail, taskStatus })
+    const res = response()
+    const handled = withAccount(givenAccount(), () => handleImageVideoCompletion({ body: T2V }, res))
+    for (let i = 0; i < 400 && !res.writableEnded; i++) {
+        await new Promise(resolve => setImmediate(resolve))
+        t.mock.timers.tick(20000)
+    }
+    await handled
+    return res
+}
+
+test('Qwen2API-03v: qwen.ai silent on one poll of the video task — the poll is let go by with a warning, and the next one waits the task\'s own twenty seconds', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const statuses = [silent(), done()]
+    let res
+    let warned
+    try {
+        warned = await withWarnings(async () => {
+            qwenBehindThePage({ generations: [task()], taskStatus: () => statuses.shift() })
+            res = response()
+            const handled = withAccount(givenAccount(), () => handleImageVideoCompletion({ body: T2V }, res))
+            // The poll was let go by — the app has said so, and asked for its pause.
+            for (let i = 0; i < 200 && !skippedSaid(); i++) await new Promise(resolve => setImmediate(resolve))
+            assert.equal(polls().length, 1)
+            // The pause is the task's own, to the second: not a shorter one for a poll that got no answer.
+            t.mock.timers.tick(19999)
+            for (let i = 0; i < 200; i++) await new Promise(resolve => setImmediate(resolve))
+            assert.equal(polls().length, 1, 'the next poll waits')
+            t.mock.timers.tick(1)
+            for (let i = 0; i < 400 && !res.writableEnded; i++) {
+                await new Promise(resolve => setImmediate(resolve))
+                t.mock.timers.tick(20000)
+            }
+            await handled
+        })
+
+        assert.equal(res.statusCode, 200)
+        assert.ok(res.body.choices[0].message.content.includes(VIDEO_URL))
+        assert.equal(polls().length, 2, 'the poll that was let go by, and the one after it')
+        // Nothing in the page is wrong with it: no reload, no password, nothing sent from Node.
+        // The chats/new, the generation, and the two polls.
+        assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress', '/egress'])
+        assert.deepEqual(direct, [])
+        assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false, false, false])
+        // Said as what it is — a warning, with the worker's code — and the call's own failure
+        // is where it always was, in the log: the seam's line with the worker's code.
+        assert.equal(warned.filter(line => line.includes(SILENT_POLL)).length, 1)
+        assert.ok(warned.some(line => line.includes(SILENT_POLL) && line.includes('egress_timeout') && line.includes('1 из 2')))
+        assert.equal(warned.filter(line => line.includes(GIVEN_UP)).length, 0)
+        assert.ok(logs.some(args => String(args[0]).includes('/api/v1/tasks/status/task-1') && String(args[0]).includes('egress_timeout')))
+    } finally {
+        t.mock.timers.reset()
+    }
+})
+
+test('Qwen2API-03v: qwen.ai silent on two polls in a row — both are let go by, and the task is had on the third', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const statuses = [silent(), failedRoad(), done()]
+    let res
+    let warned
+    try {
+        warned = await withWarnings(async () => {
+            res = await videoToItsEnd(t, { generations: [task()], taskStatus: () => statuses.shift() })
+        })
+    } finally {
+        t.mock.timers.reset()
+    }
+    assert.equal(res.statusCode, 200)
+    assert.ok(res.body.choices[0].message.content.includes(VIDEO_URL))
+    assert.equal(polls().length, 3)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress', '/egress', '/egress'])
+    assert.deepEqual(direct, [])
+    const skipped = warned.filter(line => line.includes(SILENT_POLL))
+    assert.equal(skipped.length, 2)
+    assert.ok(skipped[0].includes('egress_timeout') && skipped[0].includes('1 из 2'))
+    assert.ok(skipped[1].includes('egress_failed') && skipped[1].includes('2 из 2'))
+    assert.equal(warned.filter(line => line.includes(GIVEN_UP)).length, 0)
+})
+
+test('Qwen2API-03v: qwen.ai silent on three polls in a row — the request fails with the same 503, on the third poll and no further', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    let res
+    let warned
+    try {
+        warned = await withWarnings(async () => {
+            res = await videoToItsEnd(t, { generations: [task()], taskStatus: silent })
+        })
+    } finally {
+        t.mock.timers.reset()
+    }
+    // What a poll the worker could not carry always was to the client.
+    assert.equal(res.statusCode, 503)
+    assert.deepEqual(res.body, TRANSPORT_FAILURE)
+    assert.equal(polls().length, 3, 'two let go by, and the third is the last')
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress', '/egress', '/egress'])
+    assert.equal(worker.count('/renew'), 0, 'nothing in the page is wrong with it')
+    assert.equal(worker.count('/session'), 0)
+    assert.deepEqual(direct, [])
+    assert.equal(warned.filter(line => line.includes(SILENT_POLL)).length, 2)
+    assert.ok(warned.some(line => line.includes(GIVEN_UP) && line.includes('egress_timeout')), 'the third is said as the end it is')
+})
+
+test('Qwen2API-03v: an answer of qwen.ai\'s between silent polls starts the count over — two, an answer, two, an answer, two', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const statuses = [silent(), silent(), running(), silent(), silent(), running(), silent(), silent(), done()]
+    let res
+    try {
+        res = await videoToItsEnd(t, { generations: [task()], taskStatus: () => statuses.shift() })
+    } finally {
+        t.mock.timers.reset()
+    }
+    assert.equal(res.statusCode, 200)
+    assert.ok(res.body.choices[0].message.content.includes(VIDEO_URL))
+    // Nine polls: had the count run on, the third would have been the request's end.
+    assert.equal(polls().length, 9)
+    assert.deepEqual(worker.routes(), new Array(11).fill('/egress'))
+    assert.equal(worker.count('/renew'), 0)
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: the count is one for the whole request: it runs on from one task to the next — silence at the end of the first and at the start of the second is one run', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const statuses = {
+        // The first task is polled out to its sixtieth "not done", and that last poll is let go by.
+        'task-1': [...new Array(59).fill(running), silent],
+        'task-2': [silent, silent]
+    }
+    let res
+    try {
+        res = await videoToItsEnd(t, {
+            generations: [picture('')],
+            chatDetail: withTwoTasksInHistory,
+            taskStatus: id => (statuses[id].shift() || running)()
+        })
+    } finally {
+        t.mock.timers.reset()
+    }
+    assert.equal(res.statusCode, 503)
+    assert.deepEqual(res.body, TRANSPORT_FAILURE)
+    // Had each task counted for itself, the second would have been let go by twice, and polled a third time.
+    assert.equal(pollsOf('task-1'), 60)
+    assert.equal(pollsOf('task-2'), 2, 'the second task: two polls, and the second of them was the third in a row')
+})
+
+test('Qwen2API-03v: a lookup in the chat that qwen.ai is silent on is let go by like a poll of the task — the picture is had on the third lookup', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    const details = [silent(), failedRoad(), withPictureInHistory()]
+    let res
+    let warned
+    warned = await withWarnings(async () => {
+        qwenBehindThePage({ generations: [picture('')], chatDetail: () => details.shift() })
+        res = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+    })
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.body.choices[0].message.content, `![image](${IMAGE_URL})`)
+    assert.equal(lookups().length, 3)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress', '/egress', '/egress'])
+    assert.equal(worker.count('/renew'), 0)
+    assert.deepEqual(direct, [])
+    assert.equal(warned.filter(line => line.includes(SILENT_POLL)).length, 2)
+    assert.equal(warned.filter(line => line.includes(GIVEN_UP)).length, 0)
+})
+
+test('Qwen2API-03v: three silent lookups in a row — the same 503, after three lookups and not five', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    let res
+    let warned
+    warned = await withWarnings(async () => {
+        qwenBehindThePage({ generations: [picture('')], chatDetail: silent })
+        res = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+    })
+    assert.equal(res.statusCode, 503)
+    assert.deepEqual(res.body, TRANSPORT_FAILURE)
+    assert.equal(lookups().length, 3, 'two let go by, and the third is the last')
+    assert.equal(worker.count('/renew'), 0)
+    assert.deepEqual(direct, [])
+    assert.ok(warned.some(line => line.includes(GIVEN_UP)))
+})
+
+test('Qwen2API-03v: an answer between silent lookups of the chat starts the count over — for a picture too', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    // Five lookups is all a picture is given: two silent, an answer with no picture in it, a silent one, and the picture.
+    const details = [silent(), failedRoad(), emptyChat(), silent(), withPictureInHistory()]
+    let res
+    let warned
+    warned = await withWarnings(async () => {
+        qwenBehindThePage({ generations: [picture('')], chatDetail: () => details.shift() })
+        res = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+    })
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.body.choices[0].message.content, `![image](${IMAGE_URL})`)
+    assert.equal(lookups().length, 5)
+    assert.equal(warned.filter(line => line.includes(SILENT_POLL)).length, 3)
+    assert.equal(warned.filter(line => line.includes(GIVEN_UP)).length, 0)
+    assert.equal(worker.count('/renew'), 0)
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: a lookup let go by is one of the five — let go by on the last, it ends in the picture\'s own "no link", not in the 503', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    // Two silent, two answers with no picture in them, and the fifth goes by: nothing is left to look for the picture.
+    const details = [silent(), silent(), emptyChat(), emptyChat(), silent()]
+    let res
+    let warned
+    warned = await withWarnings(async () => {
+        qwenBehindThePage({ generations: [picture('')], chatDetail: () => details.shift() })
+        res = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+    })
+    // The request spent its lookups, as after five "not ready yet": the error is the loop's own.
+    assert.equal(res.statusCode, 500)
+    assert.ok(JSON.stringify(res.body).includes('上游未返回图片链接'))
+    assert.equal(lookups().length, 5)
+    // What became of the last lookup is in the log, and nowhere else.
+    assert.equal(warned.filter(line => line.includes(SILENT_POLL)).length, 3)
+    assert.equal(warned.filter(line => line.includes(GIVEN_UP)).length, 0)
+    assert.equal(worker.count('/renew'), 0)
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: a video whose task is looked up in the chat through the silence, and then polled through more of it', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    // In the chat: two silent lookups, an answer with no task in it, a silent one, and the answer that names the task.
+    // Had the count run on through the answer, the fourth lookup would have been the third in a row.
+    const details = [silent(), failedRoad(), emptyChat(), silent(), withTaskInHistory()]
+    const statuses = [silent(), failedRoad(), done()]
+    let res
+    try {
+        res = await videoToItsEnd(t, {
+            generations: [picture('')],
+            chatDetail: () => details.shift(),
+            taskStatus: () => statuses.shift()
+        })
+    } finally {
+        t.mock.timers.reset()
+    }
+    assert.equal(res.statusCode, 200)
+    assert.ok(res.body.choices[0].message.content.includes(VIDEO_URL))
+    assert.equal(lookups().length, 5)
+    assert.equal(polls().length, 3)
+    assert.deepEqual(worker.routes(), new Array(10).fill('/egress'))
+    assert.equal(worker.count('/renew'), 0)
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: what is not qwen.ai\'s silence still ends the request at once — the worker\'s refusal, the limit of pages, a session refused, a challenge', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const SESSION_FAILURE = { error: 'Qwen session authorization rejected; this is not Qwen2API client authentication', code: 'upstream_session_unauthorized' }
+    try {
+        for (const [reply, status, body, pollCount, what] of [
+            [() => refused(502, 'page_closed'), 503, TRANSPORT_FAILURE, 1, 'a page that closed'],
+            [() => refused(502, 'page_fault'), 503, TRANSPORT_FAILURE, 1, 'a script of the page cut the call'],
+            [() => refused(502, 'egress_too_large'), 503, TRANSPORT_FAILURE, 1, 'an answer over the page\'s limit'],
+            [() => refused(503, 'resident_capacity'), 503, TRANSPORT_FAILURE, 1, 'the limit of pages'],
+            [() => unauthorized(), 502, SESSION_FAILURE, 2, 'a session refused, and refused again after the reload'],
+            [() => challenged(), 503, { error: 'Qwen requires WAF/CAPTCHA verification', code: 'upstream_waf_challenge', retry_after: 30 }, 2, 'a challenge page, twice']
+        ]) {
+            worker.calls.length = 0
+            logs.length = 0
+            let warned
+            let res
+            warned = await withWarnings(async () => {
+                res = await videoToItsEnd(t, { generations: [task()], taskStatus: reply })
+            })
+            assert.equal(res.statusCode, status, what)
+            assert.deepEqual(res.body, body, what)
+            assert.equal(polls().length, pollCount, `${what}: the poll is not gone on with`)
+            assert.equal(
+                warned.filter(line => line.includes(SILENT_POLL) || line.includes(GIVEN_UP)).length, 0,
+                `${what}: none of it is qwen.ai's silence`
+            )
+        }
+    } finally {
+        t.mock.timers.reset()
+    }
+    assert.equal(worker.count('/session'), 0, 'none of it costs a password')
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: a lookup in the chat of a video that the worker cannot carry ends the request at once — it is not looked up five times over', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    try {
+        for (const code of ['page_closed', 'page_fault']) {
+            worker.calls.length = 0
+            logs.length = 0
+            let warned
+            let res
+            warned = await withWarnings(async () => {
+                res = await videoToItsEnd(t, { generations: [picture('')], chatDetail: () => refused(502, code) })
+            })
+            assert.equal(res.statusCode, 503, code)
+            assert.deepEqual(res.body, TRANSPORT_FAILURE, code)
+            assert.equal(lookups().length, 1, `${code}: one lookup, and it was the last`)
+            assert.equal(polls().length, 0, code)
+            assert.equal(warned.filter(line => line.includes(SILENT_POLL) || line.includes(GIVEN_UP)).length, 0, code)
+        }
+    } finally {
+        t.mock.timers.reset()
+    }
+    assert.equal(worker.count('/renew'), 0)
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: a worker that is not there when the task is polled ends the request at once — it carries no code to let go by', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const there = config.signinWorkerUrl
+    let res
+    let warned
+    try {
+        // The worker is there for the chats/new and for the generation, and is gone by the first poll.
+        const stream = task()
+        warned = await withWarnings(async () => {
+            res = await videoToItsEnd(t, {
+                generations: [{
+                    open: (serverResponse, request) => {
+                        config.signinWorkerUrl = 'http://127.0.0.1:1'
+                        return stream.open(serverResponse, request)
+                    }
+                }],
+                taskStatus: done
+            })
+        })
+    } finally {
+        config.signinWorkerUrl = there
+        t.mock.timers.reset()
+    }
+    assert.equal(res.statusCode, 503)
+    assert.deepEqual(res.body, TRANSPORT_FAILURE)
+    // The poll never reached the worker: it is not among what the worker was sent.
+    assert.equal(worker.sent('/egress').length, 2)
+    assert.equal(warned.filter(line => line.includes(SILENT_POLL)).length, 0)
+    assert.deepEqual(direct, [])
+})
+
+/* ------------------------------------- files: STS token and parse from the page (Qwen2API-03v) -- */
+
+const upload = require('../src/utils/upload')
+const { ContextExternalizationError } = require('../src/utils/upstream-error')
+const OSS = require('ali-oss')
+const CONTENT = Buffer.from('file content')
+// The STS call's body, as the direct path builds it.
+const STS_BODY = { filename: 'upload.txt', filesize: CONTENT.length, filetype: 'file' }
+
+// OSS is ali-oss's own client, not axios: its put is what stands between the test and its network.
+async function withOssPut(put, fn) {
+    const real = OSS.prototype.put
+    OSS.prototype.put = put
+    try {
+        return await fn()
+    } finally {
+        OSS.prototype.put = real
+    }
+}
+const putRecording = puts => async function (objectKey, content) {
+    puts.push({ objectKey, content: content.toString(), agent: this.agent ?? null, urllib: this.urllib ?? null })
+    return { res: { status: 200 } }
+}
+const qwenFilesBehindThePage = (sts, parse, parseStatus) => {
+    worker.script.egress = body => {
+        assert.equal(body.stream, undefined, 'a whole-answer call')
+        const pathname = new URL(body.url).pathname
+        if (pathname === '/api/v1/files/getstsToken') return typeof sts === 'function' ? sts() : sts
+        if (pathname === '/api/v2/files/parse') return typeof parse === 'function' ? parse() : parse
+        if (pathname === '/api/v2/files/parse/status') return typeof parseStatus === 'function' ? parseStatus() : parseStatus
+        throw new Error(`nothing on the page answers ${pathname}`)
+    }
+}
+const PARSE_OK = () => json({ success: true, data: {} })
+const parsed = fileId => () => json({ success: true, data: { list: [{ file_id: fileId, status: 'success' }] } })
+
+test('Qwen2API-03v: the STS token is asked of the page, with no Bearer — and the file\'s bytes go to OSS directly, as before', async () => {
+    const account = givenAccount()
+    qwenFilesBehindThePage(() => json({ success: true, data: STS }))
+    const puts = []
+
+    const result = await withOssPut(putRecording(puts), () =>
+        upload.uploadFileToQwenOss(CONTENT, 'upload.txt', account.token, account))
+    assert.deepEqual(
+        { status: result.status, file_url: result.file_url, file_id: result.file_id },
+        { status: 200, file_url: STS.file_url, file_id: STS.file_id }
+    )
+
+    const [call] = worker.sent('/egress')
+    assert.equal(call.url, STS_TOKEN)
+    assert.equal(call.method, 'POST')
+    assert.equal(call.timeoutMs, 30000)
+    assert.deepEqual(JSON.parse(call.body), STS_BODY)
+    assert.deepEqual(Object.keys(call.headers).sort(), ['content-type', 'x-request-id'])
+    assert.equal(call.headers['content-type'], 'application/json')
+    assert.equal(bringsBearer(call), false)
+    // The bytes never enter the page: OSS is not qwen.ai, and the worker lets nothing leave for it.
+    assert.equal(puts.length, 1)
+    assert.equal(puts[0].objectKey, STS.file_path)
+    assert.equal(puts[0].content, CONTENT.toString())
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: a file is parsed by the page — parse, then its status — with no Bearer', async () => {
+    const account = givenAccount()
+    const statuses = [
+        json({ success: true, data: { list: [{ file_id: 'file-1', status: 'parsing' }] } }),
+        json({ success: true, data: { list: [{ file_id: 'file-1', status: 'success' }] } })
+    ]
+    qwenFilesBehindThePage(json({ success: true, data: STS }), PARSE_OK, () => statuses.shift())
+
+    const ok = await upload.parseUploadedTextFile('file-1', account.token, account, { intervalMs: 5, maxAttempts: 10, timeoutMs: 20000 })
+    assert.equal(ok, true)
+    assert.deepEqual(worker.sent('/egress').map(call => [call.method, new URL(call.url).pathname, JSON.parse(call.body), call.timeoutMs]), [
+        ['POST', '/api/v2/files/parse', { file_id: 'file-1' }, 20000],
+        ['POST', '/api/v2/files/parse/status', { file_id_list: ['file-1'] }, 20000],
+        ['POST', '/api/v2/files/parse/status', { file_id_list: ['file-1'] }, 20000]
+    ])
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false, false])
+    assert.ok(worker.sent('/egress').every(call => Object.keys(call.headers).sort().join() === 'content-type,x-request-id'))
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: an agent context file goes up whole — STS of the page, bytes to OSS, parse by the page', async () => {
+    const account = givenAccount()
+    upload.resetParseBreaker()
+    upload.resetParseRateLimiter()
+    qwenFilesBehindThePage(() => json({ success: true, data: STS }), PARSE_OK, parsed(STS.file_id))
+    const puts = []
+
+    const descriptor = await withOssPut(putRecording(puts), () =>
+        upload.uploadAgentContextFile('the long history', account.token, account, { intervalMs: 5, maxAttempts: 5 }))
+    assert.equal(descriptor.id, STS.file_id)
+    assert.equal(descriptor.url, STS.file_url)
+    assert.equal(puts.length, 1)
+    // STS, parse, the status: three calls, all the page's.
+    assert.deepEqual(worker.sent('/egress').map(call => new URL(call.url).pathname), [
+        '/api/v1/files/getstsToken', '/api/v2/files/parse', '/api/v2/files/parse/status'
+    ])
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false, false])
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: the STS call refused as unauthorized is recovered with one reload and one retry', async () => {
+    const account = givenAccount()
+    const answers = [unauthorized(), json({ success: true, data: STS })]
+    qwenFilesBehindThePage(() => answers.shift())
+    const puts = []
+
+    const result = await withOssPut(putRecording(puts), () =>
+        upload.uploadFileToQwenOss(CONTENT, 'upload.txt', account.token, account))
+    assert.equal(result.status, 200)
+    assert.equal(puts.length, 1)
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'])
+})
+
+test('Qwen2API-03v: a worker that cannot carry the STS call is the 503 at once — not three retries, and no upload', async () => {
+    const account = givenAccount()
+    qwenFilesBehindThePage(refused(502, 'page_closed'))
+    const puts = []
+
+    await assert.rejects(withOssPut(putRecording(puts), () =>
+        upload.uploadFileToQwenOss(CONTENT, 'upload.txt', account.token, account)), callRefused('upstream_transport_error', 503))
+    // The direct path retried a timed-out STS call three times: a worker that
+    // cannot carry it is not asked again, and nothing of it is uploaded.
+    assert.deepEqual(worker.routes(), ['/egress'])
+    assert.equal(puts.length, 0)
+    assert.equal(worker.count('/renew'), 0)
+})
+
+test('Qwen2API-03v: a worker that cannot carry a parse call ends the parse at once — no thirty polls', async () => {
+    const account = givenAccount()
+    qwenFilesBehindThePage(json({ success: true, data: STS }), () => refused(502, 'page_closed'))
+
+    await assert.rejects(upload.parseUploadedTextFile('file-1', account.token, account, { intervalMs: 5, maxAttempts: 30 }),
+        callRefused('upstream_transport_error', 503))
+    assert.equal(worker.count('/egress'), 1)
+})
+
+test('Qwen2API-03v: a parse answered with a challenge page twice is the challenge the direct path names — and its status is never polled', async () => {
+    const account = givenAccount()
+    qwenFilesBehindThePage(json({ success: true, data: STS }), () => challenged())
+
+    await assert.rejects(upload.parseUploadedTextFile('file-1', account.token, account, { intervalMs: 5, maxAttempts: 30 }), error => {
+        // The parse breaker's strike and the client's Retry-After: named as the direct path names it.
+        assert.equal(error.code, 'qwen_parse_waf_challenge')
+        assert.equal(error.parseCode, 'WAF_CAPTCHA')
+        assert.equal(error.egress, 'direct')
+        assert.match(error.message, /WAF_CAPTCHA/)
+        assert.equal(new ContextExternalizationError(error).publicMessage, 'Upstream WAF is challenging document parse; retry shortly')
+        return true
+    })
+    assert.deepEqual(worker.sent('/egress').map(call => new URL(call.url).pathname), ['/api/v2/files/parse', '/api/v2/files/parse'])
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'])
+    await until(() => sessionPersistence.renewals.size === 0)
+    assert.equal(worker.count('/session'), 0)
+})
+
+test('Qwen2API-03v: three challenged parses through the page open the parse breaker — nothing is uploaded while it is open', { timeout: 15000 }, async () => {
+    const account = givenAccount()
+    qwenFilesBehindThePage(() => json({ success: true, data: STS }), () => challenged())
+    const puts = []
+    const context = { intervalMs: 5 }
+
+    for (let i = 1; i <= 3; i++) {
+        upload.resetParseRateLimiter()
+        await assert.rejects(withOssPut(putRecording(puts), () =>
+            upload.uploadAgentContextFile('the long history', account.token, account, context)), error => {
+            assert.equal(error.code, 'qwen_parse_waf_challenge', `upload ${i}`)
+            // The third one opens the breaker, and says how long for.
+            assert.equal(error.retryAfterSeconds, i < 3 ? undefined : config.agentParseBreakerSeconds, `upload ${i}`)
+            return true
+        })
+    }
+    assert.equal(puts.length, 3)
+
+    // Open: the next one is refused before a byte leaves — with the wait the client is to back off by.
+    upload.resetParseRateLimiter()
+    worker.calls.length = 0
+    await assert.rejects(withOssPut(putRecording(puts), () =>
+        upload.uploadAgentContextFile('the long history', account.token, account, context)), error => {
+        assert.equal(error.breakerOpen, true)
+        assert.ok(error.retryAfterSeconds > 0 && error.retryAfterSeconds <= config.agentParseBreakerSeconds)
+        return true
+    })
+    assert.deepEqual(worker.routes(), [])
+    assert.equal(puts.length, 3, 'no upload while the breaker is open')
+    upload.resetParseBreaker()
+})
+
+test('Qwen2API-03v: the STS call is retried on qwen.ai\'s 5xx and on its silence, as it always was', { timeout: 15000 }, async () => {
+    const account = givenAccount()
+    for (const [first, what] of [[() => json({ success: false }, 503), 'a 5xx'], [() => refused(504, 'egress_timeout'), 'a timeout']]) {
+        worker.calls.length = 0
+        const puts = []
+        const answers = [first, () => json({ success: true, data: STS })]
+        qwenFilesBehindThePage(() => answers.shift()())
+
+        const result = await withOssPut(putRecording(puts), () =>
+            upload.uploadFileToQwenOss(CONTENT, 'upload.txt', account.token, account))
+        assert.equal(result.status, 200, what)
+        // Asked once more, and no more than the direct path asked: nothing of the page is touched for it.
+        assert.deepEqual(worker.routes(), ['/egress', '/egress'], what)
+        assert.equal(puts.length, 1, what)
+    }
+})
+
+test('Qwen2API-03v: a 403 on the STS call is still the token error it was, and is not retried', async () => {
+    const account = givenAccount()
+    qwenFilesBehindThePage(() => json({ success: false, code: 'Forbidden' }, 403))
+
+    await assert.rejects(upload.uploadFileToQwenOss(CONTENT, 'upload.txt', account.token, account), { message: '认证失败，请检查Token权限' })
+    assert.deepEqual(worker.routes(), ['/egress'])
+})
+
+test('Qwen2API-03v: what qwen.ai answers the parse with is read as it always was', async () => {
+    const account = givenAccount()
+    // The shape measured on 2026-09-09: HTTP 200, success:false, the service's own code.
+    qwenFilesBehindThePage(null, () => json({ success: false, data: { code: 'Internal_Server_Error' } }))
+
+    await assert.rejects(upload.parseUploadedTextFile('file-1', account.token, account, { intervalMs: 5, maxAttempts: 30 }), error => {
+        assert.equal(error.code, 'qwen_parse_unavailable')
+        assert.equal(error.parseCode, 'Internal_Server_Error')
+        return true
+    })
+    assert.equal(worker.count('/egress'), 1, 'on the first call, as before')
+})
+
+test('Qwen2API-03v: with chats/new direct, STS and parse stay on axios, with the Bearer they always carried', async () => {
+    config.chatCreationTransport = 'direct'
+    const account = givenAccount()
+    directReply = async url => {
+        if (url.endsWith('/api/v1/files/getstsToken')) return { status: 200, data: STS }
+        if (url.endsWith('/api/v2/files/parse')) return { data: { success: true, data: {} } }
+        if (url.endsWith('/api/v2/files/parse/status')) return { data: { success: true, data: { list: [{ file_id: STS.file_id, status: 'success' }] } } }
+        assert.fail(`no direct call to ${url} is scripted`)
+    }
+
+    const result = await withOssPut(putRecording([]), () => upload.uploadFileToQwenOss(CONTENT, 'upload.txt', account.token, account))
+    assert.equal(result.status, 200)
+    assert.equal(await upload.parseUploadedTextFile(STS.file_id, account.token, account, { intervalMs: 5 }), true)
+    assert.deepEqual(direct.map(call => new URL(call.url).pathname), [
+        '/api/v1/files/getstsToken', '/api/v2/files/parse', '/api/v2/files/parse/status'
+    ])
+    assert.deepEqual(direct.map(bearerOf), [`Bearer ${account.token}`, `Bearer ${account.token}`, `Bearer ${account.token}`])
+    assert.equal(worker.calls.length, 0, 'the worker is not involved')
+})

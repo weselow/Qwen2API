@@ -7,7 +7,8 @@ const {
     TOOL_CALL_OPEN
 } = require('../utils/tool-prompt.js')
 const { stripAgentTags } = require('../utils/agent-turn.js')
-const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js')
+const { createUpstreamResponseFilter } = require('../utils/sse.js')
+const { watchClient, isClientGone, consumeWhileClientStays } = require('../utils/client-gone.js')
 const accountManager = require('../utils/account.js')
 const config = require('../config/index.js')
 const { logger } = require('../utils/logger')
@@ -411,13 +412,14 @@ const handleOpenAIAgentStream = async (
                 sendChatRequest: options.sendChatRequest || sendChatRequest,
                 on_reasoning_delta: onReasoningDelta,
                 on_content_delta: onContentDelta,
-                on_upstream_frame: commitStream,
-                isClientDisconnected: () => res.destroyed || res.writableEnded
+                on_upstream_frame: commitStream
             }),
             options.agent_processing_heartbeat_ms,
             commitStream
         )
     } catch (error) {
+        // The client went away and the upstream was closed for it: nothing failed.
+        if (isClientGone(error)) return
         logger.error('OpenAI Agent 回合处理失败', 'AGENT', '', error)
         if (!error.accountFailureRecorded) {
             noteRateLimitedAccount(error, error.failedAccountEmail ? { email: error.failedAccountEmail } : options.currentAccount)
@@ -536,12 +538,13 @@ const handleOpenAIAgentNonStream = async (
             () => runOpenAIAgentTurn(response, {
                 ...options,
                 requestBody,
-                sendChatRequest: options.sendChatRequest || sendChatRequest,
-                isClientDisconnected: () => res.destroyed || res.writableEnded
+                sendChatRequest: options.sendChatRequest || sendChatRequest
             }),
             options.agent_processing_heartbeat_ms
         )
     } catch (error) {
+        // The client went away and the upstream was closed for it: nothing failed.
+        if (isClientGone(error)) return
         logger.error('OpenAI 非流式 Agent 回合处理失败', 'AGENT', '', error)
         if (!error.accountFailureRecorded) {
             noteRateLimitedAccount(error, error.failedAccountEmail ? { email: error.failedAccountEmail } : options.currentAccount)
@@ -793,7 +796,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
          * @returns {Promise<void>} 流处理完成的 Promise
          */
         const pipeUpstream = async (upstreamResponse) => {
-            const result = await consumeSSEStream(upstreamResponse, async (frame) => {
+            const result = await consumeWhileClientStays(upstreamResponse, async (frame) => {
                 if (!frame.data || frame.data.trim() === '[DONE]') return
                 try {
                     await processSSEPayload(frame.data, upstreamResponse)
@@ -801,7 +804,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                     logger.error('流式数据处理错误', 'CHAT', '', error)
                     throw error
                 }
-            })
+            }, { client: options.client })
             upstreamCompleted = result.completed
             upstreamEventCount = result.eventCount
         }
@@ -828,6 +831,8 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                     await pipeUpstream(retryResp.response)
                 }
             } catch (e) {
+                // The client went away and the upstream was closed for it: nothing failed.
+                if (isClientGone(e)) throw e
                 logger.error('Agent 补偿重试失败', 'CHAT', '', e)
                 if (e.publicMessage) throw e
             }
@@ -889,6 +894,9 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         res.write(`data: [DONE]\n\n`)
         res.end()
     } catch (error) {
+        // The client went away and the upstream was closed for it: nothing failed,
+        // and there is nobody to answer with an error.
+        if (isClientGone(error)) return
         logger.error('聊天处理错误', 'CHAT', '', error)
         // Cuota agotada -> 429 `insufficient_quota`; adjunto caido o chat challenge -> 503
         // `upstream_unavailable` (529 es de Anthropic); cualquier otro fallo conserva su
@@ -1059,10 +1067,10 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         }
 
         const accumulateUpstream = async (upstreamResponse) => {
-            const result = await consumeSSEStream(upstreamResponse, async (frame) => {
+            const result = await consumeWhileClientStays(upstreamResponse, async (frame) => {
                 if (!frame.data || frame.data.trim() === '[DONE]') return
                 await processAccumulatedPayload(frame.data, upstreamResponse)
-            })
+            }, { client: options.client })
             upstreamCompleted = result.completed
             upstreamEventCount = result.eventCount
         }
@@ -1108,6 +1116,8 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                     assistantContent = fullContent.slice(before.length)
                 }
             } catch (e) {
+                // The client went away and the upstream was closed for it: nothing failed.
+                if (isClientGone(e)) throw e
                 logger.error('Agent 补偿重试失败', 'CHAT', '', e)
                 if (e.publicMessage) throw e
             }
@@ -1172,6 +1182,9 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         }
         res.json(bodyTemplate)
     } catch (error) {
+        // The client went away and the upstream was closed for it: nothing failed,
+        // and there is nobody to answer with an error.
+        if (isClientGone(error)) return
         logger.error('非流式聊天处理错误', 'CHAT', '', error)
         noteRateLimitedAccount(error, options.currentAccount)
         if (!res.headersSent) writeOpenAIHttpError(res, upstreamErrorShape(error, '上游响应处理失败'))
@@ -1190,6 +1203,9 @@ const handleChatCompletion = async (req, res) => {
     const enable_thinking = req.enable_thinking
     const enable_web_search = req.enable_web_search
 
+    // Watched until the response is over: a client that goes away takes its
+    // upstream with it, on the signal of req and its socket (utils/client-gone.js).
+    const client = watchClient(req)
     try {
         // Gemelo de anthropic.js: compactar solo sin tools; con tools el fallo del
         // adjunto sale como 503 reintentable (catch de abajo). La clave de sesion permite
@@ -1240,6 +1256,7 @@ const handleChatCompletion = async (req, res) => {
                 tool_history_calls: req.tool_history_calls,
                 currentAccount: response_data.currentAccount,
                 upstreamOptions,
+                client,
                 upstream_request_body: response_data.requestBody,
                 upstream_context: {
                     chatId: response_data.chatId,
@@ -1259,6 +1276,7 @@ const handleChatCompletion = async (req, res) => {
                 tool_history_calls: req.tool_history_calls,
                 currentAccount: response_data.currentAccount,
                 upstreamOptions,
+                client,
                 upstream_request_body: response_data.requestBody,
                 upstream_context: {
                     chatId: response_data.chatId,
@@ -1283,6 +1301,9 @@ const handleChatCompletion = async (req, res) => {
             .json({
                 error: "Invalid token, request failed"
             })
+    } finally {
+        // The socket outlives the request on keep-alive: its closing later is not this client leaving.
+        client.dispose()
     }
 }
 

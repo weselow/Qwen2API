@@ -11,6 +11,7 @@ const { getDefaultModelByChatType } = require('../models/models-map.js')
 const { getSsxmodForAccount } = require('../utils/ssxmod-manager')
 const { applyProxyToAxiosConfig, getChatBaseUrl } = require('../utils/proxy-helper');
 const { buildRequestHeaders } = require('../utils/header-profile')
+const browserEgress = require('../utils/browser-egress.js')
 const {
     assertChatChallengeBreakerClosed, bindChatChallengeContext, chatChallengeFrom,
     isWafChallengeError, noteChatChallengeAnswer, releaseChatProbe, ChatCreationError
@@ -18,6 +19,9 @@ const {
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
+// How long qwen.ai may take with a generation. To axios it is the whole call's
+// budget; through the egress it is the silence between two pieces of the answer.
+const GENERATION_TIMEOUT_MS = 1000 * 60 * 5
 
 /**
  * 将上游响应体格式化为便于日志输出的对象
@@ -1066,17 +1070,27 @@ const readImageUpstreamResult = async (responseStream) => {
 /**
  * 拉取聊天详情
  * @param {string} chatID - 对话 ID
- * @param {string} token - 访问令牌
+ * @param {string} token - 访问令牌（直接路径用）
+ * @param {Object} account - 账户对象：egress 模式下调用从它的页面发出（直接路径不用它，账号按 token 查）
  * @returns {Promise<object|null>} 聊天详情
+ * @throws {ChatCreationError} egress 模式：signin-worker 没能承载调用；或 qwen.ai 拒绝了会话 /
+ *   返回了 WAF challenge 页面，而恢复无济于事——拒绝重复了一次，或恢复被节流、无从进行
+ *   （Qwen2API-03v）。qwen.ai 自己的其它回答（含非 2xx）照旧读作 null。直接路径照旧把任何失败读作 null
  */
-const getChatDetail = async (chatID, token) => {
+const getChatDetail = async (chatID, token, account) => {
     try {
         const chatBaseUrl = getChatBaseUrl()
+        // From the account's page, on the page's own session (Qwen2API-03v): the
+        // app's token is no Bearer qwen.ai takes, and plain Node TLS is not let through.
+        if (browserEgress.enabled()) {
+            const response = await browserEgress.egressJson({ account, url: `${chatBaseUrl}/api/v2/chats/${chatID}` })
+            return response.data || null
+        }
         // 通过 token 反查 account 解析账号级代理（找不到则回退到全局 PROXY_URL）
-        const account = accountManager.getAccountByToken(token)
+        const directAccount = accountManager.getAccountByToken(token)
         // Antidetect: per-account fingerprint headers replace static block
-        const ssxmod = getSsxmodForAccount(account)
-        const headers = buildRequestHeaders(account, {
+        const ssxmod = getSsxmodForAccount(directAccount)
+        const headers = buildRequestHeaders(directAccount, {
             chatBaseUrl,
             token,
             ssxmodItna: ssxmod.ssxmod_itna,
@@ -1090,12 +1104,18 @@ const getChatDetail = async (chatID, token) => {
             headers
         }
 
-        applyProxyToAxiosConfig(requestConfig, account);
+        applyProxyToAxiosConfig(requestConfig, directAccount);
 
         const responseData = await axios.get(`${chatBaseUrl}/api/v2/chats/${chatID}`, requestConfig)
         return responseData.data || null
     } catch (error) {
         logger.error(`获取聊天详情失败 (${chatID})`, 'CHAT', '', buildAxiosErrorLog(error))
+        // What qwen.ai answered is what it answered, and the caller polls on as
+        // it always did. What the egress could not get answered — the session
+        // refused twice, a challenge twice, a worker that could not carry the
+        // call — is not "not ready yet": read as null it would be polled for
+        // the twenty minutes a video task is given (Qwen2API-03v).
+        if (browserEgress.enabled() && error instanceof ChatCreationError) throw error
         return null
     }
 }
@@ -1158,14 +1178,60 @@ const extractVideoInfoFromChatDetail = (chatDetail, responseIDs = []) => {
     }
 }
 
+// qwen.ai's silence on a poll, once it has crossed the egress: a call the
+// worker could not get answered (`upstream_transport_error`) because qwen.ai
+// said nothing for the call's whole budget (`egress_timeout`) or the road to
+// it failed (`egress_failed`) — qwen.ai's doing or the road's, as the text
+// path reads the same two (UPSTREAM_FAULTS in browser-egress.js). It is not
+// the worker's refusal, which is every other code: a page that closed or
+// hung, its limit of pages, a worker that is not there (no code at all); nor
+// a session refused or a challenge page, which are the session's to recover.
+const POLL_SILENCE = new Set(['egress_timeout', 'egress_failed'])
+const isPollSilence = error => error?.code === 'upstream_transport_error' && POLL_SILENCE.has(error.workerCode)
+
+// How many polls in a row qwen.ai may let go unanswered before the request is
+// given up. A video is generated for minutes and polled six to fifteen times:
+// one slow leg of qwen.ai must not lose the generation that is already paid
+// for — the client would only ask for it again (Qwen2API-03v).
+const MAX_SILENT_POLLS = 2
+
+/**
+ * qwen.ai's silence from one poll to the next of a request. A poll answered —
+ * done or not done, by qwen.ai itself — starts the count over.
+ * @returns {{skipped: function(Error): boolean, answered: function(): void}}
+ */
+const pollSilence = () => {
+    let inARow = 0
+    return {
+        // Whether the poll that failed as `error` went unanswered: counted,
+        // said in the log, and the caller is on to its next poll as after
+        // "not done". False for anything else — the worker's refusal, and the
+        // silence past the allowance — which is the caller's to fail with.
+        skipped: error => {
+            if (!isPollSilence(error)) return false
+            inARow += 1
+            if (inARow > MAX_SILENT_POLLS) {
+                logger.warn(`опрос не отвечен ${inARow} раза подряд: qwen.ai молчит (${error.workerCode}) — запрос завершается отказом`, 'CHAT')
+                return false
+            }
+            logger.warn(`опрос пропущен: qwen.ai молчит через страницу (${error.workerCode}), ${inARow} из ${MAX_SILENT_POLLS} подряд`, 'CHAT')
+            return true
+        },
+        answered: () => {
+            inARow = 0
+        }
+    }
+}
+
 /**
  * 解析图片生成结果链接
  * @param {*} responseData - 上游响应
  * @param {string} chatID - 会话 ID
  * @param {string} token - 当前账号令牌
+ * @param {Object} account - 当前账号：egress 模式下聊天详情从它的页面取（Qwen2API-03v）
  * @returns {Promise<string>} 图片链接
  */
-const resolveImageResultContentUrl = async (responseData, chatID, token) => {
+const resolveImageResultContentUrl = async (responseData, chatID, token, account) => {
     const { upstreamError, contentUrl: upstreamContentUrl, responseIDs, rawPreview } = await readImageUpstreamResult(responseData)
     if (upstreamError) {
         throw upstreamError
@@ -1176,8 +1242,18 @@ const resolveImageResultContentUrl = async (responseData, chatID, token) => {
     if (!contentUrl && chatID) {
         logger.info(`图片上游未直接返回链接，尝试从聊天详情补取，chat_id=${chatID} responseIDs=${JSON.stringify(responseIDs)}`, 'CHAT')
 
+        const silence = pollSilence()
         for (let attempt = 1; attempt <= 5; attempt++) {
-            const chatDetail = await getChatDetail(chatID, token)
+            let chatDetail
+            try {
+                chatDetail = await getChatDetail(chatID, token, account)
+            } catch (error) {
+                // qwen.ai let this lookup go by: the pause, and the next lookup, as after "not ready yet".
+                if (!silence.skipped(error)) throw error
+                await sleep(800)
+                continue
+            }
+            silence.answered()
             const extractedInfo = extractVideoInfoFromChatDetail(chatDetail, responseIDs)
             if (extractedInfo.contentUrl) {
                 contentUrl = extractedInfo.contentUrl
@@ -1201,9 +1277,10 @@ const resolveImageResultContentUrl = async (responseData, chatID, token) => {
  * @param {*} responseStream - 上游响应流
  * @param {string} token - 当前账号令牌
  * @param {string} chatID - 会话 ID
+ * @param {Object} account - 当前账号：egress 模式下聊天详情和任务状态从它的页面取（Qwen2API-03v）
  * @returns {Promise<string>} 视频链接
  */
-const resolveVideoResultContentUrl = async (responseStream, token, chatID) => {
+const resolveVideoResultContentUrl = async (responseStream, token, chatID, account) => {
     const { upstreamError, contentUrl: upstreamContentUrl, videoTaskCandidates, responseIDs, rawPreview } = await readVideoUpstreamResult(responseStream)
     if (upstreamError) {
         throw upstreamError
@@ -1219,11 +1296,27 @@ const resolveVideoResultContentUrl = async (responseStream, token, chatID) => {
     let resolvedContentUrl = upstreamContentUrl
     let resolvedTaskCandidates = [...videoTaskCandidates]
 
+    // One count of qwen.ai's silence for the whole request. Between the lookups
+    // in the chat and the polls of the task it makes no difference — a lookup
+    // is left only by an answer, which starts the count over. It runs on where
+    // a count per loop would be lost: from one task candidate to the next,
+    // when the first has been polled out to its sixtieth "not done".
+    const silence = pollSilence()
+
     if (!resolvedContentUrl && resolvedTaskCandidates.length === 0 && chatID) {
         logger.info(`视频上游未直接返回任务信息，尝试从聊天详情补取，chat_id=${chatID} responseIDs=${JSON.stringify(responseIDs)}`, 'CHAT')
 
         for (let attempt = 1; attempt <= 5; attempt++) {
-            const chatDetail = await getChatDetail(chatID, token)
+            let chatDetail
+            try {
+                chatDetail = await getChatDetail(chatID, token, account)
+            } catch (error) {
+                // qwen.ai let this lookup go by: the pause, and the next lookup, as after "nothing there yet".
+                if (!silence.skipped(error)) throw error
+                await sleep(1200)
+                continue
+            }
+            silence.answered()
             const extractedInfo = extractVideoInfoFromChatDetail(chatDetail, responseIDs)
 
             if (!resolvedContentUrl && extractedInfo.contentUrl) {
@@ -1262,7 +1355,16 @@ const resolveVideoResultContentUrl = async (responseStream, token, chatID) => {
         logger.info(`开始轮询视频任务ID: ${taskCandidate}`, 'CHAT')
 
         for (let i = 0; i < maxAttempts; i++) {
-            const content = await getVideoTaskStatus(taskCandidate, token)
+            let content
+            try {
+                content = await getVideoTaskStatus(taskCandidate, token, account)
+            } catch (error) {
+                // One poll qwen.ai let go by is one of the task's sixty, as its "not done" is.
+                if (!silence.skipped(error)) throw error
+                await sleep(delay)
+                continue
+            }
+            silence.answered()
             if (content) {
                 return content
             }
@@ -1416,25 +1518,13 @@ const generateImageVideoResult = async (payload) => {
         }
 
         const chatBaseUrl = getChatBaseUrl()
-        // Antidetect: per-account fingerprint headers replace static block
-        const ssxmod = getSsxmodForAccount(account)
         // The Accept header depends on whether the upstream call streams, so the
         // flag has to be resolved before the headers are built. Declaring it after
         // this block put it in the temporal dead zone and threw
         // "Cannot access 'upstreamStream' before initialization" on every call.
         const newChatType = reqBody.messages[0]?.chat_type
         const upstreamStream = newChatType === 't2i' || newChatType === 'image_edit'
-        const headers = buildRequestHeaders(account, {
-            chatBaseUrl,
-            token,
-            ssxmodItna: ssxmod.ssxmod_itna,
-            ssxmodItna2: ssxmod.ssxmod_itna2,
-            accept: upstreamStream ? 'application/json, text/plain, */*' : 'application/json',
-            extra: {
-                'authorization': `Bearer ${token}`,
-                'bx-v': '2.5.36'
-            }
-        })
+        const completionsUrl = `${chatBaseUrl}/api/v2/chat/completions?chat_id=${chatID}`
 
         logger.info('发送图片视频请求', 'CHAT')
         logger.info(`选择图片: ${selectedImageList[selectedImageList.length - 1] || '未选择图片，切换生成图/视频模式'}`, 'CHAT')
@@ -1444,20 +1534,56 @@ const generateImageVideoResult = async (payload) => {
 
         logger.info(`图片视频流策略: upstream=${upstreamStream} downstream=${payload.stream === true}`, 'CHAT')
 
-        const requestConfig = {
-            headers,
-            responseType: newChatType === 't2v' ? 'json' : (upstreamStream ? 'stream' : 'text'),
-            timeout: 1000 * 60 * 5
+        // The direct call's config, built for the direct call alone: through the
+        // egress (Qwen2API-03v) the generation leaves from the account's page
+        // as the page's own completions call, and none of it is used.
+        const directCallConfig = () => {
+            // Antidetect: per-account fingerprint headers replace static block
+            const ssxmod = getSsxmodForAccount(account)
+            const headers = buildRequestHeaders(account, {
+                chatBaseUrl,
+                token,
+                ssxmodItna: ssxmod.ssxmod_itna,
+                ssxmodItna2: ssxmod.ssxmod_itna2,
+                accept: upstreamStream ? 'application/json, text/plain, */*' : 'application/json',
+                extra: {
+                    'authorization': `Bearer ${token}`,
+                    'bx-v': '2.5.36'
+                }
+            })
+            const requestConfig = {
+                headers,
+                responseType: newChatType === 't2v' ? 'json' : (upstreamStream ? 'stream' : 'text'),
+                timeout: GENERATION_TIMEOUT_MS
+            }
+            applyProxyToAxiosConfig(requestConfig, account);
+            return requestConfig
         }
 
-        applyProxyToAxiosConfig(requestConfig, account);
+        const viaPage = browserEgress.completionsEnabled()
+        let directConfig = null
+        const sendGeneration = async () => {
+            if (!viaPage) {
+                directConfig = directConfig || directCallConfig()
+                return axios.post(completionsUrl, reqBody, directConfig)
+            }
+            // The video's answer is read whole, as the direct path asks Axios for it.
+            const response = await relayedGeneration({
+                url: completionsUrl, body: reqBody, account, whole: newChatType === 't2v'
+            })
+            // The egress may have recovered the session on the way (Qwen2API-3ue.3):
+            // a call that follows on the direct road (chats/new direct, completions
+            // through the page) rides the token the store holds now, as in request.js.
+            token = sessionPersistence.sessionToken(account, token)
+            return response
+        }
 
         let responseData = null
         const maxUpstreamAttempts = 2
 
         for (let attempt = 1; attempt <= maxUpstreamAttempts; attempt++) {
             try {
-                responseData = await axios.post(`${chatBaseUrl}/api/v2/chat/completions?chat_id=${chatID}`, reqBody, requestConfig)
+                responseData = await sendGeneration()
 
                 bindChatChallengeContext(responseData.data, breakerContext)
                 const inlineUpstreamError = parseUpstreamBody(responseData.data, breakerContext)
@@ -1485,7 +1611,7 @@ const generateImageVideoResult = async (payload) => {
         }
 
         if (newChatType === 't2i' || newChatType === 'image_edit') {
-            const contentUrl = await resolveImageResultContentUrl(responseData.data, chatID, token)
+            const contentUrl = await resolveImageResultContentUrl(responseData.data, chatID, token, account)
             noteChatChallengeAnswer(breakerContext)
             return {
                 model,
@@ -1496,7 +1622,7 @@ const generateImageVideoResult = async (payload) => {
         }
 
         if (newChatType === 't2v') {
-            const contentUrl = await resolveVideoResultContentUrl(responseData.data, token, chatID)
+            const contentUrl = await resolveVideoResultContentUrl(responseData.data, token, chatID, account)
             noteChatChallengeAnswer(breakerContext)
             return {
                 model,
@@ -1510,9 +1636,26 @@ const generateImageVideoResult = async (payload) => {
     } catch (error) {
         if (error instanceof ChatCreationError) {
             releaseChatProbe(breakerContext)
-            throw { status: error.status, error: error.publicMessage, code: error.code, chatCreation: true }
+            throw {
+                status: error.status, error: error.publicMessage, code: error.code, chatCreation: true,
+                // A challenge's wait, where the failure brings one (Qwen2API-03v): SDKs back off by it.
+                ...(Number(error.retryAfter) > 0 ? { retry_after: error.retryAfter } : {})
+            }
         }
         logger.error('图片/视频主流程异常', 'CHAT', '', buildAxiosErrorLog(error))
+
+        // The egress could not carry the generation, or qwen.ai refused its session
+        // twice: said to the client as what it is (Qwen2API-03v) — as a chats/new
+        // failure is, so that a streaming client gets the status too, not the
+        // failure's text as its picture. Any other HTTP status of qwen.ai's is
+        // classified below, as a direct one is.
+        if (browserEgress.completionsEnabled()) {
+            const failure = browserEgress.callFailure(error)
+            if (failure) {
+                releaseChatProbe(breakerContext)
+                throw { ...failure, chatCreation: true }
+            }
+        }
 
         if (error?.error) {
             if (!isWafChallengeError(error)) releaseChatProbe(breakerContext)
@@ -1568,6 +1711,7 @@ const handleImageVideoCompletion = async (req, res) => {
 
         if (error?.chatCreation) {
             const failure = { status: error.status, error: error.error, code: error.code }
+            if (Number(error.retry_after) > 0) failure.retry_after = error.retry_after
             if (!res.headersSent) {
                 res.set({ 'Content-Type': 'application/json' })
                 return sendUpstreamError(res, failure)
@@ -1804,40 +1948,107 @@ const handleOpenAIVideoGeneration = async (req, res) => {
 }
 
 
-const getVideoTaskStatus = async (videoTaskID, token) => {
+/**
+ * 查询视频任务状态；任务未完成时返回 null
+ * @param {string} videoTaskID - 视频任务 ID
+ * @param {string} token - 访问令牌（直接路径用）
+ * @param {Object} account - 账户对象：egress 模式下调用从它的页面发出（直接路径不用它，账号按 token 查）
+ * @returns {Promise<string|null>} 已完成时的视频链接
+ * @throws {ChatCreationError} egress 模式：signin-worker 没能承载调用；或 qwen.ai 拒绝了会话 /
+ *   返回了 WAF challenge 页面，而恢复无济于事——拒绝重复了一次，或恢复被节流、无从进行
+ *   （Qwen2API-03v）。qwen.ai 自己的其它回答（含非 2xx）照旧读作 null。直接路径照旧把任何失败读作 null
+ */
+const getVideoTaskStatus = async (videoTaskID, token, account) => {
     try {
         const chatBaseUrl = getChatBaseUrl()
-        const account = accountManager.getAccountByToken(token)
-        // Antidetect: per-account fingerprint headers replace static block
-        const ssxmod = getSsxmodForAccount(account)
-        const headers = buildRequestHeaders(account, {
-            chatBaseUrl,
-            token,
-            ssxmodItna: ssxmod.ssxmod_itna,
-            ssxmodItna2: ssxmod.ssxmod_itna2,
-            extra: {
-                'Authorization': `Bearer ${token}`
-            }
-        })
+        // From the account's page, on the page's own session (Qwen2API-03v).
+        let data
+        if (browserEgress.enabled()) {
+            const response = await browserEgress.egressJson({
+                account, url: `${chatBaseUrl}/api/v1/tasks/status/${videoTaskID}`
+            })
+            data = response.data
+        } else {
+            // 通过 token 反查 account 解析账号级代理（找不到则回退到全局 PROXY_URL）
+            const directAccount = accountManager.getAccountByToken(token)
+            // Antidetect: per-account fingerprint headers replace static block
+            const ssxmod = getSsxmodForAccount(directAccount)
+            const headers = buildRequestHeaders(directAccount, {
+                chatBaseUrl,
+                token,
+                ssxmodItna: ssxmod.ssxmod_itna,
+                ssxmodItna2: ssxmod.ssxmod_itna2,
+                extra: {
+                    'Authorization': `Bearer ${token}`
+                }
+            })
 
-        const requestConfig = {
-            headers
+            const requestConfig = {
+                headers
+            }
+
+            applyProxyToAxiosConfig(requestConfig, directAccount);
+
+            data = (await axios.get(`${chatBaseUrl}/api/v1/tasks/status/${videoTaskID}`, requestConfig)).data
         }
 
-        applyProxyToAxiosConfig(requestConfig, account);
-
-        const response_data = await axios.get(`${chatBaseUrl}/api/v1/tasks/status/${videoTaskID}`, requestConfig)
-
-        if (response_data.data?.task_status == "success") {
-            const contentUrl = extractResourceUrlFromPayload(response_data.data)
-            logger.info('获取视频任务状态成功', 'CHAT', contentUrl || response_data.data?.content)
+        if (data?.task_status == "success") {
+            const contentUrl = extractResourceUrlFromPayload(data)
+            logger.info('获取视频任务状态成功', 'CHAT', contentUrl || data?.content)
             return contentUrl
         }
-        logger.info(`获取视频任务 ${videoTaskID} 状态: ${response_data.data?.task_status}`, 'CHAT')
+        logger.info(`获取视频任务 ${videoTaskID} 状态: ${data?.task_status}`, 'CHAT')
         return null
     } catch (error) {
         logger.error(`查询视频任务状态失败 (${videoTaskID})`, 'CHAT', '', buildAxiosErrorLog(error))
+        // As in getChatDetail: null is "the task is not done", and only qwen.ai
+        // can say that. A call the egress could not get answered would be
+        // polled for the rest of the task's twenty minutes (Qwen2API-03v).
+        if (browserEgress.enabled() && error instanceof ChatCreationError) throw error
         return null
+    }
+}
+
+/**
+ * A relayed answer read to its end (Qwen2API-03v). The streaming /egress hands
+ * the body on as a stream where the direct path had it whole: a video's, which
+ * t2v asks Axios for as JSON. Parsed where it parses, the text otherwise —
+ * the parsing below takes a string as it takes an object, and qwen.ai is known
+ * to answer this call with a page or a data:-wrapped frame despite the ask.
+ * @param {*} responseStream - The body, a Readable
+ * @returns {Promise<*>} The answer as JSON, or as text
+ */
+const readWholeAnswer = async (responseStream) => {
+    const chunks = []
+    for await (const chunk of responseStream) chunks.push(Buffer.from(chunk))
+    const text = Buffer.concat(chunks).toString('utf8')
+    try {
+        return JSON.parse(text)
+    } catch (e) {
+        return text
+    }
+}
+
+/**
+ * 图片/视频的生成调用，从账号的常驻页面发出（Qwen2API-03v）
+ * @param {string} url - completions 地址（带 chat_id）
+ * @param {object} body - v2.1 请求体
+ * @param {Object} account - 当前账号：从它的页面发出
+ * @param {boolean} whole - 视频的响应整个读完；图片的照旧作为流交给调用方
+ * @returns {Promise<{status: number, statusText: string, headers: Object, data: *}>} axios 形状的响应
+ */
+const relayedGeneration = async ({ url, body, account, whole }) => {
+    // The same fetch the text completions are (Qwen2API-3ue.9), through the one
+    // seam that sends it: qwen.ai refuses this address to an XMLHttpRequest,
+    // whole-answer or not.
+    const response = await browserEgress.postCompletions({
+        url, body: JSON.stringify(body), account, timeoutMs: GENERATION_TIMEOUT_MS
+    })
+    return {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+        data: whole ? await readWholeAnswer(response.data) : response.data
     }
 }
 
@@ -1847,5 +2058,7 @@ module.exports = {
     handleOpenAIImagesEdit,
     handleOpenAIVideoGeneration,
     // 暴露内部辅助以便测试
-    parseUpstreamImageError
+    parseUpstreamImageError,
+    getChatDetail,
+    getVideoTaskStatus
 }

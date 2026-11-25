@@ -56,7 +56,8 @@ const {
 } = require('../utils/agent-turn.js');
 const { ensureAgentCurrentEnvelope } = require('../middlewares/chat-middleware.js');
 const { mapIncomingModel } = require('../utils/model-map.js');
-const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js');
+const { createUpstreamResponseFilter } = require('../utils/sse.js');
+const { watchClient, isClientGone, consumeWhileClientStays } = require('../utils/client-gone.js');
 const { logger } = require('../utils/logger');
 const {
   assertNoUpstreamFailure,
@@ -1054,17 +1055,18 @@ const describeToolErrors = (errors) => {
  * 异步迭代上游 axios 流，按 SSE 段切分回调内部 delta JSON
  * @param {object} upstream - axios stream 响应
  * @param {(json: Object) => Promise<void>|void} onDelta - 单个 delta 回调
- * @param {{ shouldStop?: () => boolean }} [options] - 透传给 consumeSSEStream（提前终止谓词）
+ * @param {{ shouldStop?: () => boolean, client?: object }} [options] - 透传给 consumeSSEStream（提前终止谓词）；
+ *   `client`（utils/client-gone.js#watchClient）在时，客户端离开即关闭上游并以 ClientGoneError 结束
  * @returns {Promise<void>} 完成 Promise
  */
-const consumeUpstream = async (upstream, onDelta, options) => consumeSSEStream(upstream, async (frame) => {
+const consumeUpstream = async (upstream, onDelta, options) => consumeWhileClientStays(upstream, async (frame) => {
   const payload = frame.data;
   if (!payload || payload.trim() === '[DONE]') return;
   if (!isJson(payload)) return;
   const parsed = JSON.parse(payload);
   assertNoUpstreamFailure(parsed, upstream);
   await onDelta(parsed);
-}, options);
+}, { client: options?.client, shouldStop: options?.shouldStop });
 
 /**
  * 原生 function_call 帧的喂入与关闭判定（流式 / 非流式共用）。完成证据读的是**原始**
@@ -1241,13 +1243,14 @@ const logEgressInterruption = (kind, error, account, { emittedBlocks, action }) 
  * @param {boolean} ctx.hasTools - 是否启用工具
  * @param {string|Object} ctx.toolChoice - 内部 tool_choice
  * @param {Object} ctx.requestBody - 内部请求体（用于重试）
+ * @param {object} [ctx.client] - 该请求客户端的离开信号（utils/client-gone.js#watchClient）
  * @returns {Promise<void>} 完成 Promise
  */
 const handleAnthropicStream = async (res, ctx, upstream) => {
   const {
     message_id, model, hasTools, toolChoice, requestBody, allowedToolNames = [],
     toolSchemas = null, sendRequest = sendChatRequest, historyToolCalls = [],
-    upstreamOptions = {}
+    upstreamOptions = {}, client = null
   } = ctx;
 
   const createdAt = new Date().toISOString();
@@ -1693,17 +1696,21 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
         () => consumeUpstream(currentUpstream, (json) => {
           ensureMessageStart();
           return onUpstreamDelta(json);
-        }, { shouldStop: () => stopRequested })
+        }, { shouldStop: () => stopRequested, client })
       );
       upstreamCompleted = result.completed;
       upstreamEventCount = result.eventCount;
     } catch (e) {
+      // The client went away and the upstream was closed for it: nothing failed,
+      // and there is nobody to fail over for.
+      if (isClientGone(e)) throw e;
       const kind = classifyMidStreamFailure(e);
       const emittedBlocks = blockIndex + 1;
       const canFailover = kind !== null
         && emittedBlocks === 0
         && failoverRetries < MID_STREAM_FAILOVER_MAX_RETRIES
-        && !res.writableEnded && !res.destroyed;
+        && !res.writableEnded && !res.destroyed
+        && !client?.gone();
       if (kind) {
         logEgressInterruption(kind, e, ctx.currentAccount, {
           emittedBlocks,
@@ -2088,7 +2095,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   const {
     message_id, model, hasTools, toolChoice, requestBody, allowedToolNames = [],
     toolSchemas = null, sendRequest = sendChatRequest, historyToolCalls = [],
-    upstreamOptions = {}
+    upstreamOptions = {}, client = null
   } = ctx;
 
   let thinkingContent = '';
@@ -2253,7 +2260,9 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     }
   };
 
-  const initialStreamResult = await consumeUpstream(upstream, onUpstreamDelta, { shouldStop: () => stopRequested });
+  const initialStreamResult = await consumeUpstream(upstream, onUpstreamDelta, {
+    shouldStop: () => stopRequested, client
+  });
   upstreamCompleted = initialStreamResult.completed;
   upstreamEventCount = initialStreamResult.eventCount;
 
@@ -2498,7 +2507,9 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     upstreamFinishReason = null;
     // usage 也按轮全新：报的是最后一轮上游给的，没给就估算，绝不继承上一轮的。
     upstreamUsage = null;
-    const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta, { shouldStop: () => stopRequested });
+    const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta, {
+      shouldStop: () => stopRequested, client
+    });
     upstreamCompleted = retryResult.completed;
     if (!upstreamCompleted && !upstreamFinishReason) {
       streamBrokeOnRetry = true;
@@ -2691,6 +2702,9 @@ const handleAnthropicMessages = async (req, res) => {
   // Tambien fuera: el catch decide si olvidar un prefijo de historial reutilizado.
   let upstreamResp = null;
   let contextPrefixKey = null;
+  // Vigilado hasta el final de la respuesta: un cliente que se va se lleva su
+  // upstream, por la senal de req y de su socket (utils/client-gone.js).
+  const client = watchClient(req);
   try {
     const compatibility = analyzeAnthropicCompatibility(req.body || {});
     const compatibilityHeaders = buildAnthropicCompatibilityHeaders(compatibility);
@@ -2744,7 +2758,8 @@ const handleAnthropicMessages = async (req, res) => {
       toolSchemas,
       requestBody: body,
       currentAccount,
-      upstreamOptions
+      upstreamOptions,
+      client
     };
 
     if (req.body?.stream) {
@@ -2753,6 +2768,9 @@ const handleAnthropicMessages = async (req, res) => {
       await handleAnthropicNonStream(res, ctx, upstreamResp.response);
     }
   } catch (error) {
+    // The client went away and the upstream was closed for it: nothing failed,
+    // and there is nobody to answer with an error.
+    if (isClientGone(error)) return;
     logger.error('Anthropic Messages 处理错误', 'ANTHROPIC', '', error);
     // La cuota diaria agotada es 429 `rate_limit_error`, como la API nativa — no un 500
     // `api_error`. Gemelo: chat.js#writeOpenAIHttpError. La deteccion es unica
@@ -2793,6 +2811,10 @@ const handleAnthropicMessages = async (req, res) => {
         } catch (_) { /* ignore */ }
       }
     }
+  } finally {
+    // El socket sobrevive a la peticion en keep-alive: que se cierre despues no es
+    // este cliente yendose.
+    client.dispose();
   }
 };
 
