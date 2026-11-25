@@ -1,10 +1,14 @@
 'use strict'
 
 // Exercise real Bun HTTP/stream/WASM behavior without real accounts or upstream traffic.
+// The network guard comes first: nothing this smoke starts on its own may leave the loopback.
+const netGuard = require('./net-guard').install()
+const runBrowserScenario = require('./bun-smoke-browser')
 const assert = require('node:assert/strict')
 const { spawn, spawnSync } = require('node:child_process')
 const { randomUUID } = require('node:crypto')
 const { createServer } = require('node:http')
+const { constants } = require('node:fs')
 const { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } = require('node:fs/promises')
 const { tmpdir } = require('node:os')
 const path = require('node:path')
@@ -55,6 +59,8 @@ function assertFrontendContentType(response, assetPath) {
 async function main() {
   assert.ok(process.versions.bun, 'Run this smoke test with Bun, not Node')
   assert.equal(countTokens('hello'), 1, 'tiktoken WASM must load under Bun')
+  // Before anything is started: in this runtime, the guard must be able to refuse the outside world.
+  await netGuard.selfTest()
   const { values } = parseArgs({ options: {
     binary: { type: 'string' }, 'docker-image': { type: 'string' }
   } })
@@ -146,18 +152,69 @@ async function main() {
   })
 
   const temporaryDirectory = await mkdtemp(path.join(tmpdir(), 'qwen-bun-smoke-'))
-  let application
-  let applicationClosed
-  let applicationLogs = ''
-  try {
+  // An empty cwd and a minimal environment prevent loading the developer's .env.
+  const environment = Object.fromEntries(Object.entries(process.env).filter(([name]) =>
+    ['PATH', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'HOME', 'USERPROFILE'].includes(name.toUpperCase())
+  ))
+
+  // How this run can start the application under test — from source, as the native
+  // executable copied next to its data, or as the container on the host's network
+  // (127.0.0.1 of the host is the stand-ins' for the executable and the container
+  // alike). Both scenarios start it the same way.
+  const startApplication = async ({ containerName, temporaryDirectory, serviceEnvironment }) => {
     let applicationExecutable = process.execPath
     let applicationArguments = ['--no-env-file', path.join(PROJECT_ROOT, 'src/server.js')]
     if (binaryPath) {
       applicationExecutable = path.join(temporaryDirectory, path.basename(binaryPath))
       applicationArguments = []
-      await copyFile(binaryPath, applicationExecutable)
+      // Copied once: a scenario that restarts the application starts the copy that is there.
+      await copyFile(binaryPath, applicationExecutable, constants.COPYFILE_EXCL).catch(error => {
+        if (error.code !== 'EEXIST') throw error
+      })
       if (process.platform !== 'win32') await chmod(applicationExecutable, 0o755)
     }
+    if (dockerImage) {
+      applicationExecutable = 'docker'
+      applicationArguments = [
+        'run', '--rm', '--pull=never', '--name', containerName, '--network', 'host',
+        '--user', `${process.getuid()}:${process.getgid()}`,
+        '--mount', `type=bind,source=${temporaryDirectory},target=/app`,
+        ...Object.entries(serviceEnvironment).flatMap(([name, value]) => ['--env', `${name}=${value}`]),
+        dockerImage
+      ]
+    }
+    const child = spawn(applicationExecutable, applicationArguments, {
+      cwd: temporaryDirectory,
+      env: { ...environment, ...serviceEnvironment },
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+    const running = { process: child, containerName, logs: '', spawnError: undefined, closed: null }
+    child.stdout.on('data', chunk => { running.logs += chunk })
+    child.stderr.on('data', chunk => { running.logs += chunk })
+    running.closed = new Promise(resolve => child.once('close', resolve))
+    child.on('error', error => { running.spawnError = error })
+    return running
+  }
+  const stopApplication = async running => {
+    if (dockerImage) {
+      const stopResult = spawnSync('docker', ['stop', '--time', '10', running.containerName], { timeout: 15000, encoding: 'utf8' })
+      assert.equal(stopResult.status, 0, stopResult.stderr || stopResult.error?.message)
+    } else {
+      running.process.kill('SIGTERM')
+    }
+    const shutdownTimer = setTimeout(() => running.process.kill('SIGKILL'), 10000)
+    const exitCode = await running.closed
+    clearTimeout(shutdownTimer)
+    return exitCode
+  }
+  const disposeApplication = async running => {
+    if (dockerImage) spawnSync('docker', ['rm', '--force', running.containerName], { timeout: 15000, stdio: 'pipe' })
+    if (running.process.exitCode === null && running.process.signalCode === null) running.process.kill('SIGKILL')
+    await running.closed
+  }
+
+  let application
+  try {
     if (standalone) {
       await mkdir(path.join(temporaryDirectory, 'data'))
       await writeFile(path.join(temporaryDirectory, 'data/data.json'), JSON.stringify({ accounts: smokeAccounts }))
@@ -169,10 +226,6 @@ async function main() {
     await closeListener(portReservation)
     const baseUrl = `http://127.0.0.1:${servicePort}`
 
-    // An empty cwd and a minimal environment prevent loading the developer's .env.
-    const environment = Object.fromEntries(Object.entries(process.env).filter(([name]) =>
-      ['PATH', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'HOME', 'USERPROFILE'].includes(name.toUpperCase())
-    ))
     const serviceEnvironment = {
       NODE_ENV: 'production',
       ...(standalone ? {} : { API_KEY }),
@@ -187,26 +240,7 @@ async function main() {
       QWEN_CHAT_PROXY_URL: `http://127.0.0.1:${upstreamPort}`,
       QWEN_CLI_PROXY_URL: `http://127.0.0.1:${upstreamPort}`
     }
-    if (dockerImage) {
-      applicationExecutable = 'docker'
-      applicationArguments = [
-        'run', '--rm', '--pull=never', '--name', containerName, '--network', 'host',
-        '--user', `${process.getuid()}:${process.getgid()}`,
-        '--mount', `type=bind,source=${temporaryDirectory},target=/app`,
-        ...Object.entries(serviceEnvironment).flatMap(([name, value]) => ['--env', `${name}=${value}`]),
-        dockerImage
-      ]
-    }
-    application = spawn(applicationExecutable, applicationArguments, {
-      cwd: temporaryDirectory,
-      env: { ...environment, ...serviceEnvironment },
-      stdio: ['ignore', 'pipe', 'pipe']
-    })
-    application.stdout.on('data', chunk => { applicationLogs += chunk })
-    application.stderr.on('data', chunk => { applicationLogs += chunk })
-    applicationClosed = new Promise(resolve => application.once('close', resolve))
-    let spawnError
-    application.on('error', error => { spawnError = error })
+    application = await startApplication({ containerName, temporaryDirectory, serviceEnvironment })
 
     const request = (route, options = {}) => fetch(`${baseUrl}${route}`, {
       signal: AbortSignal.timeout(30000), ...options
@@ -214,8 +248,8 @@ async function main() {
     let ready = false
     const readinessDeadline = Date.now() + 10000
     while (Date.now() < readinessDeadline) {
-      if (spawnError) throw spawnError
-      assert.equal(application.exitCode, null, `Application exited early: ${applicationLogs}`)
+      if (application.spawnError) throw application.spawnError
+      assert.equal(application.process.exitCode, null, `Application exited early: ${application.logs}`)
       try {
         const response = await request('/api/getAllAccounts', {
           headers: { 'x-api-key': API_KEY }, signal: AbortSignal.timeout(500)
@@ -226,7 +260,7 @@ async function main() {
       if (ready) break
       await delay(100)
     }
-    assert.ok(ready, `Application did not become ready: ${applicationLogs}`)
+    assert.ok(ready, `Application did not become ready: ${application.logs}`)
 
     const page = await request('/auth')
     assert.equal(page.status, 200, 'Build the frontend before running this smoke test')
@@ -322,7 +356,7 @@ async function main() {
           assert.equal(chatCreationRequests, createsBefore + 1, 'chat creation must not retry')
           assert.equal(signInRequests, signInsBefore, 'a refusal must not trigger login/refresh')
           assert.equal(completionRequests, 0, 'generation must not start after a refusal')
-          assert.ok(!text.includes(refusalSecret) && !applicationLogs.includes(refusalSecret), 'raw upstream content must stay private')
+          assert.ok(!text.includes(refusalSecret) && !application.logs.includes(refusalSecret), 'raw upstream content must stay private')
         }
       }
     }
@@ -437,27 +471,21 @@ async function main() {
       assert.ok(!runtimeFiles.includes('node_modules') && !runtimeFiles.includes('public'))
       console.log('PASS: standalone assets, .env, data persistence, logs, and cache directory')
     }
-    if (dockerImage) {
-      const stopResult = spawnSync('docker', ['stop', '--time', '10', containerName], { timeout: 15000, encoding: 'utf8' })
-      assert.equal(stopResult.status, 0, stopResult.stderr || stopResult.error?.message)
-    } else {
-      application.kill('SIGTERM')
-    }
-    const shutdownTimer = setTimeout(() => application.kill('SIGKILL'), 10000)
-    const exitCode = await applicationClosed
-    clearTimeout(shutdownTimer)
+    const exitCode = await stopApplication(application)
     if (process.platform !== 'win32') assert.equal(exitCode, 0, 'SIGTERM should exit cleanly')
     console.log('PASS: Bun startup, login, frontend, WASM, HTTP/SSE, and shutdown')
   } catch (error) {
-    if (applicationLogs) console.error(applicationLogs)
+    if (application?.logs) console.error(application.logs)
     throw error
   } finally {
-    if (dockerImage) spawnSync('docker', ['rm', '--force', containerName], { timeout: 15000, stdio: 'pipe' })
-    if (application && application.exitCode === null && application.signalCode === null) application.kill('SIGKILL')
-    if (applicationClosed) await applicationClosed
+    if (application) await disposeApplication(application)
     await closeListener(upstreamServer)
     await rm(temporaryDirectory, { recursive: true, force: true })
   }
+
+  // Then the application as prod runs it (Qwen2API-3ue.7): browser sessions and
+  // every qwen.ai call through the worker's page, against a stand-in on 127.0.0.1.
+  await runBrowserScenario({ startApplication, stopApplication, disposeApplication, binaryPath, dockerImage })
 }
 
 main().catch(error => {
