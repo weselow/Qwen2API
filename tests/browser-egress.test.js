@@ -2582,7 +2582,8 @@ function qwenBehindThePage({ generations = [], chatDetail, taskStatus = done }) 
         const pathname = new URL(body.url).pathname
         if (pathname === '/api/v2/chats/new') return egress(chat('chat-1'))
         if (pathname === '/api/v2/chats/chat-1') return chatDetail()
-        if (pathname === '/api/v1/tasks/status/task-1') return taskStatus()
+        // The status of the task named in the address.
+        if (pathname.startsWith('/api/v1/tasks/status/')) return taskStatus(pathname.slice('/api/v1/tasks/status/'.length))
         throw new Error(`nothing on the page answers ${pathname}`)
     }
 }
@@ -3232,6 +3233,397 @@ test('Qwen2API-03v: an error qwen.ai itself gives a poll is "not done", and the 
     } finally {
         t.mock.timers.reset()
     }
+})
+
+/* -------- images/video: qwen.ai silent on a poll is a poll let go by, not the request's end -- */
+
+const SILENT_POLL = 'опрос пропущен'
+const GIVEN_UP = 'запрос завершается отказом'
+// qwen.ai said nothing for the call's whole budget; the road to it failed.
+const silent = () => refused(504, 'egress_timeout')
+const failedRoad = () => refused(502, 'egress_failed')
+// qwen.ai's own answer: the task is not done. It is an answer all the same.
+const running = () => json({ task_status: 'running' })
+// The chat, as its detail comes back: with nothing in it yet, with the task in its history,
+// with two tasks — a video's answer can name more than one.
+const emptyChat = () => egress({ success: true, data: { chat: { history: { messages: {} } } } })
+const withTaskInHistory = () => egress({
+    success: true,
+    data: { chat: { history: { messages: { m1: { task_id: 'task-1' } } } } }
+})
+const withTwoTasksInHistory = () => egress({
+    success: true,
+    data: { chat: { history: { messages: { m1: { task_id: 'task-1' }, m2: { task_id: 'task-2' } } } } }
+})
+const lookups = () => worker.sent('/egress').filter(call => call.url === CHAT_INFO)
+const pollsOf = id => worker.sent('/egress').filter(call => call.url === `https://chat.qwen.ai/api/v1/tasks/status/${id}`).length
+
+// What the app warns of while `fn` runs, a line each.
+async function withWarnings(fn) {
+    const warned = []
+    const warn = logger.warn
+    logger.warn = (...args) => { warned.push(args.map(String).join(' ')); warn(...args) }
+    try {
+        await fn()
+    } finally {
+        logger.warn = warn
+    }
+    return warned
+}
+const skippedSaid = () => logs.some(args => String(args[0]).includes(SILENT_POLL))
+
+// A video request to its end with the clock in the test's hand: the task's
+// twenty seconds between two polls are ticked off as the app asks for them.
+// The clock has to be the test's (t.mock.timers) before this is called.
+async function videoToItsEnd(t, { generations: relayed, chatDetail, taskStatus }) {
+    qwenBehindThePage({ generations: relayed, chatDetail, taskStatus })
+    const res = response()
+    const handled = withAccount(givenAccount(), () => handleImageVideoCompletion({ body: T2V }, res))
+    for (let i = 0; i < 400 && !res.writableEnded; i++) {
+        await new Promise(resolve => setImmediate(resolve))
+        t.mock.timers.tick(20000)
+    }
+    await handled
+    return res
+}
+
+test('Qwen2API-03v: qwen.ai silent on one poll of the video task — the poll is let go by with a warning, and the next one waits the task\'s own twenty seconds', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const statuses = [silent(), done()]
+    let res
+    let warned
+    try {
+        warned = await withWarnings(async () => {
+            qwenBehindThePage({ generations: [task()], taskStatus: () => statuses.shift() })
+            res = response()
+            const handled = withAccount(givenAccount(), () => handleImageVideoCompletion({ body: T2V }, res))
+            // The poll was let go by — the app has said so, and asked for its pause.
+            for (let i = 0; i < 200 && !skippedSaid(); i++) await new Promise(resolve => setImmediate(resolve))
+            assert.equal(polls().length, 1)
+            // The pause is the task's own, to the second: not a shorter one for a poll that got no answer.
+            t.mock.timers.tick(19999)
+            for (let i = 0; i < 200; i++) await new Promise(resolve => setImmediate(resolve))
+            assert.equal(polls().length, 1, 'the next poll waits')
+            t.mock.timers.tick(1)
+            for (let i = 0; i < 400 && !res.writableEnded; i++) {
+                await new Promise(resolve => setImmediate(resolve))
+                t.mock.timers.tick(20000)
+            }
+            await handled
+        })
+
+        assert.equal(res.statusCode, 200)
+        assert.ok(res.body.choices[0].message.content.includes(VIDEO_URL))
+        assert.equal(polls().length, 2, 'the poll that was let go by, and the one after it')
+        // Nothing in the page is wrong with it: no reload, no password, nothing sent from Node.
+        // The chats/new, the generation, and the two polls.
+        assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress', '/egress'])
+        assert.deepEqual(direct, [])
+        assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false, false, false])
+        // Said as what it is — a warning, with the worker's code — and the call's own failure
+        // is where it always was, in the log: the seam's line with the worker's code.
+        assert.equal(warned.filter(line => line.includes(SILENT_POLL)).length, 1)
+        assert.ok(warned.some(line => line.includes(SILENT_POLL) && line.includes('egress_timeout') && line.includes('1 из 2')))
+        assert.equal(warned.filter(line => line.includes(GIVEN_UP)).length, 0)
+        assert.ok(logs.some(args => String(args[0]).includes('/api/v1/tasks/status/task-1') && String(args[0]).includes('egress_timeout')))
+    } finally {
+        t.mock.timers.reset()
+    }
+})
+
+test('Qwen2API-03v: qwen.ai silent on two polls in a row — both are let go by, and the task is had on the third', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const statuses = [silent(), failedRoad(), done()]
+    let res
+    let warned
+    try {
+        warned = await withWarnings(async () => {
+            res = await videoToItsEnd(t, { generations: [task()], taskStatus: () => statuses.shift() })
+        })
+    } finally {
+        t.mock.timers.reset()
+    }
+    assert.equal(res.statusCode, 200)
+    assert.ok(res.body.choices[0].message.content.includes(VIDEO_URL))
+    assert.equal(polls().length, 3)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress', '/egress', '/egress'])
+    assert.deepEqual(direct, [])
+    const skipped = warned.filter(line => line.includes(SILENT_POLL))
+    assert.equal(skipped.length, 2)
+    assert.ok(skipped[0].includes('egress_timeout') && skipped[0].includes('1 из 2'))
+    assert.ok(skipped[1].includes('egress_failed') && skipped[1].includes('2 из 2'))
+    assert.equal(warned.filter(line => line.includes(GIVEN_UP)).length, 0)
+})
+
+test('Qwen2API-03v: qwen.ai silent on three polls in a row — the request fails with the same 503, on the third poll and no further', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    let res
+    let warned
+    try {
+        warned = await withWarnings(async () => {
+            res = await videoToItsEnd(t, { generations: [task()], taskStatus: silent })
+        })
+    } finally {
+        t.mock.timers.reset()
+    }
+    // What a poll the worker could not carry always was to the client.
+    assert.equal(res.statusCode, 503)
+    assert.deepEqual(res.body, TRANSPORT_FAILURE)
+    assert.equal(polls().length, 3, 'two let go by, and the third is the last')
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress', '/egress', '/egress'])
+    assert.equal(worker.count('/renew'), 0, 'nothing in the page is wrong with it')
+    assert.equal(worker.count('/session'), 0)
+    assert.deepEqual(direct, [])
+    assert.equal(warned.filter(line => line.includes(SILENT_POLL)).length, 2)
+    assert.ok(warned.some(line => line.includes(GIVEN_UP) && line.includes('egress_timeout')), 'the third is said as the end it is')
+})
+
+test('Qwen2API-03v: an answer of qwen.ai\'s between silent polls starts the count over — two, an answer, two, an answer, two', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const statuses = [silent(), silent(), running(), silent(), silent(), running(), silent(), silent(), done()]
+    let res
+    try {
+        res = await videoToItsEnd(t, { generations: [task()], taskStatus: () => statuses.shift() })
+    } finally {
+        t.mock.timers.reset()
+    }
+    assert.equal(res.statusCode, 200)
+    assert.ok(res.body.choices[0].message.content.includes(VIDEO_URL))
+    // Nine polls: had the count run on, the third would have been the request's end.
+    assert.equal(polls().length, 9)
+    assert.deepEqual(worker.routes(), new Array(11).fill('/egress'))
+    assert.equal(worker.count('/renew'), 0)
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: the count is one for the whole request: it runs on from one task to the next — silence at the end of the first and at the start of the second is one run', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const statuses = {
+        // The first task is polled out to its sixtieth "not done", and that last poll is let go by.
+        'task-1': [...new Array(59).fill(running), silent],
+        'task-2': [silent, silent]
+    }
+    let res
+    try {
+        res = await videoToItsEnd(t, {
+            generations: [picture('')],
+            chatDetail: withTwoTasksInHistory,
+            taskStatus: id => (statuses[id].shift() || running)()
+        })
+    } finally {
+        t.mock.timers.reset()
+    }
+    assert.equal(res.statusCode, 503)
+    assert.deepEqual(res.body, TRANSPORT_FAILURE)
+    // Had each task counted for itself, the second would have been let go by twice, and polled a third time.
+    assert.equal(pollsOf('task-1'), 60)
+    assert.equal(pollsOf('task-2'), 2, 'the second task: two polls, and the second of them was the third in a row')
+})
+
+test('Qwen2API-03v: a lookup in the chat that qwen.ai is silent on is let go by like a poll of the task — the picture is had on the third lookup', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    const details = [silent(), failedRoad(), withPictureInHistory()]
+    let res
+    let warned
+    warned = await withWarnings(async () => {
+        qwenBehindThePage({ generations: [picture('')], chatDetail: () => details.shift() })
+        res = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+    })
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.body.choices[0].message.content, `![image](${IMAGE_URL})`)
+    assert.equal(lookups().length, 3)
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress', '/egress', '/egress'])
+    assert.equal(worker.count('/renew'), 0)
+    assert.deepEqual(direct, [])
+    assert.equal(warned.filter(line => line.includes(SILENT_POLL)).length, 2)
+    assert.equal(warned.filter(line => line.includes(GIVEN_UP)).length, 0)
+})
+
+test('Qwen2API-03v: three silent lookups in a row — the same 503, after three lookups and not five', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    let res
+    let warned
+    warned = await withWarnings(async () => {
+        qwenBehindThePage({ generations: [picture('')], chatDetail: silent })
+        res = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+    })
+    assert.equal(res.statusCode, 503)
+    assert.deepEqual(res.body, TRANSPORT_FAILURE)
+    assert.equal(lookups().length, 3, 'two let go by, and the third is the last')
+    assert.equal(worker.count('/renew'), 0)
+    assert.deepEqual(direct, [])
+    assert.ok(warned.some(line => line.includes(GIVEN_UP)))
+})
+
+test('Qwen2API-03v: an answer between silent lookups of the chat starts the count over — for a picture too', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    // Five lookups is all a picture is given: two silent, an answer with no picture in it, a silent one, and the picture.
+    const details = [silent(), failedRoad(), emptyChat(), silent(), withPictureInHistory()]
+    let res
+    let warned
+    warned = await withWarnings(async () => {
+        qwenBehindThePage({ generations: [picture('')], chatDetail: () => details.shift() })
+        res = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+    })
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.body.choices[0].message.content, `![image](${IMAGE_URL})`)
+    assert.equal(lookups().length, 5)
+    assert.equal(warned.filter(line => line.includes(SILENT_POLL)).length, 3)
+    assert.equal(warned.filter(line => line.includes(GIVEN_UP)).length, 0)
+    assert.equal(worker.count('/renew'), 0)
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: a lookup let go by is one of the five — let go by on the last, it ends in the picture\'s own "no link", not in the 503', { timeout: 10000 }, async () => {
+    throughThePage()
+    const account = givenAccount()
+    // Two silent, two answers with no picture in them, and the fifth goes by: nothing is left to look for the picture.
+    const details = [silent(), silent(), emptyChat(), emptyChat(), silent()]
+    let res
+    let warned
+    warned = await withWarnings(async () => {
+        qwenBehindThePage({ generations: [picture('')], chatDetail: () => details.shift() })
+        res = response()
+        await withAccount(account, () => handleImageVideoCompletion({ body: T2I }, res))
+    })
+    // The request spent its lookups, as after five "not ready yet": the error is the loop's own.
+    assert.equal(res.statusCode, 500)
+    assert.ok(JSON.stringify(res.body).includes('上游未返回图片链接'))
+    assert.equal(lookups().length, 5)
+    // What became of the last lookup is in the log, and nowhere else.
+    assert.equal(warned.filter(line => line.includes(SILENT_POLL)).length, 3)
+    assert.equal(warned.filter(line => line.includes(GIVEN_UP)).length, 0)
+    assert.equal(worker.count('/renew'), 0)
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: a video whose task is looked up in the chat through the silence, and then polled through more of it', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    // In the chat: two silent lookups, an answer with no task in it, a silent one, and the answer that names the task.
+    // Had the count run on through the answer, the fourth lookup would have been the third in a row.
+    const details = [silent(), failedRoad(), emptyChat(), silent(), withTaskInHistory()]
+    const statuses = [silent(), failedRoad(), done()]
+    let res
+    try {
+        res = await videoToItsEnd(t, {
+            generations: [picture('')],
+            chatDetail: () => details.shift(),
+            taskStatus: () => statuses.shift()
+        })
+    } finally {
+        t.mock.timers.reset()
+    }
+    assert.equal(res.statusCode, 200)
+    assert.ok(res.body.choices[0].message.content.includes(VIDEO_URL))
+    assert.equal(lookups().length, 5)
+    assert.equal(polls().length, 3)
+    assert.deepEqual(worker.routes(), new Array(10).fill('/egress'))
+    assert.equal(worker.count('/renew'), 0)
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: what is not qwen.ai\'s silence still ends the request at once — the worker\'s refusal, the limit of pages, a session refused, a challenge', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const SESSION_FAILURE = { error: 'Qwen session authorization rejected; this is not Qwen2API client authentication', code: 'upstream_session_unauthorized' }
+    try {
+        for (const [reply, status, body, pollCount, what] of [
+            [() => refused(502, 'page_closed'), 503, TRANSPORT_FAILURE, 1, 'a page that closed'],
+            [() => refused(502, 'page_fault'), 503, TRANSPORT_FAILURE, 1, 'a script of the page cut the call'],
+            [() => refused(502, 'egress_too_large'), 503, TRANSPORT_FAILURE, 1, 'an answer over the page\'s limit'],
+            [() => refused(503, 'resident_capacity'), 503, TRANSPORT_FAILURE, 1, 'the limit of pages'],
+            [() => unauthorized(), 502, SESSION_FAILURE, 2, 'a session refused, and refused again after the reload'],
+            [() => challenged(), 503, { error: 'Qwen requires WAF/CAPTCHA verification', code: 'upstream_waf_challenge', retry_after: 30 }, 2, 'a challenge page, twice']
+        ]) {
+            worker.calls.length = 0
+            logs.length = 0
+            let warned
+            let res
+            warned = await withWarnings(async () => {
+                res = await videoToItsEnd(t, { generations: [task()], taskStatus: reply })
+            })
+            assert.equal(res.statusCode, status, what)
+            assert.deepEqual(res.body, body, what)
+            assert.equal(polls().length, pollCount, `${what}: the poll is not gone on with`)
+            assert.equal(
+                warned.filter(line => line.includes(SILENT_POLL) || line.includes(GIVEN_UP)).length, 0,
+                `${what}: none of it is qwen.ai's silence`
+            )
+        }
+    } finally {
+        t.mock.timers.reset()
+    }
+    assert.equal(worker.count('/session'), 0, 'none of it costs a password')
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: a lookup in the chat of a video that the worker cannot carry ends the request at once — it is not looked up five times over', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    try {
+        for (const code of ['page_closed', 'page_fault']) {
+            worker.calls.length = 0
+            logs.length = 0
+            let warned
+            let res
+            warned = await withWarnings(async () => {
+                res = await videoToItsEnd(t, { generations: [picture('')], chatDetail: () => refused(502, code) })
+            })
+            assert.equal(res.statusCode, 503, code)
+            assert.deepEqual(res.body, TRANSPORT_FAILURE, code)
+            assert.equal(lookups().length, 1, `${code}: one lookup, and it was the last`)
+            assert.equal(polls().length, 0, code)
+            assert.equal(warned.filter(line => line.includes(SILENT_POLL) || line.includes(GIVEN_UP)).length, 0, code)
+        }
+    } finally {
+        t.mock.timers.reset()
+    }
+    assert.equal(worker.count('/renew'), 0)
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-03v: a worker that is not there when the task is polled ends the request at once — it carries no code to let go by', { timeout: 15000 }, async t => {
+    throughThePage()
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const there = config.signinWorkerUrl
+    let res
+    let warned
+    try {
+        // The worker is there for the chats/new and for the generation, and is gone by the first poll.
+        const stream = task()
+        warned = await withWarnings(async () => {
+            res = await videoToItsEnd(t, {
+                generations: [{
+                    open: (serverResponse, request) => {
+                        config.signinWorkerUrl = 'http://127.0.0.1:1'
+                        return stream.open(serverResponse, request)
+                    }
+                }],
+                taskStatus: done
+            })
+        })
+    } finally {
+        config.signinWorkerUrl = there
+        t.mock.timers.reset()
+    }
+    assert.equal(res.statusCode, 503)
+    assert.deepEqual(res.body, TRANSPORT_FAILURE)
+    // The poll never reached the worker: it is not among what the worker was sent.
+    assert.equal(worker.sent('/egress').length, 2)
+    assert.equal(warned.filter(line => line.includes(SILENT_POLL)).length, 0)
+    assert.deepEqual(direct, [])
 })
 
 /* ------------------------------------- files: STS token and parse from the page (Qwen2API-03v) -- */
