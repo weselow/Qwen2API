@@ -4,7 +4,10 @@ const { Readable } = require('node:stream')
 const store = require('./v2-session-store')
 const signinWorker = require('./signin-worker-client')
 const sessionPersistence = require('./v2-session-persistence')
-const { ChatCreationError, assertChatCreationResponse, isWafChallengeBody } = require('./upstream-error.js')
+const {
+    ChatCreationError, assertChatCreationResponse, detectWafChallenge, isWafChallengeBody,
+    CHAT_CHALLENGE_RETRY_AFTER_SECONDS
+} = require('./upstream-error.js')
 const { SigninError } = require('./signin-error')
 const { generateUUID } = require('./tools.js')
 const { logger } = require('./logger')
@@ -24,6 +27,14 @@ const { logger } = require('./logger')
  * (assertChatCreationResponse). completions (COMPLETIONS_TRANSPORT=browser,
  * Qwen2API-3ue.3) are relayed as they arrive and handed on in the shape
  * postChatRequest gets from axios and from the impersonating transport.
+ *
+ * Since Qwen2API-03v the other qwen.ai calls of images/video and of file
+ * upload take the same two roads. The JSON ones — chat info, video task
+ * status, STS token, file parse — are whole-answer calls (egressJson), behind
+ * the flag of chats/new. The generation of an image or a video is a
+ * completions call, on the one address qwen.ai takes from a fetch alone
+ * (Qwen2API-3ue.9): it goes through postCompletions, behind the flag of
+ * completions.
  *
  * A worker that cannot serve the call is never papered over with a direct
  * request: plain Node TLS from the egress IP is what Baxia refuses
@@ -78,6 +89,9 @@ const egressHeaders = accept => ({
     // The one call the page's own code sends with another accept than its XHRs' default.
     ...(accept ? { accept } : {})
 })
+
+// The same, for a call that carries no body: there is no content-type to state.
+const egressHeadersOf = body => (body === undefined ? { 'x-request-id': generateUUID() } : egressHeaders())
 
 /**
  * One chats/new from inside the resident page.
@@ -562,8 +576,194 @@ async function postCompletions(context) {
     }
 }
 
+/* -------------------------- whole-answer calls to any address of the origin (Qwen2API-03v) -- */
+
+// qwen.ai's budget for a JSON call once the page is up: what the direct
+// callers allow axios.
+const JSON_TIMEOUT_MS = 30000
+const TRANSPORT = 'upstream_transport_error'
+
+// What qwen.ai said to a call that cannot use its answer — in the categories
+// chats/new throws, the codes the clients know — and the status each goes
+// with there. Said of the call it was: these do not create a chat.
+const CALL_FAILURES = {
+    [UNAUTHORIZED]: ['Qwen session authorization rejected; this is not Qwen2API client authentication', 502],
+    [WAF_CHALLENGE]: ['Qwen requires WAF/CAPTCHA verification', 503],
+    [TRANSPORT]: ['Qwen upstream call failed in the signin worker', 503]
+}
+
+/**
+ * A whole-answer call that qwen.ai refused, or that the worker could not
+ * carry: a ChatCreationError, so that every caller already answering those
+ * (the media controller) answers this one the same way — by code and status.
+ */
+class EgressCallError extends ChatCreationError {
+    constructor(code) {
+        super(code, CALL_FAILURES[code][1])
+        this.message = this.publicMessage = CALL_FAILURES[code][0]
+        this.name = 'EgressCallError'
+    }
+}
+
+// A worker that could not carry the call — unreachable, a page that closed
+// or hung, its limit of pages. Its own code is for the log and the error.
+const notCarried = error => Object.assign(new EgressCallError(TRANSPORT), { workerCode: error.workerCode || null })
+
+// Only what a reload of the page can heal is worth one. A worker that could
+// not carry the call is not retried either: what is wrong with it is not in the page.
+const callRecoverable = error => error instanceof EgressCallError && RECOVERABLE.has(error.code)
+
+// A challenge refused the call. It carries the wait every chat challenge is
+// answered with: the media controller gives a generation's to its client as
+// Retry-After, and this one's goes the same way.
+const challengedCall = () => Object.assign(new EgressCallError(WAF_CHALLENGE), { retryAfter: CHAT_CHALLENGE_RETRY_AFTER_SECONDS })
+
+/**
+ * One whole-answer call as far as the worker's answer. The page is the
+ * source of the Bearer and of the cookies, as for every egress call: the app
+ * sends no authorization.
+ * @returns {Promise<object>} the worker's answer, the jar it returned folded into the session
+ * @throws {EgressCallError} a profile that no longer authenticates; a worker
+ *   that could not carry the call
+ */
+async function wholeAnswer({ email, account, url, method, body, timeoutMs }) {
+    let answer
+    try {
+        answer = await signinWorker.egress(email, account, {
+            url, method, headers: egressHeadersOf(body), body, timeoutMs
+        })
+    } catch (error) {
+        // The profile no longer authenticates: the same refusal as a session qwen.ai rejected.
+        if (error.sessionLost) throw new EgressCallError(UNAUTHORIZED)
+        logger.error(
+            `CHAT_CREATION_TRANSPORT=${config.chatCreationTransport}: ${method} ${new URL(url).pathname}` +
+            ` через signin-worker не прошёл${error.workerCode ? ` (${error.workerCode})` : ''}: ${error.message}`, 'CHAT'
+        )
+        throw notCarried(error)
+    }
+    sessionPersistence.syncCookies(email, answer.cookies)
+    return answer
+}
+
+// qwen.ai's answer to a JSON call, in the shape axios hands one over.
+const jsonAnswer = answer => {
+    let payload = answer.body
+    try {
+        payload = JSON.parse(answer.body)
+    } catch {
+        // Not JSON — an HTML challenge page is classified as raw text, like the direct path's.
+    }
+    // A challenge page under status 200, or the punish envelope (2026-11-24): by
+    // the markers the direct path is screened with. Read before the session, as
+    // assertChatCreationResponse reads them: a challenge is no verdict on the
+    // session — it is worth a reload, and never a password.
+    if (detectWafChallenge(payload)) throw challengedCall()
+    // A 401, or the envelope under any status: what assertChatCreationResponse reads for chats/new.
+    if (answer.status === 401 || isUnauthorized(payload)) throw new EgressCallError(UNAUTHORIZED)
+    // The body as parsed as the direct path gets it with responseType json.
+    if (answer.status < 200 || answer.status >= 300) throw httpError(answer.status, answer, payload)
+    return {
+        status: answer.status,
+        statusText: http.STATUS_CODES[answer.status] || '',
+        headers: answer.headers,
+        data: payload
+    }
+}
+
+/**
+ * One JSON call to qwen.ai from inside the account's resident page, answered
+ * whole: chat info, video task status, STS token, file parse — any address of
+ * the chat origin (Qwen2API-03v). It is a whole-answer call as chats/new is
+ * one, an XMLHttpRequest with the page's own headers, and it is switched by
+ * the same flag (CHAT_CREATION_TRANSPORT: enabled()).
+ *
+ * It gets the recovery the completions get, not the one chats/new gets. A
+ * session qwen.ai refuses, and a WAF challenge page, are answered with a
+ * reload of the page and exactly one more call. A refusal that survives the
+ * reload escalates to nothing: the password is spent on chats/new's verdict
+ * alone, and that call has just passed for the request this one belongs to
+ * (docs/browser-egress-design.md, completions).
+ *
+ * A worker that cannot carry the call is never papered over — with a direct
+ * request, nor with an empty answer: the callers used to read any failure as
+ * "not ready yet" and poll on, for the twenty minutes a video task is given.
+ * It leaves as a retryable 503.
+ *
+ * @param {object} context
+ * @param {Object} [context.account] - Account (email, proxy): whose page the call leaves from
+ * @param {string} context.url - Absolute, on the chat origin
+ * @param {string} [context.method] - GET unless said otherwise
+ * @param {string} [context.body] - Passed through as text
+ * @param {number} [context.timeoutMs] - qwen.ai's budget for the call
+ * @returns {Promise<object>} axios-shaped response; `data` is the body parsed
+ *   as JSON where it parses, the text otherwise
+ * @throws {EgressCallError} a session refused with the recovery spent (twice,
+ *   or once inside the interval of the last one), a challenge likewise — with
+ *   the chat challenge's wait on it —, a worker that could not carry the call
+ * @throws {Error} a non-2xx of qwen.ai, as axios rejects one (isAxiosError, response)
+ */
+async function egressJson(context) {
+    // The worker pins /egress to the chat origin too; this keeps the app-side refusal.
+    if (new URL(context.url).origin !== store.chatOrigin) throw new EgressCallError(TRANSPORT)
+    const { account } = context
+    const email = account?.email
+    // The session as of the call, for the sibling check below. None of it is
+    // sent — the Bearer is the page's (Qwen2API-jr9) — and none is required:
+    // the call goes out on the page's session, as a completions call does.
+    let session = store.sessions.get(email) || null
+    const call = {
+        email, account, url: context.url, method: context.method || 'GET',
+        body: context.body === undefined ? undefined : String(context.body),
+        // The direct callers' budget unless the caller brings a number of its own.
+        timeoutMs: context.timeoutMs ?? JSON_TIMEOUT_MS
+    }
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return jsonAnswer(await wholeAnswer(call))
+        } catch (error) {
+            if (!callRecoverable(error) || attempt > 1) throw error
+            // A sibling request may have recovered this account while this
+            // call was out on a page that refused it: the store holds a newer
+            // session, and the page is reloaded already. That one carries the
+            // recovery; this call schedules none of its own.
+            const latest = store.sessions.get(email)
+            const live = latest && latest.token !== session?.token
+                ? latest
+                : await sessionPersistence.recoverSession(email, account, error.code)
+            if (!live) throw error
+            session = live
+        }
+    }
+}
+
+/**
+ * What a failed egress call is to the client, in the object form the media
+ * controller answers with — or null for an error that is not the egress's to
+ * name: an HTTP status of qwen.ai's is the caller's to classify, as a direct
+ * one is. A session qwen.ai refused twice is a 502 with its code. A call that
+ * did not get through the egress is a retryable 503: the worker's doing as
+ * often as not, though qwen.ai's own silence on it (`egress_timeout`) and the
+ * road to it failing (`egress_failed`) arrive here too — the text path
+ * charges those two to the account, and the media controller keeps no books.
+ * @param {*} error - As postCompletions rejected
+ * @returns {{status: number, error: string, code: string}|null}
+ */
+const callFailure = error => {
+    // As axios and the impersonating transport reject a status; as postCompletions rejects a session.
+    if (error?.isAxiosError && error.response?.status === 401) {
+        return { status: CALL_FAILURES[UNAUTHORIZED][1], error: CALL_FAILURES[UNAUTHORIZED][0], code: UNAUTHORIZED }
+    }
+    // The relay's own failures carry the worker's code; a worker refusing
+    // the call itself is a SigninError.
+    if (error instanceof SigninError || typeof error?.workerCode === 'string') {
+        return { status: CALL_FAILURES[TRANSPORT][1], error: CALL_FAILURES[TRANSPORT][0], code: TRANSPORT }
+    }
+    return null
+}
+
 module.exports = {
     enabled, usesWorker, createChat, egressHeaders, CHAT_TIMEOUT_MS,
     completionsEnabled, postCompletions, setTimingForTests,
-    COMPLETIONS_TIMEOUT_MS, FIRST_FRAME_GRACE_MS, RELAY_GRACE_MS
+    COMPLETIONS_TIMEOUT_MS, FIRST_FRAME_GRACE_MS, RELAY_GRACE_MS,
+    egressJson, callFailure, EgressCallError, JSON_TIMEOUT_MS
 }

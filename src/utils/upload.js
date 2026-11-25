@@ -7,6 +7,10 @@ const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig, describeEgress }
 const { buildRequestHeaders } = require('./header-profile')
 const config = require('../config/index.js')
 
+// Taken when a call is made, not at the top: the egress carries the session
+// store in, which the direct path has no use for.
+const browserEgress = () => require('./browser-egress.js')
+
 // 配置常量
 const UPLOAD_CONFIG = {
     get stsTokenUrl() {
@@ -101,34 +105,32 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
             throw new Error(`文件大小超出限制，最大允许 ${UPLOAD_CONFIG.maxFileSize / 1024 / 1024}MB`)
         }
 
-        const requestId = generateUUID()
-        const bearerToken = authToken.startsWith('Bearer ') ? authToken : `Bearer ${authToken}`
-
-        // Antidetect: per-account fingerprint headers replace static UA
-        const baseHeaders = buildRequestHeaders(account, {
-            extra: {
-                'Authorization': bearerToken,
-                'x-request-id': requestId
-            }
-        })
-        const headers = baseHeaders
-
         const payload = {
             filename,
             filesize,
             filetype: filetypeSimple
         }
 
-        const requestConfig = {
-            headers,
-            timeout: UPLOAD_CONFIG.timeout
-        }
-
-        applyProxyToAxiosConfig(requestConfig, account);
-
         logger.info(`请求STS Token: ${filename} (${filesize} bytes, ${filetypeSimple})`, 'UPLOAD', '🎫')
 
-        const response = await axios.post(UPLOAD_CONFIG.stsTokenUrl, payload, requestConfig)
+        // From the account's page where the app sends chats/new from it (Qwen2API-03v):
+        // on the page's own session, with the session recovery of the egress. The
+        // app's token is no Bearer qwen.ai takes, and the call brings none.
+        const response = browserEgress().enabled()
+            ? await browserEgress().egressJson({
+                account, url: UPLOAD_CONFIG.stsTokenUrl, method: 'POST',
+                body: JSON.stringify(payload), timeoutMs: UPLOAD_CONFIG.timeout
+            })
+            : await axios.post(UPLOAD_CONFIG.stsTokenUrl, payload, applyProxyToAxiosConfig({
+                // Antidetect: per-account fingerprint headers replace static UA
+                headers: buildRequestHeaders(account, {
+                    extra: {
+                        'Authorization': authToken.startsWith('Bearer ') ? authToken : `Bearer ${authToken}`,
+                        'x-request-id': generateUUID()
+                    }
+                }),
+                timeout: UPLOAD_CONFIG.timeout
+            }, account))
 
         if (response.status === 200 && response.data) {
             if (response.data.success === false) {
@@ -181,8 +183,11 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
         }
 
         // 重试逻辑
+        // Through the page qwen.ai's silence comes back as the worker's egress_timeout
+        // (Qwen2API-03v): it is the timeout this retry always gave another chance.
         if (retryCount < UPLOAD_CONFIG.maxRetries &&
             (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT' ||
+                error.workerCode === 'egress_timeout' ||
                 error.response?.status >= 500)) {
 
             const delayMs = UPLOAD_CONFIG.retryDelay * Math.pow(2, retryCount)
@@ -404,22 +409,42 @@ const throwIfParseServiceFailed = (response, fileId, egress = 'unknown') => {
     throw error
 }
 
+// The same refusal when the call left from the account's page (Qwen2API-03v).
+// The egress has seen the challenge page, reloaded the page and asked once
+// more; what it throws is its own category. Named as the direct path names the
+// challenge — it is the parse breaker's strike and the client's Retry-After.
+const parseChallenge = (fileId, egress) => Object.assign(
+    new Error(`Qwen 文档解析服务失败: ${WAF_CAPTCHA_CODE} (${fileId}, via ${egress})`),
+    { code: 'qwen_parse_waf_challenge', parseCode: WAF_CAPTCHA_CODE, egress }
+)
+
 const parseUploadedTextFile = async (fileId, authToken, account, options = {}) => {
     if (!fileId || !authToken) throw new Error('解析文档缺少 fileId 或认证 Token')
     const egress = describeEgress(account)
 
     const baseUrl = getChatBaseUrl()
-    const requestConfig = applyProxyToAxiosConfig({
+    const timeoutMs = Math.max(1000, Number(options.timeoutMs) || 30000)
+    // From the account's page where the app sends chats/new from it (Qwen2API-03v):
+    // on the page's own session, with the session recovery of the egress. The
+    // app's token is no Bearer qwen.ai takes, and the call brings none.
+    const viaPage = browserEgress().enabled()
+    const requestConfig = viaPage ? null : applyProxyToAxiosConfig({
         headers: createAuthorizedHeaders(authToken, account),
-        timeout: Math.max(1000, Number(options.timeoutMs) || 30000)
+        timeout: timeoutMs
     }, account)
 
     // Transport failures (dead proxy, reset, timeout) never reach the JSON checks in
     // throwIfParseServiceFailed; tag them with the egress too, or a burnt proxy logs as a bare ECONNRESET.
     const postViaEgress = async (path, body) => {
         try {
+            if (viaPage) {
+                return await browserEgress().egressJson({
+                    account, url: `${baseUrl}${path}`, method: 'POST', body: JSON.stringify(body), timeoutMs
+                })
+            }
             return await axios.post(`${baseUrl}${path}`, body, requestConfig)
         } catch (error) {
+            if (error?.code === 'upstream_waf_challenge') throw parseChallenge(fileId, egress)
             if (error && typeof error === 'object' && !error.egress) {
                 error.egress = egress
                 error.message = `${error.message} (${fileId}, via ${egress})`
