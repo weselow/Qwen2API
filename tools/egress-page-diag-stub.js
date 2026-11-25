@@ -34,6 +34,11 @@
  *                         harvests) is refused, as qwen.ai refused the app's token on 2026-11-24.
  *                         For --ui-send=1 with --signed=1 and --bearer-compare=1.
  *   STUB_MODE=ui-punish  the same, but the page's own completions is answered with the punish envelope.
+ *   STUB_MODE=ui-upload  for --ui-upload=1: the page has a file input, and a file put into it goes the way the chat
+ *                         site uploads one — STS, the bytes to the object store, the parse and its status — through
+ *                         the page's own code. STUB_UPLOAD_TRANSPORT=xhr|fetch says how the page makes its file
+ *                         calls (default xhr). STUB_UPLOAD_REFUSED=1 makes the server answer STS with 405 and an
+ *                         HTML error page, as qwen.ai answered the app's own call on 2026-11-25.
  *   STUB_MODE=own-ok     for --like-own=1: POST /api/v2/chat/completions is answered with SSE frames, the worker's own
  *                         call included
  *   STUB_MODE=own-ok-control-punished
@@ -56,6 +61,10 @@ const mode = process.env.STUB_MODE || 'ok'
 const hang = mode === 'hang' || mode === 'hangfreeze'
 // ui, ui-punish: an input and a send button on the page; a message goes out through them.
 const ui = mode === 'ui' || mode === 'ui-punish'
+// ui-upload: a file input on the page; a file put into it is uploaded through the page's own code.
+const uiUpload = mode === 'ui-upload'
+const uploadTransport = process.env.STUB_UPLOAD_TRANSPORT === 'fetch' ? 'fetch' : 'xhr'
+const uploadRefused = process.env.STUB_UPLOAD_REFUSED === '1'
 // The three modes for --like-own=1.
 const own = mode === 'own-ok' || mode === 'own-ok-control-punished' || mode === 'own-referrer-needed' || mode === 'own-xhr-ok'
 const waf = mode === 'waf' || ui || own
@@ -70,6 +79,8 @@ const accelNeeded = mode === 'own-xhr-ok'
 // own-ok-control-punished: the worker's own call — an XMLHttpRequest, marked by the page's hook — is punished still.
 const controlPunished = mode === 'own-ok-control-punished'
 let refusalsLeft = refuseFirst ? 1 : 0
+// ui-upload: how many times the page asked for the parse status; the third answer says success.
+let uploadStatusAsks = 0
 const freezeAfterMs = mode === 'freeze' ? 2500 : mode === 'hangfreeze' ? 1500 : 0
 const port = Number(process.env.STUB_PORT || 3847)
 const payload = Buffer.from(JSON.stringify({ sub: 'stub', exp: Math.floor(Date.now() / 1000) + 86400 })).toString('base64url')
@@ -150,11 +161,54 @@ const uiControls = `
         }())
     </script>`
 
+// What stands in for the chat site's file input and the code that uploads a file put into it.
+const uploadControls = `
+    <input id="chat-file-input" type="file" accept=".txt,.md,.doc,.docx,.pdf,.png,.jpg" style="display: none">
+    <div id="attachments"></div>
+    <script>
+        (function () {
+            const attach = document.getElementById('chat-file-input')
+            const shown = document.getElementById('attachments')
+            const call = (url, body, done) => {
+                const headers = { 'content-type': 'application/json', 'authorization': 'Bearer ' + localStorage.getItem('token') }
+                if (${JSON.stringify(uploadTransport)} === 'xhr') {
+                    const xhr = new XMLHttpRequest()
+                    xhr.open('POST', url)
+                    for (const name in headers) xhr.setRequestHeader(name, headers[name])
+                    xhr.onload = () => done(xhr.status, xhr.responseText)
+                    xhr.send(body)
+                    return
+                }
+                fetch(url, { method: 'POST', headers, body, credentials: 'include' }).then(response => response.text().then(text => done(response.status, text)))
+            }
+            const json = (method, url, payload, done) => call(url, JSON.stringify(payload), done)
+            attach.addEventListener('change', () => {
+                const file = attach.files[0]
+                if (!file) return
+                json('POST', '/api/v1/files/getstsToken', { filename: file.name, filesize: file.size, filetype: 'document' }, (status, text) => {
+                    if (status !== 200) { shown.innerText += 'sts failed: ' + status + ' | '; return }
+                    const data = JSON.parse(text).data
+                    fetch('/oss/' + data.file_path, { method: 'PUT', body: file, headers: { 'x-oss-security-token': data.security_token } })
+                        .then(put => put.text())
+                        .then(() => json('POST', '/api/v2/files/parse', { file_id: data.file_id }, (parseStatus, parseText) => {
+                            const poll = attempt => json('POST', '/api/v2/files/parse/status', { file_id_list: [data.file_id] }, (code, out) => {
+                                const list = JSON.parse(out).data.list || []
+                                const state = list.length ? list[0].status : 'missing'
+                                if (code === 200 && state !== 'success' && attempt < 20) return setTimeout(() => poll(attempt + 1), 400)
+                                shown.innerText += 'file: ' + file.name + ' ' + state + ' | '
+                            })
+                            setTimeout(() => poll(0), 300)
+                        }))
+                })
+            })
+        }())
+    </script>`
+
 http.createServer((req, res) => {
     const pathname = req.url.split('?')[0]
     if (pathname === '/') {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-        res.end(`<!doctype html><title>stub chat</title><body><h1>stub</h1>${ui ? uiControls : ''}<script>
+        res.end(`<!doctype html><title>stub chat</title><body><h1>stub</h1>${ui ? uiControls : ''}${uiUpload ? uploadControls : ''}<script>
             localStorage.setItem('token', ${JSON.stringify(token)});
             ${waf ? hook : ''}
             ${refuseFirst ? `setTimeout(() => localStorage.setItem('token', ${JSON.stringify(rotated)}), 1500);` : ''}
@@ -172,6 +226,32 @@ http.createServer((req, res) => {
         return
     }
     if (pathname === '/api/v2/chats/new' && hang) return // never answers
+    if (pathname === '/api/v1/files/getstsToken') {
+        if (uploadRefused) {
+            // As qwen.ai answered the app's own STS call from the page on 2026-11-25: 405 with an HTML error page.
+            res.writeHead(405, { 'content-type': 'text/html; charset=utf-8' })
+            return res.end('<!doctypehtml><html lang="zh-cn"><meta charset="utf-8"><meta name="data-spm" content="a3c0e"><title>405</title><style>a,body{margin:0}</style><body>405</body></html>')
+        }
+        res.writeHead(200, { 'content-type': 'application/json' })
+        return res.end(JSON.stringify({ success: true, data: {
+            access_key_id: 'stub-access-key-id', access_key_secret: 'stub-access-key-secret', security_token: 'stub-security-token',
+            file_url: `http://127.0.0.1:${port}/oss/stub-user/file.txt?key=stub-url-key`, file_path: 'stub-user/file.txt',
+            bucketname: 'stub-bucket', region: 'stub-region', file_id: 'stub-file-1'
+        } }))
+    }
+    if (uiUpload && pathname === '/oss/stub-user/file.txt' && req.method === 'PUT') {
+        req.resume()
+        return req.on('end', () => { res.writeHead(200); res.end('') })
+    }
+    if (uiUpload && pathname === '/api/v2/files/parse') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        return res.end(JSON.stringify({ success: true, data: {} }))
+    }
+    if (uiUpload && pathname === '/api/v2/files/parse/status') {
+        uploadStatusAsks += 1
+        res.writeHead(200, { 'content-type': 'application/json' })
+        return res.end(JSON.stringify({ success: true, data: { list: [{ file_id: 'stub-file-1', status: uploadStatusAsks < 3 ? 'processing' : 'success' }] } }))
+    }
     if (pathname === '/api/v2/chat/completions') {
         // As qwen.ai does (25.11): no completions without the chat id in the address.
         if (own && !/[?&]chat_id=/.test(req.url)) {
