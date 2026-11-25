@@ -51,9 +51,11 @@
  *                    (among it x-accel-buffering: no and bx-v), to the address
  *                    without the chat id, with a body shaped like the app's.
  *                    Two calls, the runbook's pause apart, each in a fresh
- *                    chat: the first from where the page stands (referer /),
- *                    the second — only if the first was refused — with the
- *                    page's own referer for it, /c/<chat>.
+ *                    chat: the first from where the page stands (referer /).
+ *                    Refused — the second, with the page's own referer for it
+ *                    (/c/<chat>). Passed — the worker's own call once more
+ *                    instead, as the control: if that passes too, it is the
+ *                    time that changed (24.11: refused at 20:30 UTC).
  *   --fast=1        the pause between calls cut to 2 s — for --loopback-only=1
  *                    rehearsals only; a live run refuses it.
  * On 2026-11-24 the worker's old way (fetch, content-type only) got a WAF
@@ -1003,24 +1005,36 @@ async function main() {
         return said
     }
 
-    /** All of --like-own: the call without the page's referer, then, only if that was refused, with it. */
+    // A chats/new by the worker's call, then one completions call 1.5 s later — the page's own went out about a second after its chats/new (24.11).
+    async function freshChatThen(call, label) {
+        const created = await attempt(`${label}-chats-new`)
+        if (!created.chatId) {
+            log(label, `skipped: the chats/new before it made no chat (${created.outcome})`)
+            return { chatsNew: created.outcome }
+        }
+        await sleep(1500)
+        return { chatsNew: created.outcome, ...(await call(created.chatId)) }
+    }
+    const anAnswer = call => Boolean(call && call.ok && /^an answer/.test(call.answer))
+
+    /**
+     * All of --like-own. The call without the page's referer comes first. Refused — the second,
+     * with the referer, says whether that is what was missing. Passed — the worker's own call
+     * goes once more: hours may have passed since it was last refused, and if it passes too,
+     * it is the time that changed, not the shape of the call.
+     */
     async function ownLike() {
         const report = {}
-        for (const [label, withReferer] of [['own-completions-1', false], ['own-completions-2', true]]) {
+        await pauseBetweenCalls()
+        report['own-completions-1'] = await freshChatThen(chatId => ownStyleCompletions(chatId, {}, 'own-completions-1'), 'own-completions-1')
+        if (anAnswer(report['own-completions-1'])) {
+            log('own-completions-2', 'skipped: the first call passed without the page\'s referer')
             await pauseBetweenCalls()
-            const created = await attempt(`own-chats-new-${withReferer ? 2 : 1}`)
-            if (!created.chatId) {
-                log(label, `skipped: the chats/new before it made no chat (${created.outcome})`)
-                report[label] = { chatsNew: created.outcome }
-                break
-            }
-            // The page's own completions went out about a second after its chats/new (24.11).
-            await sleep(1500)
-            report[label] = { chatsNew: created.outcome, ...(await ownStyleCompletions(created.chatId, withReferer ? { referrer: `/c/${created.chatId}` } : {}, label)) }
-            if (!withReferer && report[label].ok && /^an answer/.test(report[label].answer)) {
-                log('own-completions-2', 'skipped: the first call passed without the page\'s referer')
-                break
-            }
+            report.control = await freshChatThen(chatId => completions(chatId), 'control')
+        } else {
+            await pauseBetweenCalls()
+            report['own-completions-2'] = await freshChatThen(
+                chatId => ownStyleCompletions(chatId, { referrer: `/c/${chatId}` }, 'own-completions-2'), 'own-completions-2')
         }
         report.stateAfter = await withTimeout(page.evaluate(pageState), 8000, 'the page').catch(error => ({ error: cut(error.message, 100) }))
         log('life', `the page shows: ${JSON.stringify(report.stateAfter)}`)
@@ -1306,6 +1320,12 @@ async function main() {
                 console.log(`  sent: ${call.sent}`)
                 console.log(`  starts: ${cut(call.starts, 300)}`)
             }
+        }
+        if (out.own.control) {
+            const control = out.own.control
+            console.log(`control, the worker's own call as it was: chats/new ${control.chatsNew}`)
+            if (control.took === undefined) console.log('  no completions call was made')
+            else console.log(`  ${JSON.stringify(control)}`)
         }
     }
     console.log('--- page facts')
