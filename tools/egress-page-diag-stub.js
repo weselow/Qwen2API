@@ -36,9 +36,11 @@
  *   STUB_MODE=ui-punish  the same, but the page's own completions is answered with the punish envelope.
  *   STUB_MODE=ui-upload  for --ui-upload=1: the page has a file input, and a file put into it goes the way the chat
  *                         site uploads one — STS, the bytes to the object store, the parse and its status — through
- *                         the page's own code. STUB_UPLOAD_TRANSPORT=xhr|fetch says how the page makes its file
- *                         calls (default xhr). STUB_UPLOAD_REFUSED=1 makes the server answer STS with 405 and an
- *                         HTML error page, as qwen.ai answered the app's own call on 2026-11-25.
+ *                         the page's own code, where its front end 0.3.50 makes these calls: STS at
+ *                         /api/v2/files/getstsToken, with the size as a string. STUB_UPLOAD_TRANSPORT=xhr|fetch
+ *                         says how the page makes its file calls (default xhr). The v1 STS address is answered
+ *                         405 with an HTML error page, as qwen.ai answered the app's call to it on 2026-11-25;
+ *                         STUB_UPLOAD_REFUSED=1 makes the v2 one be answered the same way.
  *   STUB_MODE=own-ok     for --like-own=1: POST /api/v2/chat/completions is answered with SSE frames, the worker's own
  *                         call included
  *   STUB_MODE=own-ok-control-punished
@@ -185,7 +187,8 @@ const uploadControls = `
             attach.addEventListener('change', () => {
                 const file = attach.files[0]
                 if (!file) return
-                json('POST', '/api/v1/files/getstsToken', { filename: file.name, filesize: file.size, filetype: 'document' }, (status, text) => {
+                // As the page's own front end 0.3.50 asks: under /api/v2, the size as a string, the type by the MIME type.
+                json('POST', '/api/v2/files/getstsToken', { filename: file.name, filesize: String(file.size), filetype: file.type.startsWith('image/') ? 'image' : 'file' }, (status, text) => {
                     if (status !== 200) { shown.innerText += 'sts failed: ' + status + ' | '; return }
                     const data = JSON.parse(text).data
                     fetch('/oss/' + data.file_path, { method: 'PUT', body: file, headers: { 'x-oss-security-token': data.security_token } })
@@ -226,17 +229,18 @@ http.createServer((req, res) => {
         return
     }
     if (pathname === '/api/v2/chats/new' && hang) return // never answers
-    if (pathname === '/api/v1/files/getstsToken') {
-        if (uploadRefused) {
-            // As qwen.ai answered the app's own STS call from the page on 2026-11-25: 405 with an HTML error page.
-            res.writeHead(405, { 'content-type': 'text/html; charset=utf-8' })
-            return res.end('<!doctypehtml><html lang="zh-cn"><meta charset="utf-8"><meta name="data-spm" content="a3c0e"><title>405</title><style>a,body{margin:0}</style><body>405</body></html>')
-        }
+    if (pathname === '/api/v1/files/getstsToken' || (pathname === '/api/v2/files/getstsToken' && uploadRefused)) {
+        // As qwen.ai answered the app's own STS call to the v1 address from the page on 2026-11-25: 405 with an HTML error page.
+        res.writeHead(405, { 'content-type': 'text/html; charset=utf-8' })
+        return res.end('<!doctypehtml><html lang="zh-cn"><meta charset="utf-8"><meta name="data-spm" content="a3c0e"><title>405</title><style>a,body{margin:0}</style><body>405</body></html>')
+    }
+    if (pathname === '/api/v2/files/getstsToken') {
         res.writeHead(200, { 'content-type': 'application/json' })
+        // The fields the page's own code reads off the answer, the endpoint among them.
         return res.end(JSON.stringify({ success: true, data: {
             access_key_id: 'stub-access-key-id', access_key_secret: 'stub-access-key-secret', security_token: 'stub-security-token',
             file_url: `http://127.0.0.1:${port}/oss/stub-user/file.txt?key=stub-url-key`, file_path: 'stub-user/file.txt',
-            bucketname: 'stub-bucket', region: 'stub-region', file_id: 'stub-file-1'
+            bucketname: 'stub-bucket', region: 'stub-region', endpoint: 'stub-region.aliyuncs.com', file_id: 'stub-file-1'
         } }))
     }
     if (uiUpload && pathname === '/oss/stub-user/file.txt' && req.method === 'PUT') {

@@ -1517,9 +1517,9 @@ E.1–E.3. Код — в `main`, живьём не проверялось ни �
 | Информация о чате: `GET /api/v2/chats/{id}` | `axios.get` из Node | целый ответ — `egressJson` (`CHAT_CREATION_TRANSPORT`) |
 | Статус видеозадачи: `GET /api/v1/tasks/status/{id}` | `axios.get` из Node | целый ответ — `egressJson` |
 | Скачивание результата (`contentUrl`, `downloadAssetAsBase64`) | `axios.get` из Node | **не менялось**: это CDN, не qwen.ai |
-| STS-токен: `POST /api/v1/files/getstsToken` (`src/utils/upload.js`) | `axios.post` из Node | целый ответ — `egressJson` |
+| STS-токен: `POST /api/v2/files/getstsToken` — адрес страницы; на прямом пути остался `/api/v1/files/getstsToken` (`src/utils/upload.js`, Qwen2API-3ue.12) | `axios.post` из Node | целый ответ — `egressJson` |
 | Разбор файла: `POST /api/v2/files/parse`, `/parse/status` (`upload.js`) | `axios.post` из Node | целый ответ — `egressJson` |
-| Заливка байтов в Alibaba OSS (`upload.js`) | напрямую, клиент `ali-oss` | **не менялось**: сторонний хост, allowlist воркера его не пускает |
+| Заливка байтов в Alibaba OSS (`upload.js`) | напрямую, клиент `ali-oss` | **из страницы не шлётся** — сторонний хост, allowlist воркера его не пускает; по-прежнему напрямую, а за тем же флагом — как подписывает страница: V4, регион и адрес хранилища из ответа (Qwen2API-3ue.12) |
 
 Инварианты рабочего пути (раздел «Established 2026-11-25») соблюдены и
 держатся тестами: ни один вызов приложения на `/egress` не несёт
@@ -1797,6 +1797,55 @@ axios; проглоченный отказ в поиске чата и в опр
 - Не проверялось живьём (файловые — вместе с Qwen2API-3ue.12): `POST
   /api/v2/files/parse`, `/parse/status`, заливка байтов в OSS
   (`*.aliyuncs.com`) напрямую, лимит 8 МиБ на информацию о чате.
+
+### STS-токен: адрес и форма страницы (Qwen2API-3ue.12, 2026-11-26)
+
+Простыми словами: вчерашний `405` получил не запрос страницы, а запрос
+приложения по её старому адресу. Код фронта 0.3.50 читается без обращения к
+qwen.ai — бандлы публичны на `assets.alicdn.com`; всё нужное лежит в
+`main.js` (класс загрузки файлов, `uploadFileToOss`). Что делает страница:
+
+- **адрес — `POST /api/v2/files/getstsToken`.** Все вызовы её API-клиента идут
+  через axios-инстанс с `baseURL = <хост>/api/v2`; адрес `/api/v1/files/…` в
+  коде вызовов не встречается — остался только строкой в списке адресов,
+  которые проверяет антибот страницы (`checkApiPath`). Приложение же просило
+  токен по v1 — и получало `405`;
+- **способ — тот же, что у воркера:** не-стримные вызовы (STS, разбор файла,
+  его статус) идут через axios, то есть XMLHttpRequest; `fetch` — только для
+  `responseType: "stream"`;
+- **тело — `{filename, filesize: String(размер), filetype}`**, где `filetype` —
+  `file | image | video | audio` по главной части MIME-типа. От тела
+  приложения отличается только одним: размер строкой, а не числом;
+- **заголовки — тот же набор,** что ставит воркер: `accept`, `content-type`,
+  `accept-language`, `version: 0.3.50`, `source: web`, `authorization`
+  страницы, `x-request-id`, `timezone`. Перед STS-вызовом страница дожидается
+  готовности антибота (`baxiaInitialized`, `getUidToken`);
+- **ответ — `data.{access_key_id, access_key_secret, security_token,
+  bucketname, region, endpoint, file_id, file_path, file_url}`**: страницу
+  интересуют `region` и `endpoint` из него;
+- **заливка в OSS — клиентом `ali-oss` с `authorizationV4: true`,** с регионом
+  и адресом хранилища из ответа; файл меньше 2 МиБ — `put`, больше —
+  multipart-загрузка;
+- **разбор документа — тот же:** `POST /api/v2/files/parse` с `{file_id}`,
+  опрос `POST /api/v2/files/parse/status` с `{file_id_list}`.
+
+Что изменено в приложении (`src/utils/upload.js`) — только за флагом egress,
+прямой путь не тронут:
+
+1. STS-вызов уходит на `/api/v2/files/getstsToken`;
+2. размер в теле — строкой;
+3. из ответа берутся `endpoint` (запасно — прежняя склейка
+   `<region>.aliyuncs.com`) и `region`;
+4. клиент OSS создаётся как у страницы: `authorizationV4: true` и `region` —
+   подпись V4 строится по региону, поэтому регион из ответа обязателен
+   (`ali-oss` 6.23.0; подпись проверена без сети на Node и на Bun).
+
+Не проверено живьём на момент этой записи: всё перечисленное — адрес,
+заливка, разбор, картинка в сообщении. По коду видно только, что адрес
+другой; что qwen.ai не блокирует файловые вызовы как таковые, кодом не
+доказать (в логах 25.11 заголовков ответа нет — в частности, не видно, был ли
+`x-region-restriction`, который фронт читает как региональную блокировку).
+Полная запись — NOTES Qwen2API-3ue.12, «25.11, 22:50 UTC».
 
 ### Ограничения
 
