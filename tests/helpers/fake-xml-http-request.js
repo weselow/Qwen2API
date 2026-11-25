@@ -3,10 +3,11 @@
 /**
  * What a page gives the worker's in-page call (signin-worker/lib/egress-fetch.js,
  * pageCall) for the worker's tests: a stand-in for the browser's
- * XMLHttpRequest over the fetch these tests have always scripted — a Response,
- * a ReadableStream fed by hand, an abort through init.signal. No Chromium
- * anywhere near CI: tools/worker-egress-local-smoke.js runs the same code on
- * a real one.
+ * XMLHttpRequest — and for its fetch, where the call is made as the page's
+ * own front end makes it (a stream, Qwen2API-3ue.9) — over the fetch these
+ * tests have always scripted: a Response, a ReadableStream fed by hand, an
+ * abort through init.signal. No Chromium anywhere near CI:
+ * tools/worker-egress-local-smoke.js runs the same code on a real one.
  *
  *   const sandbox = { ...pageGlobals(script, page), [binding]: call }
  *
@@ -17,13 +18,16 @@
  *   hold       body => boolean                    an answer whose end never reaches the call — what
  *                                                 the page's request hooks do to one they take for a block
  *                                                 (xhr.release() tells the call of it after all, as when
- *                                                 the hooks let go)
+ *                                                 the hooks let go; a fetch's release() hands it over then)
  *   frontEnd   string                            the front end's version the page's scripts advertise;
  *                                                 '' for a page that shows none, 'elsewhere' for one
  *                                                 whose scripts show no version
  *   language   string                            the page's language (navigator.language)
  *   pageToken  string                            the session token the page keeps (localStorage.token)
- *   xhrs       XMLHttpRequest[]                  every request the page made, newest last
+ *   xhrs       XMLHttpRequest[]                  every XMLHttpRequest the page made, newest last
+ *   fetches    object[]                          every fetch the page made, newest last: `sent` is what
+ *                                                 it was asked (the address, and init as the call
+ *                                                 made it), `aborted` whether its signal was
  *
  * Like the browser's, the stand-in tells the page's network about an answer
  * whatever it does with the call's own events: the `page` it was given hears
@@ -35,12 +39,13 @@ const CHAT = 'https://chat.qwen.ai'
 /**
  * The globals pageCall needs beyond the ones every page has and the test
  * already provides (timers, btoa, the stream channel).
- * @param {{fetch?: Function, hold?: Function, frontEnd?: string, xhrs?: object[]}} script
+ * @param {{fetch?: Function, hold?: Function, frontEnd?: string, xhrs?: object[], fetches?: object[]}} script
  * @param {{emit?: Function}} [page] hears 'response' for every answer
  */
 function pageGlobals(script, page = null) {
     return {
         XMLHttpRequest: xmlHttpRequest(script, page),
+        fetch: pageFetch(script, page),
         TextEncoder,
         URL,
         location: { href: `${CHAT}/` },
@@ -243,4 +248,53 @@ function xmlHttpRequest(script, page) {
     }
 }
 
-module.exports = { pageGlobals, xmlHttpRequest, pageDocument }
+/**
+ * The stand-in for the browser's fetch: for the call the page makes as its
+ * own front end makes it (pageCall given a channel — a stream,
+ * Qwen2API-3ue.9). The scripted fetch answers it as it answers an
+ * XMLHttpRequest; what is recorded of it is what it was asked. Its init is
+ * not touched: it goes to "qwen.ai" as the call made it, its signal included.
+ */
+function pageFetch(script, page) {
+    return async function fetch(url, init) {
+        const request = {
+            sent: { url, init },
+            held: false,
+            letGo: null,
+            // A fetch is aborted by its signal, and the call's signal is the one it was given.
+            get aborted() { return Boolean(init.signal && init.signal.aborted) },
+            /** The hooks let go of the answer they held: the call gets it now. */
+            release() { this.letGo?.() }
+        }
+        ;(script.fetches ||= []).push(request)
+        const response = await script.fetch(url, init)
+        const rawHeaders = [...(response.headers instanceof Headers ? response.headers.entries() : Object.entries(response.headers || {}))]
+            .map(([name, value]) => [name.toLowerCase(), value])
+        // qwen.ai's head: told to the page's network. Taken before the body is
+        // read, and answered to whoever asks and however often: as Playwright's
+        // response.text() is.
+        const copy = typeof response.clone === 'function' ? response.clone() : null
+        let text = null
+        const read = () => (text ||= copy ? copy.text().catch(() => '') : Promise.resolve(''))
+        page?.emit('response', {
+            status: () => response.status,
+            // A Response made by hand has no address of its own: it answered the one it was sent to.
+            url: () => response.url || request.sent.url,
+            headers: () => Object.fromEntries(rawHeaders),
+            request: () => ({ method: () => init.method, headers: () => ({ ...init.headers }) }),
+            text: read
+        })
+        // An answer the page's hooks take for a block is never handed to the
+        // call — until `release()`, as when they let go of it. The hooks can
+        // keep only what they have seen, and a page is the only thing they are
+        // known to keep: only a text/html answer is read for `hold`. Any other
+        // is the call's at once, while its body still arrives.
+        if (!/text\/html/i.test(Object.fromEntries(rawHeaders)['content-type'] || '')) return response
+        if (!(script.hold && script.hold(await read()))) return response
+        request.held = true
+        await new Promise(resolve => { request.letGo = resolve })
+        return response
+    }
+}
+
+module.exports = { pageGlobals, pageFetch, xmlHttpRequest, pageDocument }

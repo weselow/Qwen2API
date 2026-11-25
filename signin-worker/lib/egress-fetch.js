@@ -14,6 +14,16 @@
  * challenge page under status 200, and the same call made that way was
  * answered with JSON. Which single header matters was not isolated; the call
  * carries all of them.
+ *
+ * Since Qwen2API-3ue.9 (2026-11-25) that is the whole-answer call alone
+ * (chats/new), which stays an XMLHttpRequest because it passes. The streaming
+ * one (completions) is a fetch again, made as the page's own front end makes
+ * its: on prod qwen.ai's risk control refused the call as an XMLHttpRequest —
+ * status 200 with the punish envelope FAIL_SYS_USER_VALIDATE / RGV587_ERROR,
+ * or an HTML challenge page — where a fetch from the same page passed (HTTP
+ * 200, SSE, the model answered). The body and x-accel-buffering: no did not
+ * rescue the XMLHttpRequest, nor did the Baxia signature; why the server
+ * tells two calls with the same headers apart is not known.
  */
 
 const crypto = require('node:crypto')
@@ -29,10 +39,12 @@ const HEADER_VALUE = /^[\t\x20-\xff]*$/
 
 const invalid = message => new WorkerError('invalid_request', message)
 
-// What the page's own requests carry that a caller may leave out. The front
-// end's client sends its XHRs with axios's defaults and `source: web`. The
-// same values are written out in pageCall: that function reaches the page as
-// source text and can read nothing from this module.
+// What the page's own requests carry that a caller may leave out on a
+// whole-answer call. The front end's client sends its XHRs with axios's
+// defaults and `source: web`. The same values are written out in pageCall:
+// that function reaches the page as source text and can read nothing from
+// this module. (A stream's defaults are the page's own completions call's,
+// written out where the stream is made.)
 const PAGE_HEADERS = { accept: 'application/json, text/plain, */*', source: 'web' }
 
 /**
@@ -51,17 +63,35 @@ function readFrontEndVersion() {
  *
  * One function for both kinds of call: given `channel`, the answer is relayed
  * while it arrives (the streaming /egress, Qwen2API-3ue.3); without one, it is
- * returned once it is whole.
+ * returned once it is whole. They differ in how the request is made, and not
+ * in what it carries — which is why they are one function.
  *
  * How the request is made:
  *
- * - An XMLHttpRequest, subscribed with addEventListener. The page's request
- *   hooks (baxiaCommon.js 2.5.37) keep a script from seeing an answer they
- *   take for a block by never calling its onload, onloadend and
+ * - A whole answer: an XMLHttpRequest, subscribed with addEventListener. The
+ *   page's request hooks (baxiaCommon.js 2.5.37) keep a script from seeing an
+ *   answer they take for a block by never calling its onload, onloadend and
  *   onreadystatechange PROPERTIES; a listener added with addEventListener is
  *   called all the same. So a challenge page reaches the worker as an answer,
  *   instead of leaving the call hanging (Qwen2API-3ue.6). readyState is never
  *   read for the same reason: its getter is one of the hooks'.
+ * - A stream: a fetch, the way the page's own front end makes its completions
+ *   call (Qwen2API-3ue.9, 2026-11-25). Observed on prod, from one headless
+ *   page of one account, one call at a time: the page's own call (a fetch)
+ *   passed, and so did ours as a fetch with its headers; ours as an
+ *   XMLHttpRequest was refused — an HTML challenge page — with the worker's
+ *   simplified body or with the page's own body and x-accel-buffering: no,
+ *   with the Baxia signature or without it. The app's request was refused
+ *   with status 200 and the punish envelope FAIL_SYS_USER_VALIDATE /
+ *   RGV587_ERROR. Why the server tells a fetch from an XMLHttpRequest is not
+ *   known; a fetch passes, an XMLHttpRequest is refused. So the stream
+ *   carries what the passing call carried, in its order. The whole-answer
+ *   call stays an XMLHttpRequest: it passes, and is not touched.
+ *   A fetch has no events to listen to: the page's hooks are known to keep
+ *   its promise pending on a challenge page, and to ignore an abort through
+ *   their wrapper (2026-11-24). The call is ended from its own signal
+ *   whatever the fetch does, and an answer kept from it is the worker's to
+ *   read off the page's network (resident-pages.js#watchAnswer).
  * - With the page's headers. Three of them are the page's to say, so they are
  *   read here and not passed in: the front end's version (off the address its
  *   scripts load from), the time zone (off the page's own clock), and the
@@ -88,9 +118,7 @@ function readFrontEndVersion() {
  */
 async function pageCall({ url, init, timeoutMs, maxBytes, channel, registry, id, reasons }) {
     const streaming = Boolean(channel)
-    const xhr = new XMLHttpRequest()
     const target = new URL(url, location.href)
-    const encoder = new TextEncoder()
     const controller = new AbortController()
     const aborts = streaming ? (globalThis[registry] || (globalThis[registry] = {})) : null
     if (aborts) aborts[id] = controller
@@ -115,134 +143,12 @@ async function pageCall({ url, init, timeoutMs, maxBytes, channel, registry, id,
         clearTimeout(timer)
         if (!ended) timer = setTimeout(() => controller.abort(reasons.timeout), timeoutMs)
     }
-    controller.signal.addEventListener('abort', () => {
-        // Said before the request is aborted: abort() before send() fires no
-        // event at all, and the one it fires later does not know why.
-        end({ ok: false, error: controller.signal.reason === reasons.timeout ? 'timeout' : 'aborted' })
-        xhr.abort()
-    }, { once: true })
 
-    // Streaming: reports go out one at a time, each once the one before was
-    // taken — a report is the page waiting for the worker to write it out.
-    const aborted = new Promise(resolve => {
-        controller.signal.addEventListener('abort', () => resolve(), { once: true })
-    })
-    const report = event => Promise.race([emit(id, event), aborted])
-    let queue = Promise.resolve()
-    // Bytes travel as base64 — the channel carries strings, and a chunk may
-    // cut a multi-byte character in half.
-    const toBase64 = bytes => {
-        let binary = ''
-        for (let at = 0; at < bytes.length; at += 0x8000) {
-            binary += String.fromCharCode(...bytes.subarray(at, at + 0x8000))
-        }
-        return btoa(binary)
-    }
-    const tell = async event => {
-        clearTimeout(timer)
-        await report(event)
-        arm()
-    }
-    const answer = () => {
-        const headers = {}
-        xhr.getAllResponseHeaders().trim().split(/\r?\n/).filter(Boolean).forEach(line => {
-            const at = line.indexOf(':')
-            headers[line.slice(0, at).toLowerCase()] = line.slice(at + 1).trim()
-        })
-        // The page's hooks may add to the address; a move to another page is what a redirect is.
-        const responseUrl = new URL(xhr.responseURL || target.href)
-        const redirected = responseUrl.origin !== target.origin || responseUrl.pathname !== target.pathname
-        return { status: xhr.status, url: responseUrl.href, redirected, headers }
-    }
-
-    let delivered = 0
-    let size = 0
-    let last = new Uint8Array(0)
-    let headSent = false
-    let html = false
-    // What arrived since the last look. False once the answer is over the cap.
-    const take = () => {
-        let text
-        try {
-            text = xhr.responseText
-        } catch {
-            // A page hook's getter: nothing is known to have arrived. What was
-            // told so far stands — a blank read must not tell it all again.
-            last = new Uint8Array(0)
-            return true
-        }
-        last = encoder.encode(text.slice(delivered))
-        delivered = text.length
-        size += last.byteLength
-        return !maxBytes || size <= maxBytes
-    }
-    const cutOff = () => {
-        end({ ok: false, error: 'too_large', status: xhr.status })
-        xhr.abort()
-    }
-    // One more report, after those already queued.
-    const relay = event => { queue = queue.then(() => ended ? undefined : tell(event)) }
-    const relayChunk = bytes => relay({ type: 'chunk', data: toBase64(bytes) })
-    const onHead = () => {
-        headSent = true
-        const head = answer()
-        html = /text\/html/i.test(head.headers['content-type'] || '')
-        if (!html) relay({ type: 'head', ...head })
-    }
-    const onProgress = async () => {
-        if (ended) return
-        // However the events are ordered, the head is told before any of the body.
-        if (streaming && !headSent) onHead()
-        if (!take()) return cutOff()
-        // The browser announces the end of a body with a progress event of its own, carrying nothing.
-        if (streaming && !html && last.byteLength) relayChunk(last)
-        await queue
-    }
-    const onLoad = async () => {
-        if (ended) return
-        if (!streaming) {
-            if (!take()) return cutOff()
-            return end({ ok: true, ...answer(), body: xhr.responseText })
-        }
-        // From the browser's cache no state change may have been reported.
-        if (!headSent) onHead()
-        if (!take()) return cutOff()
-        if (html) {
-            relay({ type: 'head', ...answer() })
-            relayChunk(encoder.encode(xhr.responseText))
-        } else if (last.byteLength) {
-            relayChunk(last)
-        }
-        await queue
-        end({ ok: true })
-    }
-    // A listener that throws must not leave the call hanging: the backstop is
-    // 35 s away, and nothing would say why. The page's doing, not qwen.ai's.
-    const guarded = listener => async () => {
-        try {
-            await listener()
-        } catch (error) {
-            end({ ok: false, error: 'report_failed', message: String((error && error.message) || error) })
-        }
-    }
-    if (streaming) {
-        xhr.addEventListener('readystatechange', () => {
-            // status is set once the head is in. (Not readyState: see above.)
-            if (!ended && !headSent && xhr.status !== 0) guarded(onHead)()
-        })
-        xhr.addEventListener('progress', guarded(onProgress))
-    } else {
-        xhr.addEventListener('progress', guarded(onProgress))
-    }
-    xhr.addEventListener('load', guarded(onLoad))
-    xhr.addEventListener('error', () => end({ ok: false, error: 'network_error', message: 'network error' }))
-    // The call's own aborts end the call before the request is aborted, so
-    // this event means a script of the page's cut the request: not the app
-    // going away, and a failure the worker names (page_fault).
-    xhr.addEventListener('abort', () => end({ ok: false, error: 'aborted_in_page' }))
-
-    try {
-        const headers = { accept: 'application/json, text/plain, */*', source: 'web', ...init.headers }
+    // What the call carries: `defaults` where the caller brought nothing, a
+    // header the caller brought as given, and then what the page is the
+    // authority on, read here rather than passed in.
+    const carry = defaults => {
+        const headers = { ...defaults, ...init.headers }
         // Chrome's own form for a language ('en-US,en;q=0.9'): what the page's
         // requests carry, where the browser would send only the language.
         if (!('accept-language' in headers)) {
@@ -274,6 +180,204 @@ async function pageCall({ url, init, timeoutMs, maxBytes, channel, registry, id,
             } catch { /* the page keeps none: the call goes without, as it asked */ }
             if (token) headers.authorization = `Bearer ${token}`
         }
+        return headers
+    }
+
+    if (streaming) {
+        // Said from the signal, not from what the fetch does next. The page's
+        // request hooks are known to keep a fetch pending on a challenge page,
+        // and to ignore an abort through their wrapper (2026-11-24): the call
+        // is over all the same, and nothing of it waits on the fetch. An
+        // answer kept that way is the worker's to see, off the page's network
+        // (resident-pages.js#watchAnswer); what is still unanswered after
+        // that, its backstop ends.
+        controller.signal.addEventListener('abort', () => {
+            end({ ok: false, error: controller.signal.reason === reasons.timeout ? 'timeout' : 'aborted' })
+        }, { once: true })
+
+        // Streaming: reports go out one at a time, each once the one before was
+        // taken — a report is the page waiting for the worker to write it out.
+        const aborted = new Promise(resolve => {
+            controller.signal.addEventListener('abort', () => resolve(), { once: true })
+        })
+        const report = event => Promise.race([emit(id, event), aborted])
+        // Bytes travel as base64 — the channel carries strings, and a chunk may
+        // cut a multi-byte character in half.
+        const toBase64 = bytes => {
+            let binary = ''
+            for (let at = 0; at < bytes.length; at += 0x8000) {
+                binary += String.fromCharCode(...bytes.subarray(at, at + 0x8000))
+            }
+            return btoa(binary)
+        }
+        const tell = async event => {
+            clearTimeout(timer)
+            await report(event)
+            arm()
+        }
+        // One report. False once the call is over — by an abort, or by a
+        // report that could not be made: a listener that throws must not
+        // leave the call hanging, and nothing would say why. The page's
+        // doing, not qwen.ai's.
+        const told = async event => {
+            try {
+                await tell(event)
+            } catch (error) {
+                end({ ok: false, error: 'report_failed', message: String((error && error.message) || error) })
+                controller.abort()
+            }
+            return !ended
+        }
+
+        // On its own, and not awaited: the call is `theEnd`, and end() is
+        // what says it. Every wait below is followed by a look at `ended` —
+        // a fetch a hook kept pending settles when it pleases, and by then
+        // nothing of its answer is the call's.
+        void (async () => {
+            try {
+                // What the passing call carried (prod, 2026-11-25), in the
+                // order it sent them in. What the caller brought that is not
+                // among them goes after, as it brought it.
+                const carried = carry({ accept: 'application/json', 'x-accel-buffering': 'no', 'bx-v': '2.5.36', source: 'web' })
+                const sent = {}
+                for (const name of ['accept', 'accept-language', 'content-type', 'authorization', 'source', 'timezone', 'version',
+                    'x-accel-buffering', 'bx-v', 'x-request-id']) {
+                    if (name in carried) sent[name] = carried[name]
+                }
+                Object.assign(sent, carried)
+                arm()
+                const response = await fetch(target.href, {
+                    method: init.method, headers: sent, body: init.body, credentials: 'include', signal: controller.signal
+                })
+                if (ended) return
+                // The page's hooks may add to the address; a move to another page is what a redirect is.
+                const responseUrl = new URL(response.url || target.href)
+                const headers = {}
+                response.headers.forEach((value, name) => { headers[name] = value })
+                const head = {
+                    type: 'head', status: response.status, url: responseUrl.href,
+                    redirected: responseUrl.origin !== target.origin || responseUrl.pathname !== target.pathname,
+                    headers
+                }
+                // A page, not data: whole, once it is in — the head, then the page as one piece.
+                const page = /text\/html/i.test(headers['content-type'] || '')
+                // The head goes out before a byte of the body is read.
+                if (!page && !(await told(head))) return
+                const reader = response.body ? response.body.getReader() : null
+                let size = 0
+                const whole = []
+                if (reader) {
+                    for (;;) {
+                        const { done, value } = await reader.read()
+                        if (ended) return
+                        if (done) break
+                        size += value.byteLength
+                        if (maxBytes && size > maxBytes) {
+                            // Cut as it arrives, not after it: the request is aborted.
+                            end({ ok: false, error: 'too_large', status: response.status })
+                            return controller.abort()
+                        }
+                        if (page) {
+                            whole.push(value)
+                            arm()
+                        } else if (!(await told({ type: 'chunk', data: toBase64(value) }))) {
+                            return
+                        }
+                    }
+                }
+                if (page) {
+                    const bytes = new Uint8Array(size)
+                    let at = 0
+                    for (const piece of whole) {
+                        bytes.set(piece, at)
+                        at += piece.byteLength
+                    }
+                    if (!(await told(head))) return
+                    if (!(await told({ type: 'chunk', data: toBase64(bytes) }))) return
+                }
+                end({ ok: true })
+            } catch (error) {
+                if (ended) return
+                // Stopped as an abort, and not by the call's own signal: a
+                // script of the page cut the request. That is the page's doing, not the app going away — what the 'abort' event of an XMLHttpRequest says below.
+                if (error && error.name === 'AbortError') return end({ ok: false, error: 'aborted_in_page' })
+                // The browser's own failure: a dead connection, a blocked request.
+                end({ ok: false, error: 'network_error', message: String((error && error.message) || error) })
+            }
+        })()
+        return theEnd
+    }
+
+    const xhr = new XMLHttpRequest()
+    const encoder = new TextEncoder()
+    controller.signal.addEventListener('abort', () => {
+        // Said before the request is aborted: abort() before send() fires no
+        // event at all, and the one it fires later does not know why.
+        end({ ok: false, error: controller.signal.reason === reasons.timeout ? 'timeout' : 'aborted' })
+        xhr.abort()
+    }, { once: true })
+
+    const answer = () => {
+        const headers = {}
+        xhr.getAllResponseHeaders().trim().split(/\r?\n/).filter(Boolean).forEach(line => {
+            const at = line.indexOf(':')
+            headers[line.slice(0, at).toLowerCase()] = line.slice(at + 1).trim()
+        })
+        // The page's hooks may add to the address; a move to another page is what a redirect is.
+        const responseUrl = new URL(xhr.responseURL || target.href)
+        const redirected = responseUrl.origin !== target.origin || responseUrl.pathname !== target.pathname
+        return { status: xhr.status, url: responseUrl.href, redirected, headers }
+    }
+
+    let delivered = 0
+    let size = 0
+    // What arrived since the last look. False once the answer is over the cap.
+    const take = () => {
+        let text
+        try {
+            text = xhr.responseText
+        } catch {
+            // A page hook's getter: nothing is known to have arrived. What was
+            // counted so far stands — a blank read must not count it all again.
+            return true
+        }
+        const fresh = encoder.encode(text.slice(delivered))
+        delivered = text.length
+        size += fresh.byteLength
+        return !maxBytes || size <= maxBytes
+    }
+    const cutOff = () => {
+        end({ ok: false, error: 'too_large', status: xhr.status })
+        xhr.abort()
+    }
+    const onProgress = async () => {
+        if (ended) return
+        if (!take()) return cutOff()
+    }
+    const onLoad = async () => {
+        if (ended) return
+        if (!take()) return cutOff()
+        end({ ok: true, ...answer(), body: xhr.responseText })
+    }
+    // A listener that throws must not leave the call hanging: the backstop is
+    // 35 s away, and nothing would say why. The page's doing, not qwen.ai's.
+    const guarded = listener => async () => {
+        try {
+            await listener()
+        } catch (error) {
+            end({ ok: false, error: 'report_failed', message: String((error && error.message) || error) })
+        }
+    }
+    xhr.addEventListener('progress', guarded(onProgress))
+    xhr.addEventListener('load', guarded(onLoad))
+    xhr.addEventListener('error', () => end({ ok: false, error: 'network_error', message: 'network error' }))
+    // The call's own aborts end the call before the request is aborted, so
+    // this event means a script of the page's cut the request: not the app
+    // going away, and a failure the worker names (page_fault).
+    xhr.addEventListener('abort', () => end({ ok: false, error: 'aborted_in_page' }))
+
+    try {
+        const headers = carry({ accept: 'application/json, text/plain, */*', source: 'web' })
         // open() first: the page's hooks decide here whether this address is one they sign.
         xhr.open(init.method, target.href, true)
         for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value)
@@ -289,8 +393,9 @@ async function pageCall({ url, init, timeoutMs, maxBytes, channel, registry, id,
 // What a stream's request was aborted for, as the page reports it back. The
 // page aborts with the timeout reason itself; anything else aborted it from
 // outside, which only the app going away does (resident-pages.js#abort). A
-// request a script of the page cuts is not the call's abort at all: that is
-// the request's own 'abort' event, and ends the call as `aborted_in_page`.
+// request a script of the page cuts is not the call's abort at all: an
+// XMLHttpRequest says so with its own 'abort' event, a fetch by stopping as
+// an abort that is not the call's. Either ends the call as `aborted_in_page`.
 const ABORT_REASON = { timeout: 'timeout', cancelled: 'cancelled' }
 
 // Names the worker and the page know each other by. Both live on the page's

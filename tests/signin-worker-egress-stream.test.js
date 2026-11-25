@@ -11,11 +11,14 @@ const { createResidents } = require('../signin-worker/lib/resident-pages')
 const {
     pageCall, pageAbortStream, STREAM_CHANNEL, STREAM_ABORTS, ABORT_REASON
 } = require('../signin-worker/lib/egress-fetch')
-const { pageGlobals, xmlHttpRequest, pageDocument } = require('./helpers/fake-xml-http-request')
+const { pageGlobals, pageFetch, xmlHttpRequest, pageDocument } = require('./helpers/fake-xml-http-request')
 
 // The streaming /egress (Qwen2API-3ue.3): qwen.ai's answer relayed to the app
 // as it arrives, and the app's going away aborting the fetch inside the page.
-// The whole-answer call is signin-worker-egress.test.js's subject.
+// Since Qwen2API-3ue.9 that fetch is what the call is: the page makes it as
+// its own front end makes its completions call. (Before, it was an
+// XMLHttpRequest, which qwen.ai refused.) The whole-answer call is
+// signin-worker-egress.test.js's subject, and is an XMLHttpRequest still.
 
 const CHAT = 'https://chat.qwen.ai'
 const COMPLETIONS = `${CHAT}/api/v2/chat/completions?chat_id=c1`
@@ -58,9 +61,10 @@ const jsonResponse = (payload, status = 200) =>
 // every evaluate of a page runs in ONE JavaScript realm — what one call
 // leaves on globalThis the next one sees, as on a real page — the page
 // carries the binding exposeFunction gave it, a renewal throws the page's
-// running scripts out the way a navigation does, and its XMLHttpRequest
-// answers from a scripted fetch (helpers/fake-xml-http-request.js), telling
-// the page's network of every answer. No Chromium anywhere near CI:
+// running scripts out the way a navigation does, and its fetch and its
+// XMLHttpRequest both answer from a scripted fetch
+// (helpers/fake-xml-http-request.js), each telling the page's network of
+// every answer. No Chromium anywhere near CI:
 // tools/worker-egress-local-smoke.js runs this same worker on a real one.
 function fakeBrowser() {
   const script = { fetch: () => jsonResponse({ success: true }), cookies: [], renew: null, evaluate: null, closeDelay: 0 }
@@ -93,7 +97,7 @@ function fakeBrowser() {
       for (const [name, value] of Object.entries({ AbortController, setTimeout, clearTimeout, Blob, btoa, TextEncoder, URL })) {
         define(name, () => value)
       }
-      define('fetch', () => script.fetch)
+      define('fetch', () => pageFetch(script, page))
       // What a page gives its requests (Qwen2API-3ue.5).
       define('XMLHttpRequest', () => xmlHttpRequest(script, page))
       define('document', () => pageDocument(script))
@@ -300,7 +304,7 @@ function manualClock() {
 // same way, in a bare realm, to reach what the HTTP tests cannot stage. The
 // guard turns a stream that never settles (a broken abort) into a failure
 // here instead of a hung test runner. `script` is what the page's requests
-// answer from (its fetch, the channel, a clock), and its `xhrs` are the
+// answer from (its fetch, the channel, a clock), and its `fetches` are the
 // requests the run made.
 const pageRealm = script => vm.createContext({ AbortController, setTimeout, clearTimeout, btoa, ...script, ...pageGlobals(script) })
 const runIn = (realm, fn) => vm.runInContext(`(${fn.toString()})`, realm)
@@ -315,6 +319,16 @@ const inPage = async (script, arg) => {
   } finally {
     clearTimeout(timer)
   }
+}
+// The same, on a page of the test's own — for a call the test has to reach
+// into while it runs, to abort it from Node's side or to turn the page's
+// clock, or before the request is out.
+const running = (page, arg) => {
+  let timer
+  const guard = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error('the in-page stream never settled')), 2000)
+  })
+  return plain(Promise.race([runIn(page, pageCall)(arg), guard])).finally(() => clearTimeout(timer))
 }
 const PAGE = (extra = {}) => ({
   url: COMPLETIONS, init: { method: 'POST', headers: {} }, timeoutMs: 1000, maxBytes: 1024,
@@ -499,20 +513,141 @@ test('the in-page stream maps its own failures: no body, a dead network, an over
   assert.deepEqual(await inPage({
     [STREAM_CHANNEL]: channel().call, fetch: async () => ({ status: 204, headers: new Headers(), body: null })
   }, PAGE()), { ok: true })
-  // The browser's own failure: a dead connection, a blocked request.
+  // The browser's own failure: a dead connection, a blocked request. What a
+  // fetch says of it, as it says it.
   assert.deepEqual(await inPage({
     [STREAM_CHANNEL]: channel().call, fetch: async () => { throw new TypeError('Failed to fetch') }
-  }, PAGE()), { ok: false, error: 'network_error', message: 'network error' })
+  }, PAGE()), { ok: false, error: 'network_error', message: 'Failed to fetch' })
   // Oversize is cut as it arrives, not after it: the request is aborted.
   const oversize = {
     [STREAM_CHANNEL]: channel().call, fetch: async (url, init) => answering(init, ['x'.repeat(600), 'x'.repeat(600)])
   }
   assert.deepEqual(await inPage(oversize, PAGE({ maxBytes: 512 })), { ok: false, error: 'too_large', status: 200 })
-  assert.equal(oversize.xhrs[0].aborted, true)
+  assert.equal(oversize.fetches[0].aborted, true)
   // No cap asked, none applied: a stream is not the worker's to cap by default.
   assert.deepEqual(await inPage({
     [STREAM_CHANNEL]: channel().call, fetch: async (url, init) => answering(init, ['x'.repeat(600), 'x'.repeat(600)])
   }, PAGE({ maxBytes: 0 })), { ok: true })
+})
+
+// Qwen2API-3ue.9: on prod (2026-11-25) qwen.ai's risk control refused the
+// call as an XMLHttpRequest, and passed it as a fetch (pageCall).
+
+test('Qwen2API-3ue.9: a stream is a fetch — no XMLHttpRequest is made for it — that the call never waits on; a whole answer is an XMLHttpRequest still', async () => {
+  const stream = {
+    [STREAM_CHANNEL]: channel().call, fetch: async (url, init) => answering(init, ['data: x\n\n'])
+  }
+  assert.deepEqual(await inPage(stream, PAGE()), { ok: true })
+  assert.equal(stream.fetches?.length, 1, 'the stream did not go out as a fetch')
+  assert.equal(stream.xhrs, undefined, 'an XMLHttpRequest was made for the stream')
+
+  // A fetch is one promise, and the page's hooks are known to keep it pending
+  // on a challenge page and to ignore an abort through their wrapper
+  // (2026-11-24). The call is not that promise: its own signal says it, and it
+  // waits for nothing — not for the fetch, nor for the request to be out.
+  const kept = { [STREAM_CHANNEL]: channel().call, fetch: () => new Promise(() => {}) }
+  // The app going away while the fetch is out, and kept.
+  const page = pageRealm(kept)
+  const cancelled = running(page, PAGE({ timeoutMs: 1000 }))
+  assert.equal(kept.fetches.length, 1, 'the fetch was not made')
+  assert.equal(runIn(page, pageAbortStream)({ registry: STREAM_ABORTS, id: 7, reason: ABORT_REASON.cancelled }), true)
+  assert.deepEqual(await cancelled, { ok: false, error: 'aborted' })
+  // The app gone before the request is out at all: a hook of the page's is still holding on to it.
+  let heldPage
+  const held = {
+    [STREAM_CHANNEL]: channel().call,
+    fetch: () => {
+      runIn(heldPage, pageAbortStream)({ registry: STREAM_ABORTS, id: 7, reason: ABORT_REASON.cancelled })
+      return new Promise(() => {})
+    }
+  }
+  heldPage = pageRealm(held)
+  assert.deepEqual(await running(heldPage, PAGE({ timeoutMs: 1000 })), { ok: false, error: 'aborted' })
+  // And qwen.ai's silence: the page's own timer cuts it, and says so.
+  const clock = manualClock()
+  const silent = {
+    [STREAM_CHANNEL]: channel().call, fetch: () => new Promise(() => {}),
+    setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout
+  }
+  const quiet = running(pageRealm(silent), PAGE({ timeoutMs: 100 }))
+  await clock.advance(99)
+  assert.equal(silent.fetches[0].aborted, false)
+  await clock.advance(2)
+  assert.deepEqual(await quiet, { ok: false, error: 'timeout' })
+
+  // The whole-answer call (chats/new) is what it was: an XMLHttpRequest, which
+  // passes, and no fetch.
+  const whole = { fetch: async () => jsonResponse({ success: true }) }
+  assert.deepEqual(await inPage(whole, {
+    url: `${CHAT}/api/v2/chats/new`, init: { method: 'POST', headers: {} }, timeoutMs: 1000, maxBytes: 1024, reasons: ABORT_REASON
+  }), { ok: true, status: 200, url: `${CHAT}/api/v2/chats/new`, redirected: false, headers: { 'content-type': 'application/json' }, body: '{"success":true}' })
+  assert.equal(whole.xhrs.length, 1, 'the whole-answer call is not an XMLHttpRequest')
+  assert.equal(whole.fetches, undefined, 'the whole-answer call went out as a fetch')
+})
+
+test('Qwen2API-3ue.9: a stream’s fetch carries what the page’s own completions call carried — the same headers, in the same order, on the page’s session', async () => {
+  // What the passing call sent, by name and in order (prod, 2026-11-25).
+  const carried = ['accept', 'accept-language', 'content-type', 'authorization', 'source', 'timezone', 'version',
+    'x-accel-buffering', 'bx-v', 'x-request-id']
+  // What one call left the page with, as plain data (it comes from the page's
+  // realm). `headers` is what the caller brought: the app's is content-type,
+  // x-request-id and accept: application/json, and no authorization
+  // (Qwen2API-jr9).
+  const sentBy = async (script, headers) => {
+    const page = {
+      frontEnd: '0.3.50', pageToken: 'page-session', [STREAM_CHANNEL]: channel().call, ...script,
+      fetch: async (url, init) => answering(init, ['data: x\n\n'])
+    }
+    await inPage(page, PAGE({ init: { method: 'POST', headers, body: '{"stream":true}' } }))
+    const sent = page.fetches?.[0]?.sent
+    assert.ok(sent, 'the stream did not go out as a fetch')
+    return plain(sent)
+  }
+  const app = { 'content-type': 'application/json', 'x-request-id': 'app-request-1', accept: 'application/json' }
+
+  const { url, init } = await sentBy({}, app)
+  assert.equal(url, COMPLETIONS)
+  assert.equal(init.method, 'POST')
+  assert.equal(init.body, '{"stream":true}')
+  // The browser's own cookies ride along, and the referer is not set: the
+  // page's own goes out.
+  assert.equal(init.credentials, 'include')
+  assert.equal('referrer' in init, false)
+  assert.equal('referrerPolicy' in init, false)
+  assert.deepEqual(Object.keys(init.headers), carried)
+  // The page's clock, in the front end's format. (Not the very second: the
+  // call and this check may straddle one.)
+  assert.match(init.headers.timezone, /^\S{3} \S{3} \d\d \d{4} \d\d:\d\d:\d\d GMT[+-]\d{4}$/)
+  assert.deepEqual(init.headers, {
+    accept: 'application/json',
+    'accept-language': 'en-US,en;q=0.9',
+    'content-type': 'application/json',
+    // The caller brought no Bearer: the call is one of the page's own, on the
+    // token of its session.
+    authorization: 'Bearer page-session',
+    source: 'web',
+    timezone: init.headers.timezone,
+    // The front end's version, read off the address its scripts load from.
+    version: '0.3.50',
+    'x-accel-buffering': 'no',
+    'bx-v': '2.5.36',
+    'x-request-id': 'app-request-1'
+  })
+  assert.equal((await sentBy({ frontEnd: '0.4.1' }, app)).init.headers.version, '0.4.1')
+
+  // A call that brings a Bearer has it sent as given.
+  assert.equal((await sentBy({}, { ...app, authorization: 'Bearer app-token' })).init.headers.authorization, 'Bearer app-token')
+  // So has any header it brings, in its place among the page's.
+  const own = await sentBy({}, { ...app, accept: 'text/event-stream', 'x-accel-buffering': 'yes' })
+  assert.equal(own.init.headers.accept, 'text/event-stream')
+  assert.equal(own.init.headers['x-accel-buffering'], 'yes')
+  assert.deepEqual(Object.keys(own.init.headers), carried)
+  // What it brings that is not among those goes after them, as it brought it.
+  assert.deepEqual(Object.keys((await sentBy({}, { ...app, 'x-custom': '1' })).init.headers), [...carried, 'x-custom'])
+  // A page without a session sends no Bearer: the rest stands, in order.
+  const signedOut = await sentBy({ pageToken: '' }, app)
+  assert.equal('authorization' in signedOut.init.headers, false, 'a page without a session sends a Bearer')
+  assert.deepEqual(Object.keys(signedOut.init.headers), carried.filter(name => name !== 'authorization'))
 })
 
 /* ------------------------------------------------------------------ over HTTP -- */
@@ -530,16 +665,19 @@ test('a streaming /egress relays the answer as it arrives: the head, every chunk
   assert.equal(opened.response.status, 200)
   assert.match(opened.response.headers.get('content-type'), /application\/x-ndjson/)
   await upstream.opened
-  // What left the page: the app's call, on the browser's own credentials,
-  // with the page's own headers as every request of the page carries them
+  // What left the page: the app's call as a fetch (Qwen2API-3ue.9) — no
+  // XMLHttpRequest was made for it — on the browser's own credentials, with
+  // the page's own headers as its own completions call carries them
   // (Qwen2API-3ue.5).
+  assert.equal(signer.script.fetches.length, 1)
+  assert.equal(signer.script.xhrs, undefined, 'the stream was made as an XMLHttpRequest')
   assert.equal(upstream.url, COMPLETIONS)
   assert.equal(upstream.init.method, 'POST')
   assert.equal(upstream.init.body, '{"stream":true}')
   assert.equal(upstream.init.credentials, 'include')
   assert.equal(upstream.init.headers['content-type'], 'application/json')
   assert.equal(upstream.init.headers.authorization, 'Bearer app-token')
-  assert.equal(upstream.init.headers.accept, 'application/json, text/plain, */*')
+  assert.equal(upstream.init.headers.accept, 'application/json')
   assert.equal(upstream.init.headers['accept-language'], 'en-US,en;q=0.9')
   assert.equal(upstream.init.headers.source, 'web')
   assert.equal(upstream.init.headers.version, '0.3.50')
@@ -576,6 +714,44 @@ test('a streaming /egress relays the answer as it arrives: the head, every chunk
   assert.deepEqual(await health(), {
     ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell'
   })
+})
+
+// Qwen2API-3ue.9: the call is a fetch now; what the app gets of the answer is
+// what it got — and each piece is the bytes qwen.ai delivered.
+test('Qwen2API-3ue.9: a stream’s body reaches the app in pieces while qwen.ai is still answering — each the bytes that arrived — and the end follows the last one', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { relay, health, dataDir } = await start(t, { signer })
+  const email = 'pieces@example.invalid'
+  withProfile(dataDir, email)
+  const upstream = feedable()
+  signer.script.fetch = upstream.fetch
+  const opened = await relay(email)
+  await upstream.opened
+  // A piece that arrives eventually is no proof that it came while the answer
+  // ran: each is waited for here and now.
+  const inTime = (promise, what) => Promise.race([
+    promise,
+    new Promise((resolve, reject) => {
+      setTimeout(() => reject(new Error(`${what} did not arrive while qwen.ai was still answering`)), 2000)
+    })
+  ])
+  assert.equal((await inTime(opened.next(), 'the head')).type, 'head')
+
+  // qwen.ai is generating still. What it has delivered is with the app
+  // already, as the bytes that arrived: a piece may end inside a two-byte
+  // character — nothing decodes the body and encodes it back on the way.
+  const frame = Buffer.from('data: {"choices":[{"delta":{"content":"при"}}]}\n\n')
+  const split = frame.indexOf(Buffer.from('р')) + 1
+  const pieces = [frame.subarray(0, split), frame.subarray(split), Buffer.from('data: [DONE]\n\n')]
+  for (const [at, piece] of pieces.entries()) {
+    upstream.pushBytes(piece)
+    assert.deepEqual(await inTime(opened.next(), `piece ${at + 1}`), { type: 'chunk', data: Buffer.from(piece).toString('base64') })
+  }
+
+  // The body is over: the relay ends right after its last piece, with nothing in between.
+  upstream.finish()
+  assert.deepEqual(kinds(await readAll(opened)), ['end'])
+  assert.equal((await health()).residentPages, 1)
 })
 
 test('the stream flag is validated, and off it is the whole-answer call', async t => {
@@ -666,7 +842,7 @@ test('what goes wrong after qwen.ai answered is the relay’s last event', { tim
   const tooLarge = await readAll(big.opened)
   assert.deepEqual(tooLarge.map(event => [event.type, event.code]), [['head', undefined], ['error', 'egress_too_large']])
   // The request inside the page was cut, not left to run its course.
-  assert.equal(signer.script.xhrs.at(-1).aborted, true)
+  assert.equal(signer.script.fetches.at(-1).aborted, true)
 
   // None of that was the page's doing.
   assert.equal((await health()).residentPages, 1)
@@ -716,8 +892,10 @@ test('the app closing its connection aborts the fetch inside the page, and the p
       upstream.aborted,
       new Promise((resolve, reject) => setTimeout(() => reject(new Error('the request inside the page was not aborted')), 3000))
     ])
-    // The request inside the page was aborted: that is the signal of it.
-    assert.equal(reason?.name, 'AbortError')
+    // The request inside the page was aborted: that is the signal of it, the
+    // fetch's own. It says for what — the worker's word for the app going
+    // away, and not a timeout.
+    assert.equal(reason, ABORT_REASON.cancelled)
     await until(() => lines.some(line => /egress-stream .* cancelled \(/.test(line)), 3000)
     return lines
   })
@@ -1041,7 +1219,7 @@ test('once the worker took a kept answer, what the page says of it is not relaye
     id: 1, onEvent: event => { delivered.push(event.type); return event.type === 'head' ? held : undefined }
   })
   await until(() => delivered.length === 1)
-  const answer = signer.script.xhrs.at(-1)
+  const answer = signer.script.fetches.at(-1)
   assert.ok(answer.held, 'the stand-in held the answer back from the call')
   // The worker cut the call in the page before relaying what it read: nothing
   // of it waits there for the call's own timer.
@@ -1075,9 +1253,12 @@ test('a script of the page cutting the stream’s request is the page’s fault,
   const opened = await relay(email)
   await upstream.opened
   assert.equal((await opened.next()).type, 'head')
-  // Not the app closing its connection: something in the page aborts the request itself.
+  // Not the app closing its connection: something in the page cuts the request
+  // itself. A fetch has no abort() for a script to call: the page's own
+  // AbortController ends it, and the browser ends the body with it — an
+  // AbortError, and not the call's own signal's.
   const { said, events } = await logged(async captured => {
-    signer.script.xhrs.at(-1).abort()
+    upstream.fail(new DOMException('The operation was aborted.', 'AbortError'))
     return { said: captured, events: await readAll(opened) }
   })
   // The relay ends, with the failure said by its name.

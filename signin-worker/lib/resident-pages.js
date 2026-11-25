@@ -30,6 +30,14 @@
  * those hooks leave alone, and the worker watches the page's network for the
  * response (watchAnswer). A challenge is handed on as qwen.ai's answer — the
  * app classifies it — named in the log, and the page is left alone.
+ *
+ * Since Qwen2API-3ue.9 a stream is a fetch, as the page's own front end makes
+ * its completions call (qwen.ai refused it as an XMLHttpRequest); a
+ * whole-answer call is an XMLHttpRequest still. Of the two things above a
+ * fetch has only the second: it is one promise, and the hooks are known to
+ * keep it pending on a challenge page, and to ignore an abort through their
+ * wrapper. So a challenge answered to a stream is read off the page's network,
+ * and the call in the page ends from its own signal, whatever its fetch does.
  */
 
 const fs = require('node:fs')
@@ -460,7 +468,10 @@ function createResidents({
      *
      * A challenge page the page's scripts kept from the call is relayed by
      * the worker itself, from what the page's network saw: whole, the way the
-     * page relays an answer that is a page.
+     * page relays an answer that is a page. A stream is a fetch since
+     * Qwen2API-3ue.9, and a promise kept pending is how those scripts hold a
+     * fetch back: the call is cut below, and ends with that, whatever its
+     * fetch does afterwards.
      *
      * @param {object} entry
      * @param {{url: string, init: object, timeoutMs: number}} request as normalizeEgress returned it

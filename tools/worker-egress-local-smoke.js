@@ -14,6 +14,11 @@
  * (Qwen2API-3ue.5 and .6). That is what hung /egress for 35 s on prod on
  * 2026-11-24; here the worker has to see a challenge page through it, at once.
  *
+ * A completions the stand-in answers as qwen.ai did on 2026-11-25
+ * (Qwen2API-3ue.9): made as an XMLHttpRequest, with a challenge page; made as
+ * a fetch with the page's headers, with SSE. The worker's stream is that
+ * fetch — made the old way, it gets the challenge here.
+ *
  * qwen.ai is never contacted: run this freely, it is not a live probe. Use it
  * after touching the worker's browser paths: signin-worker/server.js (the
  * sign-in path), lib/login-pacer.js, lib/resident-pages.js,
@@ -24,7 +29,7 @@
  *   node tools/worker-egress-local-smoke.js
  */
 
-/* global XMLHttpRequest */
+/* global XMLHttpRequest, window */
 
 const http = require('node:http')
 const fs = require('node:fs')
@@ -60,7 +65,8 @@ const CHALLENGE_PAGE = '<!doctype html> <meta charset="UTF-8"> <meta name="aliyu
  * 2.5.37) behaves where it matters here. Runs in the page.
  * @param {boolean} strict - Also hide a blocked answer from addEventListener,
  *   which the real hook does not do: the second line of the worker's
- *   (Qwen2API-3ue.6) is exercised with it
+ *   (Qwen2API-3ue.6) is exercised with it. And do to a fetch what the real
+ *   hooks are known to do (Qwen2API-3ue.9)
  */
 function pageHook(strict) {
     const proto = XMLHttpRequest.prototype
@@ -73,6 +79,9 @@ function pageHook(strict) {
     proto.send = function () {
         // What the page's hook adds to every request of the page's, this one included.
         this.setRequestHeader('x-stub-v', '2.5.37')
+        // What tells the stand-in this went out as an XMLHttpRequest. How the
+        // real server tells one from a fetch is not known.
+        this.setRequestHeader('x-stub-transport', 'xhr')
         // An answer taken for a block is never told to these.
         for (const name of ['onload', 'onloadend']) {
             const own = this[name]
@@ -81,11 +90,53 @@ function pageHook(strict) {
         }
         return send.apply(this, arguments)
     }
+    // Every fetch is wrapped, to tell the stand-in — `x-stub-fetch-order` —
+    // the order the page's script gave its headers in. The order on the wire
+    // is not the script's to give: it is the browser's, and Chromium 159 does
+    // not keep the script's against this stand-in.
+    const realFetch = window.fetch
+    window.fetch = function (resource, init) {
+        const sent = { ...(init || {}) }
+        sent.headers = { 'x-stub-fetch-order': Object.keys(sent.headers || {}).join(','), ...sent.headers }
+        if (!strict) return realFetch.call(this, resource, sent)
+        // What the real page's hooks are known to do to a fetch (2026-11-24):
+        // an answer they take for a block is never handed to the caller — its
+        // promise stays pending — and an abort through their wrapper changes
+        // nothing: the request is not the caller's signal's. Only a page is
+        // looked into for a block: any other answer is the caller's while its
+        // body still arrives.
+        delete sent.signal
+        return realFetch.call(this, resource, sent).then(response => {
+            if (!/text\/html/i.test(response.headers.get('content-type') || '')) return response
+            return response.clone().text().then(text => (/aliyun_waf_/.test(text) ? new Promise(() => {}) : response))
+        })
+    }
     if (!strict) return
     const add = proto.addEventListener
     proto.addEventListener = function (type, listener, options) {
         return add.call(this, type, function (event) { if (!blocked(this)) listener.call(this, event) }, options)
     }
+}
+
+/**
+ * What the stand-in answers an SSE route with, a frame at a time: with a pause
+ * between, so that a relay has to hand them over as they come, not once they
+ * are all in.
+ */
+function sseFrames(res) {
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    SSE_FRAMES.forEach((frame, at) => setTimeout(() => {
+        if (at === 0) {
+            // Two writes, the first ending inside the "р".
+            const bytes = Buffer.from(frame)
+            const split = bytes.indexOf(Buffer.from('р')) + 1
+            res.write(bytes.subarray(0, split))
+            res.write(bytes.subarray(split))
+            return
+        }
+        res.write(frame)
+    }, 150 * (at + 1)))
+    return setTimeout(() => res.end(), 150 * SSE_FRAMES.length + 50)
 }
 
 /**
@@ -104,6 +155,8 @@ function startStandIn() {
     const frame = { document: null, request: null, page: null }
     // Whether the page loaded next hides blocked answers from listeners too.
     const state = { holdListeners: false }
+    // The last completions the stand-in was asked for: how it went out.
+    const completions = { last: null }
     const other = http.createServer((req, res) => {
         if (req.url === '/frame' && req.method === 'GET') {
             frame.document = req.headers['user-agent'] || null
@@ -192,23 +245,34 @@ function startStandIn() {
                 }))
             })
         }
-        if (req.url === '/api/sse') {
-            // A frame at a time, with a pause between: a relay has to hand
-            // them over as they come, not once they are all in.
-            res.writeHead(200, { 'content-type': 'text/event-stream' })
-            SSE_FRAMES.forEach((frame, at) => setTimeout(() => {
-                if (at === 0) {
-                    // Two writes, the first ending inside the "р".
-                    const bytes = Buffer.from(frame)
-                    const split = bytes.indexOf(Buffer.from('р')) + 1
-                    res.write(bytes.subarray(0, split))
-                    res.write(bytes.subarray(split))
-                    return
+        if (req.url.startsWith('/api/v2/chat/completions')) {
+            // What qwen.ai did with a completions from the page on 2026-11-25
+            // (Qwen2API-3ue.9), as the stand-in's rule for one: made as an
+            // XMLHttpRequest, it is answered with a challenge page; made as a
+            // fetch with the page's headers — x-accel-buffering: no among them
+            // — with SSE. How the real server told the two apart is not known:
+            // the rule stands for "not in the form that passed".
+            let body = ''
+            req.on('data', chunk => { body += chunk })
+            return req.on('end', () => {
+                const byXhr = req.headers['x-stub-transport'] === 'xhr'
+                const asThePage = req.headers['x-accel-buffering'] === 'no'
+                completions.last = {
+                    byXhr, asThePage, body, headers: req.headers,
+                    // What went over the wire, by name, in its order — the
+                    // browser's, not the page's script's.
+                    order: req.rawHeaders.filter((_, at) => at % 2 === 0).map(name => name.toLowerCase()),
+                    // The order the page's script gave the fetch its headers in (the page's hook reports it).
+                    given: String(req.headers['x-stub-fetch-order'] || '').split(',').filter(Boolean)
                 }
-                res.write(frame)
-            }, 150 * (at + 1)))
-            return setTimeout(() => res.end(), 150 * SSE_FRAMES.length + 50)
+                if (byXhr || !asThePage) {
+                    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+                    return res.end(CHALLENGE_PAGE)
+                }
+                return sseFrames(res)
+            })
         }
+        if (req.url === '/api/sse') return sseFrames(res)
         if (req.url === '/api/sse-wide') {
             res.writeHead(200, { 'content-type': 'text/event-stream' })
             const bytes = Buffer.from(WIDE, 'utf8')
@@ -247,9 +311,22 @@ function startStandIn() {
         origin: `http://127.0.0.1:${server.address().port}`,
         pageLoads: () => pageLoads,
         state,
+        completions,
         longStream,
         frame
     }))));
+}
+
+// What the worker logs while `fn` runs — as it runs.
+async function logged(fn) {
+  const lines = []
+  const real = console.log
+  console.log = (...args) => lines.push(args.join(' '))
+  try {
+    return await fn(lines)
+  } finally {
+    console.log = real
+  }
 }
 
 // Poll until the condition holds: a relay's chunks are timed by the stand-in.
@@ -301,9 +378,9 @@ async function main() {
         body: '{"hello":"world"}', timeoutMs: 30000, ...extra
     })
     // A streaming /egress (Qwen2API-3ue.3), read one event at a time.
-    const relay = async extra => {
+    const relay = async (extra, base = worker) => {
         const controller = new AbortController()
-        const response = await fetch(`${worker}/egress`, {
+        const response = await fetch(`${base}/egress`, {
             method: 'POST', signal: controller.signal,
             headers: { 'content-type': 'application/json', authorization: 'Bearer secret' },
             body: JSON.stringify({
@@ -328,6 +405,15 @@ async function main() {
             }
         }
         return { response, next, cancel: () => controller.abort() }
+    }
+    // Everything a relay says up to its end.
+    const drain = async opened => {
+      const events = []
+      for (;;) {
+        const event = await opened.next()
+        if (event.type === 'end' || event.type === 'eof') return events
+        events.push(event)
+      }
     }
 
     try {
@@ -436,22 +522,35 @@ async function main() {
         assert.equal(readOff.challenge, 'network')
         assert.ok(Date.now() - keptAt < 5000, `the kept challenge was read off after ${Date.now() - keptAt} ms`)
         assert.equal((await health()).residentPages, 1, 'a kept challenge closed the page')
-        // Relayed as a stream too: whole, the head and then the page.
-        const keptStream = await relay({ url: '/api/challenged', body: undefined, timeoutMs: 30000 })
-        const keptEvents = []
-        for (;;) {
-            const event = await keptStream.next()
-            if (event.type === 'end' || event.type === 'eof') break
-            keptEvents.push(event)
-        }
-        assert.deepEqual(keptEvents.map(event => event.type), ['head', 'chunk'])
-        assert.equal(Buffer.from(keptEvents[1].data, 'base64').toString('utf8'), CHALLENGE_PAGE)
+        // Relayed as a stream too: whole, the head and then the page. A stream
+        // is a fetch since Qwen2API-3ue.9, and the hook keeps that promise
+        // pending, as the real one is known to: it is the worker's reading of
+        // the page's network that relays the page — in about the grace the
+        // worker gives the page, not after the call's own timer (30 s here)
+        // or the backstop.
+        const keptStream = await logged(async lines => {
+            const since = Date.now()
+            const events = await drain(await relay({ url: '/api/challenged', body: undefined, timeoutMs: 30000 }))
+            return { events, took: Date.now() - since, said: lines }
+        })
+        assert.deepEqual(keptStream.events.map(event => event.type), ['head', 'chunk'])
+        assert.equal(Buffer.from(keptStream.events[1].data, 'base64').toString('utf8'), CHALLENGE_PAGE)
+        assert.ok(keptStream.said.some(line =>
+            /egress-stream \/api\/challenged end \(\d+ ms\) — WAF challenge page, kept from the call by the page$/.test(line)),
+        keptStream.said.join('\n'))
+        assert.ok(keptStream.took < 5000, `the stream waited ${keptStream.took} ms on a fetch the hook keeps pending`)
+        console.log(`ok kept challenge as a stream: relayed by the worker off the page's network (${keptStream.took} ms) while the hook kept the fetch pending`)
+        // That fetch is pending still: the page is none the worse, and its
+        // next stream is its own.
+        const afterKept = await drain(await relay())
+        assert.deepEqual(afterKept.map(event => event.type), ['head', 'chunk', 'chunk', 'chunk'])
+        console.log('ok after a kept challenge: the next stream ran on the page as if nothing was held')
         // ...and the page answers the next call itself, once the answer is an ordinary one.
         assert.equal((await egress({ body: '{"after":true}' })).status, 200)
         assert.equal(JSON.parse((await egress()).body.body).body, '{"hello":"world"}')
         standIn.state.holdListeners = false
         assert.equal((await call('/renew', { email })).status, 200)
-        console.log(`ok kept challenge: read off the page's network (${Date.now() - keptAt} ms), relayed whole as a stream; the page stayed`)
+        console.log(`ok kept challenge: read off the page's network (${Date.now() - keptAt} ms); the page stayed`)
 
         // The in-page abort timer.
         const slow = await egress({ url: '/api/slow', method: 'GET', body: undefined, timeoutMs: 500 })
@@ -471,6 +570,60 @@ async function main() {
         assert.equal(refused.status, 400)
         assert.equal(refused.body.code, 'invalid_request')
         console.log('ok allowlist: an off-origin target is refused')
+
+        // The call this change is for (Qwen2API-3ue.9): a completions, as the
+        // app makes it — content-type, x-request-id and accept: application/json,
+        // and no authorization (Qwen2API-jr9: the Bearer is the page's). qwen.ai
+        // refused it as an XMLHttpRequest (prod, 25.11) and passed it as a fetch
+        // with the page's headers; the stand-in answers likewise. What the app
+        // gets has to be qwen.ai's answer, and not the challenge.
+        const completionsStarted = Date.now()
+        const completions = await relay({
+            url: '/api/v2/chat/completions?chat_id=smoke', body: '{"stream":true}',
+            headers: { 'content-type': 'application/json', accept: 'application/json', 'x-request-id': 'smoke-completions-1' }
+        })
+        assert.equal(completions.response.status, 200, 'the relay must start with an ordinary 200')
+        const completionsHead = await completions.next()
+        assert.equal(completionsHead.type, 'head', JSON.stringify(completionsHead))
+        // The old way, an XMLHttpRequest, is answered with the challenge page:
+        // a head with text/html, then the page as one piece.
+        assert.equal(completionsHead.headers['content-type'], 'text/event-stream', 'the stream was answered with a challenge page')
+        const completionsEvents = await drain(completions)
+        assert.deepEqual(completionsEvents.map(event => event.type), ['chunk', 'chunk', 'chunk'])
+        assert.equal(completionsEvents.map(event => Buffer.from(event.data, 'base64').toString('utf8')).join(''), SSE_FRAMES.join(''))
+        // How it went out: a fetch — not through the page's hook for XHRs,
+        // which marks and signs theirs.
+        const sent = standIn.completions.last
+        assert.equal(sent.byXhr, false, 'the stream went out as an XMLHttpRequest')
+        assert.equal(sent.headers['x-stub-v'], undefined)
+        assert.equal(sent.body, '{"stream":true}')
+        // Of what the call carries, the call gave fetch() the headers of the
+        // call that passed, in its order (prod, 25.11)...
+        const carried = ['accept', 'accept-language', 'content-type', 'authorization', 'source', 'timezone', 'version',
+            'x-accel-buffering', 'bx-v', 'x-request-id']
+        assert.deepEqual(sent.given.filter(name => carried.includes(name)), carried, sent.given.join(', '))
+        // ...and they went over the wire, with what it reads off the page and
+        // what the caller brought of its own.
+        assert.equal(sent.headers.accept, 'application/json')
+        assert.equal(sent.headers['accept-language'], 'en-US,en;q=0.9')
+        assert.equal(sent.headers['content-type'], 'application/json')
+        assert.equal(sent.headers.source, 'web')
+        assert.match(sent.headers.timezone, /^\S{3} \S{3} \d\d \d{4} \d\d:\d\d:\d\d GMT[+-]\d{4}$/)
+        assert.equal(sent.headers.version, '0.3.50')
+        assert.equal(sent.headers['x-accel-buffering'], 'no')
+        assert.equal(sent.headers['bx-v'], '2.5.36')
+        assert.equal(sent.headers['x-request-id'], 'smoke-completions-1')
+        // The Bearer is the page's own token and the profile's jar rides along:
+        // the call brought neither.
+        assert.match(sent.headers.authorization, /^Bearer eyJ/)
+        assert.match(sent.headers.cookie || '', /(^|;\s*)standin=1/)
+        console.log(`ok completions: out of the page as a fetch with the page's headers, in the page's order;` +
+            ` the relay carried qwen.ai's answer (${Date.now() - completionsStarted} ms)`)
+        // The order on the wire is the browser's own, and not the call's: the
+        // call's holds up to fetch(). (The same browser sends the headers of an
+        // XMLHttpRequest in the same order of its own.)
+        console.log(`   on the wire, what the call carries went in the browser's order:` +
+            ` ${sent.order.filter(name => carried.includes(name)).join(', ')}`)
 
         // A streaming answer is relayed one event at a time, as it comes
         // (Qwen2API-3ue.3): the head, then every chunk, then the end with the jar.
@@ -623,15 +776,25 @@ async function main() {
         // An explicit invalidation (Qwen2API-3ue.2) on a worker whose cache is
         // FRESH: a plain /renew answers from the cache, force reloads the page.
         // The smoke's own worker above keeps its cache permanently stale, so
-        // this runs on a second one with the default freshness window.
+        // this runs on a second one with the default freshness window. Its
+        // stream cap is 32 bytes: less than the stand-in's first frame.
         const freshDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwen-worker-smoke-force-'))
-        const fresh = createServer({ dataDir: freshDir, token: 'secret', chatOrigin: standIn.origin, keepAliveMs: 200 })
+        const fresh = createServer({
+            dataDir: freshDir, token: 'secret', chatOrigin: standIn.origin, keepAliveMs: 200, egressMaxStreamBytes: 32
+        })
         await new Promise(resolve => fresh.listen(0, '127.0.0.1', resolve))
         const freshUrl = `http://127.0.0.1:${fresh.address().port}`
         const onFresh = (route, payload) => call(route, payload, freshUrl)
         try {
             fs.mkdirSync(profileDirOf(freshDir))
             assert.equal((await onFresh('/egress', { email, url: '/api/echo', method: 'GET', timeoutMs: 30000 })).status, 200)
+            // The stream cap, in a real browser: a stream is a fetch
+            // (Qwen2API-3ue.9), and it is cut as the cap is passed — inside
+            // the page, before the body is in.
+            const capped = await drain(await relay({ timeoutMs: 5000 }, freshUrl))
+            assert.deepEqual(capped.map(event => [event.type, event.code]), [['head', undefined], ['error', 'egress_too_large']],
+                JSON.stringify(capped))
+            console.log('ok stream size cap: a stream over its cap is cut inside the page')
             const loads = standIn.pageLoads()
             const plain = await onFresh('/renew', { email })
             assert.equal(plain.status, 200, JSON.stringify(plain.body))
