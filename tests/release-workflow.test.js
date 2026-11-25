@@ -1,7 +1,8 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
+const { execFileSync } = require('node:child_process')
 const { createHash } = require('node:crypto')
-const { mkdtempSync, readFileSync, rmSync, writeFileSync } = require('node:fs')
+const { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require('node:fs')
 const { tmpdir } = require('node:os')
 const path = require('node:path')
 const { parse } = require('yaml')
@@ -118,6 +119,111 @@ test('CI and reusable verification cannot publish or consume deployment secrets'
       if (step.uses?.startsWith('actions/checkout@')) assert.equal(step.with['persist-credentials'], false)
     }
   }
+})
+
+
+test('CI ignores docs-only changes and only runs push checks on integration branches', () => {
+  const ci = readWorkflow('ci.yml')
+  const docs = ['**/*.md', 'docs/**']
+  assert.deepEqual(ci.on, {
+    push: { branches: ['main', 'production'], 'paths-ignore': docs },
+    pull_request: { 'paths-ignore': docs }
+  })
+  assert.deepEqual(ci.jobs.verify.with, { 'filter-builds': true })
+})
+
+test('build filtering is opt-in for CI and preserves all Release checks', () => {
+  const release = readWorkflow('release.yml')
+  const verification = readWorkflow('verify.yml')
+  assert.equal(release.jobs.verify.with?.['filter-builds'], undefined)
+  const input = verification.on.workflow_call.inputs['filter-builds']
+  assert.equal(input.type, 'boolean')
+  assert.equal(input.default, false)
+  assert.equal(verification.jobs.regression.if, undefined)
+  assert.equal(verification.jobs.regression.needs, undefined)
+  assert.equal(verification.jobs.changes.if, undefined)
+  assert.equal(verification.jobs.changes.steps[0].if, 'inputs.filter-builds')
+  assert.equal(verification.jobs.changes.steps[0].with['fetch-depth'], 0)
+  assert.equal(verification.jobs.changes.outputs.binaries, '${{ steps.plan.outputs.binaries }}')
+  assert.equal(verification.jobs.frontend.needs, 'changes')
+  assert.equal(verification.jobs.frontend.if, "needs.changes.outputs.binaries == 'true'")
+})
+
+test('build detection uses the event diff and defaults to building if the diff is unavailable', t => {
+  const plan = readWorkflow('verify.yml').jobs.changes.steps.find(step => step.id === 'plan')
+  assert.deepEqual(plan.env, {
+    FILTER_BUILDS: '${{ inputs.filter-builds }}',
+    BASE_SHA: '${{ github.event.pull_request.base.sha || github.event.before }}',
+    HEAD_SHA: '${{ github.event.pull_request.head.sha || github.event.after }}'
+  })
+
+  const cwd = mkdtempSync(path.join(tmpdir(), 'qwen-ci-diff-'))
+  t.after(() => rmSync(cwd, { recursive: true, force: true }))
+  const git = (...args) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
+  const commitFile = (filename, contents) => {
+    const file = path.join(cwd, filename)
+    mkdirSync(path.dirname(file), { recursive: true })
+    writeFileSync(file, contents)
+    git('add', '--', filename)
+    git('commit', '-qm', 'Update fixture')
+    return git('rev-parse', 'HEAD')
+  }
+  git('init', '-q', '--initial-branch=main')
+  git('config', 'user.name', 'CI workflow test')
+  git('config', 'user.email', 'ci@example.com')
+  git('config', 'commit.gpgsign', 'false')
+  const fork = commitFile('src/base.js', 'original')
+  git('branch', 'feature')
+  const main = commitFile('src/base.js', 'updated on main')
+  git('checkout', '-q', 'feature')
+  const testsOnly = commitFile('tests/example.test.js', 'test')
+  const script = path.join(cwd, 'plan.cjs')
+  const output = path.join(cwd, 'output')
+  writeFileSync(script, plan.run)
+
+  const requiresBuilds = (base, head, event = 'push', filter = 'true') => {
+    writeFileSync(output, '')
+    execFileSync(process.execPath, [script], {
+      cwd,
+      stdio: 'pipe',
+      env: {
+        ...process.env,
+        FILTER_BUILDS: filter,
+        GITHUB_EVENT_NAME: event,
+        BASE_SHA: base,
+        HEAD_SHA: head,
+        GITHUB_OUTPUT: output
+      }
+    })
+    const result = readFileSync(output, 'utf8')
+    assert.match(result, /^binaries=(true|false)\n$/)
+    return result === 'binaries=true\n'
+  }
+
+  // The base branch's changes don't count towards the PR's diff.
+  assert.equal(requiresBuilds(main, testsOnly, 'pull_request'), false)
+  assert.equal(requiresBuilds(fork, testsOnly), false)
+  assert.equal(requiresBuilds(fork, testsOnly, 'push', 'false'), true)
+  assert.equal(requiresBuilds(fork, testsOnly, 'workflow_dispatch'), true)
+  assert.equal(requiresBuilds(testsOnly, testsOnly), true)
+  assert.equal(requiresBuilds('0'.repeat(40), testsOnly), true)
+  assert.equal(requiresBuilds('', testsOnly), true)
+
+  for (const file of [
+    'src/another file.js', 'signin-worker/worker.js', 'public/src/page.vue',
+    'public/package.json', 'public/bun.lock', 'docker/Dockerfile', 'tools/build.mjs',
+    'package.json', 'bun.lock', '.dockerignore', '.github/workflows/ci.yml'
+  ]) {
+    const before = git('rev-parse', 'HEAD')
+    const after = commitFile(file, 'build input')
+    assert.equal(requiresBuilds(before, after), true, file)
+  }
+
+  const beforeRename = git('rev-parse', 'HEAD')
+  assert.equal(requiresBuilds(main, beforeRename, 'pull_request'), true)
+  git('mv', 'src/base.js', 'tests/moved.js')
+  git('commit', '-qm', 'Move source out of build inputs')
+  assert.equal(requiresBuilds(beforeRename, git('rev-parse', 'HEAD')), true)
 })
 
 test('native executables and Alpine images are tested before artifact export', () => {
