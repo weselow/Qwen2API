@@ -355,10 +355,11 @@ test('browser mode sends the call through the egress and touches neither axios n
 
     const account = { email: 'who@example.invalid', token: TOKEN }
     const requestConfig = { headers: FE_HEADERS, timeout: 600000 }
-    const response = await transport.postCompletions(URL, PAYLOAD, requestConfig, { account, token: TOKEN })
+    const response = await transport.postCompletions(URL, PAYLOAD, requestConfig, { account })
 
     assert.equal(response, answered)
-    assert.deepEqual(sent, [{ url: URL, body: JSON.stringify(PAYLOAD), account, token: TOKEN, timeoutMs: 600000 }])
+    // The account opens the page; no token travels: the Bearer on the call is the page's own (Qwen2API-jr9).
+    assert.deepEqual(sent, [{ url: URL, body: JSON.stringify(PAYLOAD), account, timeoutMs: 600000 }])
     assert.equal(axiosCalls.length, 0, 'the egress is not a wrapper around axios')
     assert.equal(calls.length, 0)
 })

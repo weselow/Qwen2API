@@ -635,7 +635,8 @@ test('the call listens, as the page’s hooks cannot hold it: no handler propert
   // The page's request hooks hold an answer back from a request by never
   // calling its onload, onloadend and onreadystatechange properties, and sit
   // on the readyState getter. The call must use none of the four — the stand-in
-  // page notes every use.
+  // page notes every use. A stream has none of the four to use: it is a fetch
+  // since Qwen2API-3ue.9, and makes no XMLHttpRequest at all.
   const request = { url: `${CHAT}/api/v2/chats/new`, init: { method: 'POST', headers: {} }, timeoutMs: 1000, maxBytes: 4096, reasons: ABORT_REASON }
   const whole = {
     frontEnd: '0.3.50',
@@ -648,11 +649,11 @@ test('the call listens, as the page’s hooks cannot hold it: no handler propert
     fetch: async (url, init) => new Response('data: x\n\n', { headers: { 'content-type': 'text/event-stream' } })
   }
   assert.deepEqual(await inPage(streamed, { ...request, channel: STREAM_CHANNEL, registry: STREAM_ABORTS, id: 7 }), { ok: true })
-  for (const script of [whole, streamed]) {
-    assert.equal(script.xhrs.length, 1)
-    assert.deepEqual(script.xhrs[0].handlerProperties, undefined, 'a handler property was assigned')
-    assert.equal(script.xhrs[0].readyStateReads, undefined, 'readyState was read')
-  }
+  assert.equal(whole.xhrs.length, 1)
+  assert.deepEqual(whole.xhrs[0].handlerProperties, undefined, 'a handler property was assigned')
+  assert.equal(whole.xhrs[0].readyStateReads, undefined, 'readyState was read')
+  assert.equal(streamed.fetches.length, 1, 'the stream was not a fetch')
+  assert.equal(streamed.xhrs, undefined, 'the stream was made as an XMLHttpRequest')
 })
 
 test('markers quoted in an answer that is no page make no challenge', async t => {

@@ -14,8 +14,9 @@ const { logger } = require('./logger')
  *
  * qwen.ai API calls leave from inside the account's resident page in the
  * signin worker (POST /egress), so qwen.ai sees Chromium's TLS and the
- * profile's own cookies. The worker answers 200 whenever the call left the
- * page; qwen.ai's status and body travel inside.
+ * profile's own cookies — and its own session: the app brings no Bearer, the
+ * worker sends the call on the page's (Qwen2API-jr9). The worker answers 200
+ * whenever the call left the page; qwen.ai's status and body travel inside.
  *
  * chats/new (CHAT_CREATION_TRANSPORT: browser = forced, direct = the axios
  * path, auto = browser when the app runs browser sessions against a
@@ -60,14 +61,20 @@ const enabled = () => usesWorker(config.chatCreationTransport, config)
 // page's own carries besides is the worker's to send, and it sends it with
 // every call (Qwen2API-3ue.5): accept, source, the language, the time zone and
 // the front end's version, read off the page — the direct path's profile has
-// them from the account's fingerprint, which is not what the page says. The
-// Bearer is the session's, so a token the page rotated away from is refused
-// here — and recovered inside this request — instead of failing the generation
-// later on a direct call.
-const egressHeaders = (token, accept) => ({
+// them from the account's fingerprint, which is not what the page says.
+// The Bearer is not among them either (Qwen2API-jr9, 2026-11-25): a call that
+// brings no authorization is one of the page's own, and the worker sends it on
+// the page's localStorage.token. The app used to send its session's token —
+// the one a renewal harvested, which the page, changing its token as it boots,
+// may have moved on from: on 2026-11-24 (prod, image 439c35b) the same
+// chats/new passed on the page's token and was refused as unauthorized on the
+// renewal's. (Why qwen.ai refused that one is not established: a token of that
+// kind passed from Node on 21.11.) On the app's token every rotation was a
+// refused call and a reload; the page is the source of truth for the Bearer,
+// as it is for cookies.
+const egressHeaders = accept => ({
     'content-type': 'application/json',
     'x-request-id': generateUUID(),
-    authorization: `Bearer ${token}`,
     // The one call the page's own code sends with another accept than its XHRs' default.
     ...(accept ? { accept } : {})
 })
@@ -79,12 +86,12 @@ const egressHeaders = (token, accept) => ({
  *   that could not serve the call leaves as a SigninError for the caller to
  *   classify as a transport failure
  */
-async function postChat(context, token) {
+async function postChat(context) {
     const { email, account, url, body } = context
     let answer
     try {
         answer = await signinWorker.egress(email, account, {
-            url, headers: egressHeaders(token), body: JSON.stringify(body), timeoutMs: CHAT_TIMEOUT_MS
+            url, headers: egressHeaders(), body: JSON.stringify(body), timeoutMs: CHAT_TIMEOUT_MS
         })
     } catch (error) {
         if (error.sessionLost) {
@@ -108,8 +115,8 @@ async function postChat(context, token) {
     return assertChatCreationResponse(payload)
 }
 
-const accepted = async (context, token) => {
-    const chatId = await postChat(context, token)
+const accepted = async context => {
+    const chatId = await postChat(context)
     sessionPersistence.markSessionAccepted(context.email)
     return chatId
 }
@@ -132,26 +139,28 @@ async function createChat({ account, url, body }) {
     if (new URL(url).origin !== store.chatOrigin) throw new Error('Unexpected v2 chat origin')
     const email = account?.email
     const context = { email, account, url, body }
-    // The store is the source of truth for the token: a session a sibling
-    // request recovered may be newer than the one the caller was handed.
+    // The session as of the call. None of it is sent — the Bearer is the
+    // page's (Qwen2API-jr9) — but it says whether the account has one at all,
+    // and below whether a sibling request replaced it while the call was out.
     let session = store.sessions.get(email)
     // No session at all (invalidated meanwhile, or never restored): one recovery may still produce one.
     if (!session) session = await sessionPersistence.recoverSession(email, account, 'v2_session_required')
     if (!session) throw new ChatCreationError('v2_session_required', 409)
     try {
-        return await accepted(context, session.token)
+        return await accepted(context)
     } catch (error) {
         if (!recoverable(error)) throw error
-        // A sibling request may have replaced the session this call went out
-        // on (and was refused on): that one carries the retry, and this
-        // request schedules no recovery of its own.
+        // A sibling request may have recovered this account while this call
+        // was out on a page that refused it: the store holds a newer session,
+        // and the page is reloaded or re-logged in already. That one carries
+        // the recovery; this request schedules none of its own.
         const latest = store.sessions.get(email)
         const recovered = latest && latest.token !== session.token
             ? latest
             : await sessionPersistence.recoverSession(email, account, error.code)
         if (!recovered) throw error
         try {
-            return await accepted(context, recovered.token)
+            return await accepted(context)
         } catch (retryError) {
             // Refused as unauthorized again after a reload: a reload cannot
             // help this account. The full sign-in follows in the background,
@@ -271,12 +280,12 @@ const settlesWithin = async (promise, ms) => {
  * @throws the relay's own failures (relayFailure), a dead profile as a
  *   refused session, a misconfigured worker as its SigninError
  */
-async function openCompletions(context, token) {
+async function openCompletions(context) {
     let relay
     try {
         relay = await signinWorker.egressStream(context.email, context.account, {
             // The page's own completions call says `accept: application/json`, where its other XHRs carry axios's default.
-            url: context.url, headers: egressHeaders(token, 'application/json'), body: context.body, timeoutMs: context.timeoutMs
+            url: context.url, headers: egressHeaders('application/json'), body: context.body, timeoutMs: context.timeoutMs
         })
     } catch (error) {
         // The profile no longer authenticates: the same refusal chats/new makes of it.
@@ -459,12 +468,12 @@ async function openCompletions(context, token) {
 }
 
 /**
- * One attempt: the call on one token, up to the point the answer is the
- * caller's. A refusal of the session is thrown as the 401 the direct
- * transports reject with; so is everything else that went wrong.
+ * One attempt: the call, up to the point the answer is the caller's. A
+ * refusal of the session is thrown as the 401 the direct transports reject
+ * with; so is everything else that went wrong.
  */
-async function streamCompletions(context, token) {
-    const relay = await openCompletions(context, token)
+async function streamCompletions(context) {
+    const relay = await openCompletions(context)
     try {
         // Jar sync, as for chats/new: what the browser holds now replaces the
         // stored cookies of the same name.
@@ -503,31 +512,30 @@ async function streamCompletions(context, token) {
  * Unlike chats/new, a refusal that survives the reload escalates to nothing.
  * The password is spent on chats/new's verdict alone — that is the call that
  * proves a session — and it has just passed for this very request. A
- * completions refusal after it says the token moved, not that the profile
- * died; and were completions refused for a reason of their own (a header the
- * in-page call lacks, say), every request would otherwise be chats/new
- * accepting the session, resetting the sign-in backoff, and completions
- * spending a password login on it: one a minute, for as long as it lasted.
+ * completions refusal after it is no verdict on the profile; and were
+ * completions refused for a reason of their own (a header the in-page call
+ * lacks, say), every request would otherwise be chats/new accepting the
+ * session, resetting the sign-in backoff, and completions spending a password
+ * login on it: one a minute, for as long as it lasted.
  *
  * @param {object} context
  * @param {Object} context.account - Account (email, proxy)
  * @param {string} context.url - completions URL
  * @param {string} context.body - The v2.1 request body, serialized
- * @param {string} context.token - The session's token as the caller holds it
  * @param {number} [context.timeoutMs] - How long qwen.ai may fall silent
  * @returns {Promise<object>} axios-shaped response with data as a Readable
  */
 async function postCompletions(context) {
     const { account } = context
     const email = account?.email
-    // The store is the source of truth for the token, as it is for chats/new.
+    // The session as of the call, for the sibling check below; the call
+    // itself goes out on the page's token (Qwen2API-jr9).
     let session = store.sessions.get(email) || null
-    let token = session ? session.token : context.token
     // The silence budget is the direct transports' unless the caller brings a
     // number of its own (an undefined one would arm every timer for "NaN").
     const call = { ...context, email, timeoutMs: context.timeoutMs ?? COMPLETIONS_TIMEOUT_MS }
-    // A sibling request may have replaced the session this call went out on
-    // (and was refused or challenged on): that one carries the retry.
+    // A sibling request may have recovered this account while this call was
+    // out on a page that refused or challenged it: that one carries the retry.
     const recovered = async reason => {
         const latest = store.sessions.get(email)
         return latest && latest.token !== session?.token
@@ -536,7 +544,7 @@ async function postCompletions(context) {
     }
     for (let attempt = 1; ; attempt++) {
         try {
-            const { response, challenge } = await streamCompletions(call, token)
+            const { response, challenge } = await streamCompletions(call)
             if (!challenge || attempt > 1) return response
             // Challenged again after the reload: the answer goes on as it is,
             // and the caller screens it as it screens a direct one's.
@@ -545,13 +553,11 @@ async function postCompletions(context) {
             // The challenged answer is nobody's now: its relay is closed.
             response.data.destroy()
             session = live
-            token = live.token
         } catch (error) {
             if (error.response?.status !== 401 || attempt > 1) throw error
             const live = await recovered(UNAUTHORIZED)
             if (!live) throw error
             session = live
-            token = live.token
         }
     }
 }
