@@ -48,14 +48,16 @@
  *                    page the worker's call was refused on). A fetch — the
  *                    page's completions is a fetch, the worker's call an
  *                    XMLHttpRequest — with what the page's own request carried
- *                    (among it x-accel-buffering: no and bx-v), to the address
- *                    without the chat id, with a body shaped like the app's.
+ *                    (among it x-accel-buffering: no and bx-v), with a body
+ *                    shaped like the app's.
  *                    Two calls, the runbook's pause apart, each in a fresh
  *                    chat: the first from where the page stands (referer /).
- *                    Refused — the second, with the page's own referer for it
- *                    (/c/<chat>). Passed — the worker's own call once more
- *                    instead, as the control: if that passes too, it is the
- *                    time that changed (24.11: refused at 20:30 UTC).
+ *                    Refused by the risk control — the second, with the page's
+ *                    own referer for it (/c/<chat>). Passed — the worker's own
+ *                    call once more instead, as the control: if that passes
+ *                    too, it is the time that changed, not the shape of the
+ *                    call. (25.11: qwen.ai takes no completions without the
+ *                    chat id in the address — the page's own carries it.)
  *   --fast=1        the pause between calls cut to 2 s — for --loopback-only=1
  *                    rehearsals only; a live run refuses it.
  * On 2026-11-24 the worker's old way (fetch, content-type only) got a WAF
@@ -534,7 +536,7 @@ async function main() {
     page.on('request', request => {
         const u = new URL(request.url())
         requests.set(request, {
-            t: ms(), host: u.hostname, path: (u.pathname || '/').slice(0, 70),
+            t: ms(), host: u.hostname, path: (u.pathname || '/').slice(0, 70), query: (u.search || '').slice(0, 90),
             method: request.method(), type: request.resourceType(), status: null, tAnswer: null, tEnd: null, failed: null
         })
     })
@@ -801,7 +803,7 @@ async function main() {
         const request = response.request()
         const sent = await request.allHeaders().catch(() => ({}))
         const said = {
-            at: requests.get(request)?.t, path: new URL(request.url()).pathname, sent: headerNames(sent),
+            at: requests.get(request)?.t, path: new URL(request.url()).pathname, query: new URL(request.url()).search.slice(0, 90), sent: headerNames(sent),
             status: response.status(), type: response.headers()['content-type'] || ''
         }
         const posted = request.postData()
@@ -933,7 +935,7 @@ async function main() {
         const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
         const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
         return `${days[now.getDay()]} ${months[now.getMonth()]} ${pad(now.getDate())} ${now.getFullYear()} ` +
-            `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}GMT${offset < 0 ? '-' : '+'}${pad(Math.floor(Math.abs(offset) / 60))}${pad(Math.abs(offset) % 60)}`
+            `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())} GMT${offset < 0 ? '-' : '+'}${pad(Math.floor(Math.abs(offset) / 60))}${pad(Math.abs(offset) % 60)}`
     }
 
     // The body the app builds (src/middlewares/chat-middleware.js) — the shape of the page's own (24.11).
@@ -974,9 +976,9 @@ async function main() {
             },
             body: ownStyleBody(chatId)
         }
-        log(label, `the call starts: a fetch to /api/v2/chat/completions (no chat id in the address), x-accel-buffering: no, ` +
+        log(label, `the call starts: a fetch to /api/v2/chat/completions?chat_id=<chat>, x-accel-buffering: no, ` +
             `${referrer ? `the page's own referer ${hostPath(referrer)}` : 'the referer of where the page stands'}`)
-        const running = page.evaluate(pageFetchProbe, { url: '/api/v2/chat/completions', init, timeoutMs: 120000, maxBytes: MAX_BYTES, referrer })
+        const running = page.evaluate(pageFetchProbe, { url: `/api/v2/chat/completions?chat_id=${chatId}`, init, timeoutMs: 120000, maxBytes: MAX_BYTES, referrer })
             .then(outcome => ({ outcome }), error => ({ error }))
         let got
         try {
@@ -997,7 +999,7 @@ async function main() {
         }
         // What went over the wire, as the page's network saw it: the referer above all.
         const sent = [...requests.values()].filter(entry => entry.path === '/api/v2/chat/completions' && entry.t >= started - T0).pop()
-        said.sent = sent && sent.sent ? sent.sent.filter(name => /^(referer|x-accel-buffering|bx-v|version|source|accept)=|^authorization$/.test(name)).join(' ') : 'not recorded'
+        said.sent = sent && sent.sent ? sent.sent.filter(name => /^(referer|x-accel-buffering|bx-|version|source|accept)/.test(name)).join(' ') : 'not recorded'
         log(label, `${said.ok ? 'ok' : `not ok: ${said.error}`} · HTTP ${said.status} · ${said.type || '-'} · ${said.bytes} bytes, ${said.frames} SSE frame(s) · ${said.answer} · ${said.took} ms`)
         said.starts = cut(body.replace(/\s+/g, ' '), 600)
         log(label, `sent: ${said.sent}`)
@@ -1018,23 +1020,29 @@ async function main() {
     const anAnswer = call => Boolean(call && call.ok && /^an answer/.test(call.answer))
 
     /**
-     * All of --like-own. The call without the page's referer comes first. Refused — the second,
-     * with the referer, says whether that is what was missing. Passed — the worker's own call
-     * goes once more: hours may have passed since it was last refused, and if it passes too,
-     * it is the time that changed, not the shape of the call.
+     * All of --like-own. The call without the page's referer comes first. Passed — the
+     * worker's own call goes once more, as the control: hours may have passed since it
+     * was last refused, and if it passes too, it is the time that changed, not the shape
+     * of the call. Refused by the risk control — the second call, with the page's own
+     * referer, says whether that is what was missing. Anything else the first call got —
+     * an error of the server's own, say — is not a question the second call answers, and
+     * the run stops there.
      */
     async function ownLike() {
         const report = {}
         await pauseBetweenCalls()
         report['own-completions-1'] = await freshChatThen(chatId => ownStyleCompletions(chatId, {}, 'own-completions-1'), 'own-completions-1')
-        if (anAnswer(report['own-completions-1'])) {
+        const first = report['own-completions-1']
+        if (anAnswer(first)) {
             log('own-completions-2', 'skipped: the first call passed without the page\'s referer')
             await pauseBetweenCalls()
             report.control = await freshChatThen(chatId => completions(chatId), 'control')
-        } else {
+        } else if (first.answer === 'A CHALLENGE') {
             await pauseBetweenCalls()
             report['own-completions-2'] = await freshChatThen(
                 chatId => ownStyleCompletions(chatId, { referrer: `/c/${chatId}` }, 'own-completions-2'), 'own-completions-2')
+        } else if (first.answer !== undefined) {
+            log('own-completions-2', `skipped: the first call was not refused by the risk control but answered "${first.answer}" — the referer is not what that is about`)
         }
         report.stateAfter = await withTimeout(page.evaluate(pageState), 8000, 'the page').catch(error => ({ error: cut(error.message, 100) }))
         log('life', `the page shows: ${JSON.stringify(report.stateAfter)}`)
@@ -1210,7 +1218,7 @@ async function main() {
     for (const entry of list.filter(e => apiType(e) && e.host === originHost).slice(0, 70)) {
         const duration = entry.tEnd !== null ? entry.tEnd - entry.t : null
         const state = entry.failed ? `FAILED ${entry.failed}` : entry.status === null ? (entry.tEnd === null ? 'PENDING' : 'no status') : entry.viaServiceWorker ? 'done via service worker' : 'done'
-        console.log(`${String(entry.t).padStart(7)}  ${String(duration === null ? '-' : '+' + duration).padStart(8)}  ${entry.type.padEnd(8)} ${entry.method.padEnd(4)} ${entry.path.slice(0, 60)}  ${entry.status === null ? '-' : entry.status}  ${state}`)
+        console.log(`${String(entry.t).padStart(7)}  ${String(duration === null ? '-' : '+' + duration).padStart(8)}  ${entry.type.padEnd(8)} ${entry.method.padEnd(4)} ${cut(entry.path.slice(0, 60) + (entry.query ? ' ?' + entry.query.slice(1) : ''), 110)}  ${entry.status === null ? '-' : entry.status}  ${state}`)
     }
     console.log("--- what was sent with them (header names; opaque values by length) and what qwen.ai answered to this run's calls")
     const shown = new Set()
@@ -1296,7 +1304,7 @@ async function main() {
         console.log(`the message was ${ui.typed.sentWith ? `sent with ${ui.typed.sentWith}, ${ui.typed.msToSent} ms after typing began` : 'NOT SENT'}`)
         if (ui.chatsNew) console.log(`its chats/new: HTTP ${ui.chatsNew.status}; sent: ${ui.chatsNew.sent.join(' ')} -> ${ui.chatsNew.answer}`)
         if (ui.completions) {
-            console.log(`its completions: HTTP ${ui.completions.status} [${ui.completions.type}]; sent: ${ui.completions.sent.join(' ')}`)
+            console.log(`its completions: ${ui.completions.path}${ui.completions.query} — HTTP ${ui.completions.status} [${ui.completions.type}]; sent: ${ui.completions.sent.join(' ')}`)
             console.log(`  on it: ${ui.signature.join(' ') || 'no bx-ua / bx-umidtoken'}`)
             console.log(`  body sent: ${ui.completions.body}`)
             console.log(`  answered: ${ui.completions.answer}`)
@@ -1326,6 +1334,7 @@ async function main() {
             console.log(`control, the worker's own call as it was: chats/new ${control.chatsNew}`)
             if (control.took === undefined) console.log('  no completions call was made')
             else console.log(`  ${JSON.stringify(control)}`)
+            console.log('  what it says: both passed — it is the time that changed, not the shape of the call; only this one refused — the shape of the call is what was refused')
         }
     }
     console.log('--- page facts')
