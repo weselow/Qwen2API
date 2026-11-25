@@ -56,7 +56,7 @@ async function until(condition, timeoutMs = 5000) {
 }
 
 // A loopback stand-in for the signin worker: scripted answers per route and a
-// record of everything the app sent. Nothing here knows about qwen.ai, and a
+// record of everything the app sent. Nothing here reaches qwen.ai, and a
 // script may return a promise to hold an answer back — or a function, which
 // takes the response over (what the streaming /egress needs: relay()).
 function standInWorker() {
@@ -115,6 +115,32 @@ const harvested = (label, cookies = [cookie('cna', `from-${label}`)]) =>
     ({ token: tokenWith(label), expiresAt: EXPIRES_AT, cookies })
 const unauthorized = () => egress({ success: false, data: { code: 'unauthorized', details: SECRET } })
 const refusedDirect = async () => ({ status: 200, data: { success: false, code: 'unauthorized' }, headers: {} })
+
+// The page the worker keeps for the account, by the session it is on: a token,
+// or null while it is logged out. The app brings no Bearer on an egress call
+// (Qwen2API-jr9) — the worker sends the call on the page's own — so this, and
+// nothing the app holds, is what qwen.ai answers a call by.
+const page = { token: null }
+
+// qwen.ai's verdict on a call of the page: refused unless the page is on a
+// session and the call went out on it. A call that brings no Bearer does (it
+// is one of the page's own); one that brings the Bearer of another session
+// does not — as the app's did on 24.11, after the page had moved on from the
+// token a renewal harvested.
+const pageRefuses = body => !page.token ||
+    (body.headers.authorization !== undefined && body.headers.authorization !== `Bearer ${page.token}`)
+
+// The answer /renew or /session gives once it harvested a session. Forced,
+// either is a reload of the page or a sign-in on it: the page is on that
+// session from here on.
+const sessionOnPage = (body, harvested) => {
+    if (body.force === true) page.token = harvested.token
+    return ok(harvested)
+}
+
+// Whether the app put a Bearer of its own on a call. It never does
+// (Qwen2API-jr9): a retry rides the page's session, not a token of the store's.
+const bringsBearer = body => 'authorization' in body.headers
 
 // The send settings as the process was configured; a test may quicken the retry.
 const SENT = { chatRetryCount: config.chatRetryCount, chatRetryBackoffMs: config.chatRetryBackoffMs }
@@ -211,9 +237,13 @@ test.beforeEach(async () => {
     direct.length = 0
     logs.length = 0
     directReply = null
-    worker.script.egress = () => egress(chat('chat-1'))
-    worker.script.renew = () => ok(harvested('renewed'))
-    worker.script.session = () => ok(harvested('signed-in'))
+    // The account's page is on the session the account was given, and answers
+    // as the page does; a forced renewal reloads it, a forced sign-in signs it
+    // in — either leaves it on the session it hands back.
+    page.token = tokenWith('initial')
+    worker.script.egress = body => (pageRefuses(body) ? unauthorized() : egress(chat('chat-1')))
+    worker.script.renew = body => sessionOnPage(body, harvested('renewed'))
+    worker.script.session = body => sessionOnPage(body, harvested('signed-in'))
     store.clearSessions()
     accountManager.accountTokens.length = 0
     config.chatCreationTransport = 'auto'
@@ -314,8 +344,8 @@ test('chats/new leaves through the worker and nowhere else', async () => {
     assert.equal(sent.body.proxy, null)
     assert.equal(sent.body.timeoutMs, browserEgress.CHAT_TIMEOUT_MS)
     // The profile's own cookies ride along in the browser: the app's jar is not shipped to the worker.
-    assert.deepEqual(Object.keys(sent.body.headers).sort(), ['authorization', 'content-type', 'x-request-id'])
-    assert.equal(sent.body.headers.authorization, `Bearer ${account.token}`)
+    // Nor its token: the call is one of the page's own and goes out on the page's Bearer (Qwen2API-jr9).
+    assert.deepEqual(Object.keys(sent.body.headers).sort(), ['content-type', 'x-request-id'])
     assert.equal(sent.body.headers['content-type'], 'application/json')
     assert.match(sent.body.headers['x-request-id'], /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
 
@@ -531,7 +561,8 @@ test('an unauthorized chats/new is recovered inside the request: live reload, th
     assert.equal(await generateChatID(account.token, MODEL, account), 'chat-after-reload')
     assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'])
     assert.deepEqual(worker.sent('/renew')[0], { email: EMAIL, proxy: null, force: true })
-    assert.equal(worker.sent('/egress')[1].headers.authorization, `Bearer ${renewed.token}`)
+    // The retry is the same call again, on the reloaded page: no Bearer of the app's on either.
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false])
     // The retry's jar is folded in like any other answer.
     assert.equal(jarPairs('https://chat.qwen.ai/').ssxmod_itna, 'after-reload')
     assert.deepEqual(direct, [])
@@ -546,7 +577,7 @@ test('a WAF challenge on egress gets the reload and the retry — and never a pa
     assert.equal(await generateChatID(account.token, MODEL, account), 'after-reload')
     assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'])
     assert.equal(worker.sent('/renew')[0].force, true)
-    assert.equal(worker.sent('/egress')[1].headers.authorization, `Bearer ${renewed.token}`)
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false])
     assert.equal(worker.count('/session'), 0)
 })
 
@@ -705,7 +736,7 @@ test('a dead profile is re-logged in with the password before the retry', async 
         assert.equal(await generateChatID(account.token, MODEL, account), 'after-relogin', code)
         assert.deepEqual(worker.routes(), ['/egress', '/renew', '/session', '/egress'], code)
         assert.deepEqual(worker.sent('/session')[0], { email: EMAIL, password: PASSWORD, proxy: null, force: true })
-        assert.equal(worker.sent('/egress')[1].headers.authorization, `Bearer ${signedIn.token}`)
+        assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false])
         assert.equal(account.token, signedIn.token)
     }
 })
@@ -718,7 +749,7 @@ test('a resident page that cannot authenticate (session_expired on the lazy open
     worker.script.renew = () => ok(renewed)
     assert.equal(await generateChatID(account.token, MODEL, account), 'after-reload')
     assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'])
-    assert.equal(worker.sent('/egress')[1].headers.authorization, `Bearer ${renewed.token}`)
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false])
 })
 
 test('a reload that fails outright leaves the failure with the request and the session where it was', async () => {
@@ -750,7 +781,7 @@ test('without a session the call is refused locally, unless one recovery produce
     worker.script.renew = () => ok(renewed)
     assert.equal(await generateChatID(account.token, MODEL, account), 'chat-1')
     assert.deepEqual(worker.routes(), ['/renew', '/egress'])
-    assert.equal(worker.sent('/egress')[0].headers.authorization, `Bearer ${renewed.token}`)
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false])
 })
 
 /* ------------------------------------------------------------ bounded load -- */
@@ -896,7 +927,7 @@ test('a sign-in that fails backs off exactly like one whose session is refused',
     })
 })
 
-test('parallel failures on one account share a single reload and all retry on the renewed token', { timeout: 10000 }, async () => {
+test('parallel failures on one account share a single reload and all retry after it, on no Bearer of the app\'s', { timeout: 10000 }, async () => {
     const account = givenAccount()
     const renewed = harvested('renewed')
     const answers = [unauthorized(), unauthorized(), unauthorized(), egress(chat('shared')), egress(chat('shared')), egress(chat('shared'))]
@@ -911,10 +942,10 @@ test('parallel failures on one account share a single reload and all retry on th
     assert.deepEqual(await Promise.all(pending), ['shared', 'shared', 'shared'])
     assert.equal(worker.count('/renew'), 1)
     assert.deepEqual(worker.routes().slice(-3), ['/egress', '/egress', '/egress'])
-    assert.ok(worker.sent('/egress').slice(-3).every(body => body.headers.authorization === `Bearer ${renewed.token}`))
+    assert.deepEqual(worker.sent('/egress').slice(-3).map(bringsBearer), [false, false, false])
 })
 
-test('a request refused on a token a sibling already replaced retries on the new one, with no recovery of its own', { timeout: 10000 }, async () => {
+test('a request whose refusal lands after a sibling replaced the session retries after that recovery, with none of its own', { timeout: 10000 }, async () => {
     const account = givenAccount()
     const renewed = harvested('renewed')
     // First answers, in order: the refusal that starts the recovery; the one
@@ -938,13 +969,15 @@ test('a request refused on a token a sibling already replaced retries on the new
     releaseRenew()
     assert.equal(await first, 'chat-3')
 
-    // Its call went out on the old token and comes back refused after the
-    // store has moved on: that is not this account's session being bad.
+    // Its call went out before the recovery and comes back refused once the
+    // store has moved on — the sibling has reloaded the page meanwhile: that
+    // is not this account's session being bad.
     for (const release of held) release()
     assert.equal(await second, 'chat-4')
     // Two calls each, and the one renewal: the second request scheduled none.
     assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress', '/egress', '/egress'])
-    assert.equal(worker.sent('/egress')[3].headers.authorization, `Bearer ${renewed.token}`)
+    // None of the four carried a Bearer: the retries ride the page the sibling reloaded.
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false, false, false])
 })
 
 test('a session replaced under the same token is not "a new session": the refusal still needs a recovery', { timeout: 10000 }, async () => {
@@ -1267,19 +1300,19 @@ test('COMPLETIONS_TRANSPORT=browser sends the call from the page and hands the a
     assert.equal(creation.stream, undefined, 'chats/new is the whole-answer call it was')
     assert.equal(worker.calls[1].auth, 'Bearer shared-secret')
     // What left the page: the v2.1 body the direct path builds, on the
-    // session's token, with the headers chats/new sends.
+    // page's own session, with the headers chats/new sends.
     assert.equal(completions.email, EMAIL)
     assert.equal(completions.url, `${COMPLETIONS}chat-1`)
     assert.equal(completions.method, 'POST')
     assert.equal(completions.stream, true)
     assert.equal(completions.proxy, null)
     assert.equal(completions.timeoutMs, browserEgress.COMPLETIONS_TIMEOUT_MS)
-    // The app puts its own on the call; the rest of what a request of the
-    // page's carries is the worker's (Qwen2API-3ue.5) — except the one the
-    // page's own completions call differs in from its other XHRs.
-    assert.deepEqual(Object.keys(completions.headers).sort(), ['accept', 'authorization', 'content-type', 'x-request-id'])
+    // The app puts its own on the call — no Bearer: that one is the page's
+    // (Qwen2API-jr9) — and the rest of what a request of the page's carries
+    // is the worker's (Qwen2API-3ue.5), except the one the page's own
+    // completions call differs in from its other XHRs.
+    assert.deepEqual(Object.keys(completions.headers).sort(), ['accept', 'content-type', 'x-request-id'])
     assert.equal(completions.headers.accept, 'application/json')
-    assert.equal(completions.headers.authorization, `Bearer ${account.token}`)
     assert.deepEqual(JSON.parse(completions.body), {
         model: MODEL, max_tokens: 64, stream: true, chat_id: 'chat-1', chatId: 'chat-1', parent_id: null, parentId: null,
         messages: [{ role: 'user', content: 'hello', parent_id: null, parentId: null }]
@@ -1313,7 +1346,7 @@ test('the transport answers in the shape axios and the impersonating transport u
     scripted(stream)
 
     const response = await browserEgress.postCompletions({
-        account, url: `${COMPLETIONS}chat-1`, body: '{"stream":true}', token: account.token, timeoutMs: 600000
+        account, url: `${COMPLETIONS}chat-1`, body: '{"stream":true}', timeoutMs: 600000
     })
     assert.equal(response.status, 200)
     assert.equal(response.statusText, 'OK')
@@ -1368,8 +1401,9 @@ test('a session refused in the answer’s first frame is recovered: live reload,
     assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
     // The refused relay is hung up on: what follows its refusal is never read.
     assert.equal(await refused.hungUp, false)
-    // The retry rides the renewed token, and so does everything after it.
-    assert.equal(completionsCalls()[1].headers.authorization, `Bearer ${tokenWith('renewed')}`)
+    // The retry is the same call again, on the reloaded page — no Bearer of
+    // the app's on either; the renewed token is what everything after it rides.
+    assert.deepEqual(completionsCalls().map(bringsBearer), [false, false])
     assert.equal(result.currentToken, tokenWith('renewed'))
     assert.equal(current().token, tokenWith('renewed'))
     assert.equal(account.token, tokenWith('renewed'))
@@ -1386,7 +1420,7 @@ test('a session refused as an HTTP status is recovered the same way', { timeout:
     const result = await sendChatRequest(BODY, { currentAccount: account })
     assert.equal(result.status, true)
     assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
-    assert.equal(completionsCalls()[1].headers.authorization, `Bearer ${tokenWith('renewed')}`)
+    assert.deepEqual(completionsCalls().map(bringsBearer), [false, false])
 })
 
 test('still refused after the reload: the request fails, and a completions refusal never costs a password', { timeout: 10000 }, async () => {
@@ -1436,7 +1470,7 @@ test('one recovery per interval: a completions refusal inside the window fails a
     assert.deepEqual(second.charged, [['recordAccountError', EMAIL, 401]])
 })
 
-test('a completions call refused on a token a sibling already replaced retries on the new one, with no reload of its own', { timeout: 10000 }, async () => {
+test('a completions refusal that lands after a sibling replaced the session retries after that recovery, with no reload of its own', { timeout: 10000 }, async () => {
     config.completionsTransport = 'browser'
     const account = givenAccount()
     accountManager.accountTokens = [account]
@@ -1454,11 +1488,12 @@ test('a completions call refused on a token a sibling already replaced retries o
     const result = await sendChatRequest(BODY, { currentAccount: account })
     assert.equal(result.status, true)
     assert.deepEqual(worker.routes(), ['/egress', '/egress', '/egress'])
-    assert.equal(completionsCalls()[1].headers.authorization, `Bearer ${sibling.token}`)
+    // The refusal and the retry alike went out as the page's own: the store's token was on neither.
+    assert.deepEqual(completionsCalls().map(bringsBearer), [false, false])
     assert.equal(result.currentToken, sibling.token)
 })
 
-test('with no session left in the store the call rides the token the caller holds', { timeout: 10000 }, async () => {
+test('with no session left in the store the call still goes out, on the page\'s session — no token of the caller\'s is needed', { timeout: 10000 }, async () => {
     config.completionsTransport = 'browser'
     const account = givenAccount()
     // A sibling's direct call may drop the session after this request was
@@ -1470,9 +1505,8 @@ test('with no session left in the store the call rides the token the caller hold
     stream.end()
     scripted(stream)
 
-    const response = await transport.postCompletions(`${COMPLETIONS}chat-1`, {}, { timeout: 60000 },
-      { account, token: account.token })
-    assert.equal(completionsCalls()[0].headers.authorization, `Bearer ${account.token}`)
+    const response = await transport.postCompletions(`${COMPLETIONS}chat-1`, {}, { timeout: 60000 }, { account })
+    assert.deepEqual(completionsCalls().map(bringsBearer), [false])
     const events = response.data[Symbol.asyncIterator]()
     assert.equal((await events.next()).value.toString('utf8'), frame({ content: 'по' }))
     assert.equal((await events.next()).done, true)
@@ -1512,7 +1546,7 @@ test('a handed-off stream that nobody reads is cut in time, and takes nothing do
     scripted(stream)
 
     const response = await browserEgress.postCompletions({
-        account, url: `${COMPLETIONS}chat-1`, body: '{"stream":true}', token: account.token, timeoutMs: 30
+        account, url: `${COMPLETIONS}chat-1`, body: '{"stream":true}', timeoutMs: 30
     })
     // Never read, never closed: the watchdog comes for it, and an 'error'
     // with no listener of its own would be the end of the process.
@@ -1572,7 +1606,7 @@ test('a relay that goes silent before its first frame is cut like one that goes 
     scripted(mute)
 
     await assert.rejects(browserEgress.postCompletions({
-        account, url: `${COMPLETIONS}chat-1`, body: '{"stream":true}', token: account.token, timeoutMs: 30
+        account, url: `${COMPLETIONS}chat-1`, body: '{"stream":true}', timeoutMs: 30
     }), error => error.code === 'ETIMEDOUT' && error.workerCode === 'relay_silent')
     // Cut before the hand-off, not parked on the first frame until its grace runs out.
     assert.equal(await mute.hungUp, false)
@@ -1589,7 +1623,7 @@ test('a dead profile behind the page is re-logged in with the password before th
     const result = await sendChatRequest(BODY, { currentAccount: account })
     assert.equal(result.status, true)
     assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/session', '/egress'])
-    assert.equal(completionsCalls()[1].headers.authorization, `Bearer ${tokenWith('signed-in')}`)
+    assert.deepEqual(completionsCalls().map(bringsBearer), [false, false])
     assert.equal(worker.sent('/session')[0].force, true)
 })
 
@@ -1774,7 +1808,7 @@ test('a WAF challenge page as the answer gets the live reload and exactly one re
     const result = await sendChatRequest(BODY, { currentAccount: account })
     assert.equal(result.status, true)
     assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
-    assert.equal(completionsCalls()[1].headers.authorization, `Bearer ${tokenWith('renewed')}`)
+    assert.deepEqual(completionsCalls().map(bringsBearer), [false, false])
     // A reload is all it took: no password — chats/new accepted this session a moment ago.
     assert.equal(worker.count('/session'), 0)
     assert.equal(JSON.stringify(logs).includes(SECRET), false, 'the challenge page never reaches a log line')
@@ -1852,7 +1886,7 @@ test('an HTML answer that is no challenge goes on as it is: nothing is reloaded'
     scripted(challenging(maintenance))
 
     const response = await browserEgress.postCompletions({
-        account, url: `${COMPLETIONS}chat-1`, body: '{"stream":true}', token: account.token, timeoutMs: 600000
+        account, url: `${COMPLETIONS}chat-1`, body: '{"stream":true}', timeoutMs: 600000
     })
     assert.equal(response.status, 200)
     assert.equal(response.headers['content-type'], 'text/html; charset=utf-8')
@@ -1884,7 +1918,7 @@ test('a caller that brings no silence budget of its own gets the usual one', { t
     stream.end()
     scripted(stream)
 
-    const response = await transport.postCompletions(`${COMPLETIONS}chat-1`, {}, {}, { account, token: account.token })
+    const response = await transport.postCompletions(`${COMPLETIONS}chat-1`, {}, {}, { account })
     assert.equal(worker.sent('/egress')[0].timeoutMs, browserEgress.COMPLETIONS_TIMEOUT_MS)
     // Read to the end without a trip: an undefined budget must not arm the
     // silence watchdog for "NaN" milliseconds, which is to say at once.
@@ -1898,7 +1932,7 @@ test('a relay that stays silent past every budget the worker has is cut by the a
     scripted(stream)
 
     const response = await browserEgress.postCompletions({
-        account, url: `${COMPLETIONS}chat-1`, body: '{}', token: account.token, timeoutMs: 30
+        account, url: `${COMPLETIONS}chat-1`, body: '{}', timeoutMs: 30
     })
     const events = response.data[Symbol.asyncIterator]()
     await events.next()
@@ -1946,4 +1980,153 @@ test('COMPLETIONS_TRANSPORT=browser is a forced transport: a worker that is not 
     } finally {
         config.signinWorkerUrl = workerUrl
     }
+})
+
+/* --------------- the Bearer is the page's own (Qwen2API-jr9) ---------------- */
+
+// 24.11, prod (image 439c35b): the same chats/new passed on the page's token
+// and was refused as unauthorized on the app's — the token a renewal
+// harvested, which the page, changing its token as it boots, had moved on
+// from. Why qwen.ai refused that one is not established (such a token passed
+// from Node on 21.11); the fix stands on the observed pair alone, and on the
+// worker sending a call that brings no Bearer on the page's own token.
+
+// Every call of a request answered as the page's own: chats/new whole,
+// completions as one relay — `answer`'s, or a refusal's.
+const asThePage = (body, answer) => {
+    const refused = pageRefuses(body)
+    if (body.stream !== true) return refused ? unauthorized() : egress(chat('chat-1'))
+    return (refused ? refusing() : answer).open
+}
+
+test('Qwen2API-jr9: chats/new carries no authorization and passes on the page\'s session while the store holds a token the page moved on from', async () => {
+    const account = givenAccount()
+    page.token = tokenWith('moved-on')
+    assert.equal(await generateChatID(account.token, MODEL, account), 'chat-1')
+    // Nothing of the app's is on the call, so nothing can go stale: one call, no reload, no password.
+    assert.deepEqual(worker.routes(), ['/egress'])
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false])
+    // The store is left as it was: its token is the account record's business, not the call's.
+    assert.equal(current().token, account.token)
+    assert.deepEqual(logs, [])
+})
+
+test('Qwen2API-jr9: completions carry no authorization too: a token the page moved on from in the store costs neither a refusal nor a reload', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    page.token = tokenWith('moved-on')
+    const stream = answering()
+    worker.script.egress = body => asThePage(body, stream)
+
+    const result = await sendChatRequest(BODY, { currentAccount: account })
+    try {
+        assert.equal(result.status, true)
+        assert.equal((await result.response[Symbol.asyncIterator]().next()).value.toString('utf8'), frame({ content: 'по' }))
+    } finally {
+        result.response.destroy()
+    }
+    assert.deepEqual(worker.routes(), ['/egress', '/egress'])
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false])
+    assert.equal(current().token, account.token)
+})
+
+test('Qwen2API-jr9: a page logged out — chats/new is refused, the page is reloaded, and exactly one retry, with no authorization, passes', async () => {
+    const account = givenAccount()
+    page.token = null
+    assert.equal(await generateChatID(account.token, MODEL, account), 'chat-1')
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'])
+    assert.deepEqual(worker.sent('/renew')[0], { email: EMAIL, proxy: null, force: true })
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false])
+    assert.equal(worker.count('/session'), 0)
+})
+
+test('Qwen2API-jr9: refused again after the reload — one retry with no authorization, then the failure, and the password sign-in in the background', async () => {
+    const account = givenAccount()
+    page.token = null
+    // The reload hands back a session, but qwen.ai goes on refusing the page's.
+    worker.script.renew = () => ok(harvested('renewed'))
+    await assert.rejects(generateChatID(account.token, MODEL, account), { code: 'upstream_session_unauthorized', status: 502 })
+    assert.deepEqual(worker.routes(), ['/egress', '/renew', '/egress'])
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false])
+    // The re-login is not on the request's path, and it is one.
+    await until(() => worker.count('/session') === 1)
+    assert.deepEqual(worker.sent('/session')[0], { email: EMAIL, password: PASSWORD, proxy: null, force: true })
+    await until(() => current()?.token === tokenWith('signed-in'))
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-jr9: completions on a page logged out — refused, reloaded, exactly one retry with no authorization, and it passes', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    const stream = answering()
+    // The page loses its session between chats/new and completions.
+    worker.script.egress = body => {
+        if (body.stream !== true) {
+            page.token = null
+            return egress(chat('chat-1'))
+        }
+        return asThePage(body, stream)
+    }
+
+    const result = await sendChatRequest(BODY, { currentAccount: account })
+    try {
+        assert.equal(result.status, true)
+    } finally {
+        result.response.destroy()
+    }
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false, false])
+    assert.deepEqual(worker.sent('/renew')[0], { email: EMAIL, proxy: null, force: true })
+    assert.equal(worker.count('/session'), 0, 'a reload is all it took')
+})
+
+test('Qwen2API-jr9: completions refused again after the reload — one retry with no authorization, the request fails, and no password is spent', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    // The page loses its session between chats/new and completions, and the
+    // reload brings none back: every completions call is refused.
+    worker.script.egress = body => {
+        if (body.stream !== true) {
+            page.token = null
+            return egress(chat('chat-1'))
+        }
+        return refusing().open
+    }
+    worker.script.renew = () => ok(harvested('renewed'))
+
+    const { value: result, charged } = await charging(() => sendChatRequest(BODY, { currentAccount: account }))
+    assert.equal(result.status, false)
+    assert.deepEqual(result.failure, UNCLASSIFIED_502)
+    // A refused session is a 4xx of the upstream's: the warn mark and nothing else.
+    assert.deepEqual(charged, [['recordAccountError', EMAIL, 401]])
+    assert.deepEqual(worker.routes(), ['/egress', '/egress', '/renew', '/egress'])
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false, false])
+    // Not now, and not once the reload's bookkeeping has settled: chats/new
+    // accepted this session a moment ago.
+    await until(() => sessionPersistence.renewals.size === 0)
+    assert.equal(worker.count('/session'), 0)
+})
+
+test('Qwen2API-jr9: the app puts exactly content-type and x-request-id on /egress — plus accept: application/json on the stream — and never authorization', { timeout: 10000 }, async () => {
+    config.completionsTransport = 'browser'
+    const account = givenAccount()
+    const stream = answering()
+    scripted(stream)
+    const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+    const result = await sendChatRequest(BODY, { currentAccount: account })
+    result.response.destroy()
+    const [creation, completions] = worker.sent('/egress')
+    assert.equal(creation.stream, undefined, 'chats/new is the whole-answer call')
+    assert.deepEqual(Object.keys(creation.headers).sort(), ['content-type', 'x-request-id'])
+    assert.equal(creation.headers['content-type'], 'application/json')
+    assert.match(creation.headers['x-request-id'], UUID)
+    assert.equal(completions.stream, true)
+    // Plus the accept the page's own completions call sends where its other XHRs carry axios's default.
+    assert.deepEqual(Object.keys(completions.headers).sort(), ['accept', 'content-type', 'x-request-id'])
+    assert.equal(completions.headers['content-type'], 'application/json')
+    assert.equal(completions.headers.accept, 'application/json')
+    assert.match(completions.headers['x-request-id'], UUID)
+    // The Bearer is the page's, the worker's to send: it is not the app's to bring.
+    assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false])
 })

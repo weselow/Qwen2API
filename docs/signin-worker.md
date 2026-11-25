@@ -205,11 +205,12 @@ egress **выключен**, пока его не включат явно (`brow
 
 С `COMPLETIONS_TRANSPORT=browser` completions уходят тем же путём: `POST
 /egress` с `stream: true`, и ответ qwen.ai возвращается приложению по мере
-поступления (`src/utils/browser-egress.js#postCompletions`). Тело v2.1 и Bearer
-по-прежнему собирает приложение; из заголовков приложение задаёт своё
-(`content-type`, `x-request-id`, `authorization`) и `accept: application/json`
-— так шлёт страница свой вызов completions; остальное, что несёт запрос
-страницы, добавляет воркер (Qwen2API-3ue.5).
+поступления (`src/utils/browser-egress.js#postCompletions`). Тело v2.1
+по-прежнему собирает приложение; из заголовков оно задаёт свои `content-type`
+и `x-request-id` и `accept: application/json` — так шлёт страница свой вызов
+completions; остальное, что несёт запрос страницы, добавляет воркер
+(Qwen2API-3ue.5), в том числе Bearer — токен самой страницы: приложение
+`authorization` не шлёт (Qwen2API-jr9).
 
 - **Для контроллеров ничего не меняется.** Транспорт отдаёт ответ той же
   формы, что axios и curl-impersonate (`{status, statusText, headers, data}`,

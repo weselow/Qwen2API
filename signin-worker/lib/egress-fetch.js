@@ -267,7 +267,7 @@ async function pageCall({ url, init, timeoutMs, maxBytes, channel, registry, id,
             if (version) headers.version = version
         }
         if (!('authorization' in headers)) {
-            // A call that brings no Bearer is one of the page's own: its session's token is the page's (the app brings its own).
+            // A call that brings no Bearer is one of the page's own: its session's token is the page's. The app brings none (Qwen2API-jr9): every call of its goes out this way.
             let token = null
             try {
                 token = localStorage.getItem('token')

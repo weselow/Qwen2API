@@ -823,12 +823,12 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
             }
             // completions 唯一的发送点：由 impersonate-transport 按 COMPLETIONS_TRANSPORT
             // 在 curl-impersonate（Chrome TLS 指纹）、axios 与浏览器 egress（Qwen2API-3ue.3：
-            // 从 signin-worker 的常驻页面里发出，用下面的 account 与 token）之间分派。
+            // 从 signin-worker 的常驻页面里发出，只用下面的 account——Bearer 是页面自己的，
+            // 应用不发，Qwen2API-jr9）之间分派。
             // 代理的取值与上面 applyProxyToAxiosConfig 的条件保持一致——lab 模式直连。
             const response = await postCompletions(url, payload, requestConfig, {
                 proxyUrl: lab.authOrigin ? null : resolveProxyUrl(currentAccount),
-                account: currentAccount,
-                token: currentToken
+                account: currentAccount
             })
             // Browser mode: the jar follows what qwen.ai set on this direct call too (Qwen2API-3ue.2)
             sessionPersistence.readSetCookies(currentAccount?.email, response.headers, url)
