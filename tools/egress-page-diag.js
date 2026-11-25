@@ -962,20 +962,25 @@ async function main() {
     const FILE_PATHS = /^\/api\/v\d+\/files\//
     // What was asked from the moment the file was put into the input: the file
     // calls as the responses — for what they carried and what was answered —,
-    // and every request to another host, by host, path and status alone.
-    const upload = { startedAt: null, files: [], foreign: [] }
+    // every other call the page made on the origin, by path and status (on
+    // 2026-11-25 the one file input of the chat's front page was the support
+    // widget's: the page answered the file with its support entry call), and
+    // every request to another host.
+    const upload = { startedAt: null, files: [], origin: [], foreign: [] }
     page.on('response', response => {
         const entry = requests.get(response.request())
         if (upload.startedAt === null || !entry || entry.t < upload.startedAt) return
         if (entry.host === originHost) {
+            if (!apiType(entry) || entry.type === 'document') return
+            if (upload.origin.length < 80) upload.origin.push({ at: entry.t, type: entry.type, method: entry.method, path: entry.path, status: response.status() })
             if (FILE_PATHS.test(entry.path) && upload.files.length < 60) upload.files.push(response)
         } else if (upload.foreign.length < 60) {
             upload.foreign.push({ at: entry.t, type: entry.type, method: entry.method, host: entry.host, path: entry.path, status: response.status() })
         }
     })
-    // What gives access, masked: the STS answer's credentials, a signed url's query.
-    const SECRET_VALUE = /("(?:access_key_secret|accessKeySecret|security_token|securityToken|access_key_id|accessKeyId|signature|Signature|x-oss-signature|x-oss-security-token|x-oss-credential|OSSAccessKeyId|token|key)"\s*:\s*")([^"]*)(")/g
-    const SECRET_QUERY = /([?&](?:key|Signature|OSSAccessKeyId|x-oss-signature|x-oss-security-token|x-oss-credential|security-token|token|x-amz-[^&=\s]+)=)[^&"\s<>]+/gi
+    // What gives access, masked: the STS answer's credentials, a signed url's query, a support widget's entry.
+    const SECRET_VALUE = /("(?:access_key_secret|accessKeySecret|security_token|securityToken|access_key_id|accessKeyId|signature|Signature|x-oss-signature|x-oss-security-token|x-oss-credential|OSSAccessKeyId|token|key|xtoken|xsign)"\s*:\s*")([^"]*)(")/g
+    const SECRET_QUERY = /([?&](?:key|Signature|OSSAccessKeyId|x-oss-signature|x-oss-security-token|x-oss-credential|security-token|token|x-amz-[^&=\s]+|xtoken|xsign)=)[^&"\s<>]+/gi
     const maskSecrets = value => String(value).replace(SECRET_VALUE, '$1<masked>$3').replace(SECRET_QUERY, '$1<masked>')
 
     /** What the page's own file call carried, and what was answered to it. */
@@ -1051,6 +1056,11 @@ async function main() {
             log('upload', `  answered: ${said.answer}`)
         }
         if (!report.files.length) log('upload', 'the page made no file call on the origin after the file was put in')
+        report.origin = upload.origin
+        if (!report.files.length) {
+            // What the page did instead — by path and status, as the requests of the origin go.
+            for (const item of upload.origin.slice(0, 20)) log('upload', `the page asked: ${item.type} ${item.method} ${item.path} -> HTTP ${item.status}`)
+        }
         report.foreign = upload.foreign
         for (const item of upload.foreign) {
             log('upload', `to another host: ${item.type} ${item.method} ${item.host}${cut(item.path, 40)} -> HTTP ${item.status}`)
@@ -1483,7 +1493,11 @@ async function main() {
             if (said.body) console.log(`  body: ${said.body}`)
             console.log(`  answered: ${said.answer}`)
         }
-        if (up.files && !up.files.length) console.log('the page made no file call on the origin after the file was put in')
+        if (up.files && !up.files.length) {
+            console.log('the page made no file call on the origin after the file was put in; what it asked instead:')
+            for (const item of up.origin || []) console.log(`  ${item.type} ${item.method} ${item.path} -> HTTP ${item.status}`)
+        }
+        if (up.files && up.files.length) console.log(`other calls the page made on the origin meanwhile: ${(up.origin || []).filter(item => !FILE_PATHS.test(item.path)).map(item => `${item.method} ${item.path.slice(0, 40)} -> ${item.status}`).join('; ') || 'none'}`)
         for (const item of up.foreign || []) console.log(`to another host: ${item.type} ${item.method} ${item.host}${cut(item.path, 40)} -> HTTP ${item.status}`)
         console.log(`the page shows after it: ${JSON.stringify(up.stateAfter)}`)
     }
