@@ -16,6 +16,15 @@ const UPLOAD_CONFIG = {
     get stsTokenUrl() {
         return `${getChatBaseUrl()}/api/v1/files/getstsToken`
     },
+    // Where the page's own code asks for the token (front end 0.3.50, read in
+    // its main.js on 2026-11-25): every call of its API client goes out under
+    // /api/v2, and /api/v1/files/getstsToken is an address it no longer uses —
+    // qwen.ai answered the call from the page with 405 (prod, 2026-11-25,
+    // Qwen2API-3ue.12). Only the call that leaves from the page takes it; the
+    // direct path keeps the address it always had.
+    get stsTokenUrlOfPage() {
+        return `${getChatBaseUrl()}/api/v2/files/getstsToken`
+    },
     maxRetries: 3,
     timeout: 30000,
     maxFileSize: 100 * 1024 * 1024, // 100MB
@@ -105,20 +114,24 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
             throw new Error(`文件大小超出限制，最大允许 ${UPLOAD_CONFIG.maxFileSize / 1024 / 1024}MB`)
         }
 
+        // From the account's page where the app sends chats/new from it (Qwen2API-03v):
+        // on the page's own session, with the session recovery of the egress. The
+        // app's token is no Bearer qwen.ai takes, and the call brings none.
+        const viaPage = browserEgress().enabled()
+        // The page's own body where the call leaves from the page: the size as a
+        // string, the type named as it is here, by the main part of the MIME type
+        // (Qwen2API-3ue.12). The direct path's body, as it always was, elsewhere.
         const payload = {
             filename,
-            filesize,
+            filesize: viaPage ? String(filesize) : filesize,
             filetype: filetypeSimple
         }
 
         logger.info(`请求STS Token: ${filename} (${filesize} bytes, ${filetypeSimple})`, 'UPLOAD', '🎫')
 
-        // From the account's page where the app sends chats/new from it (Qwen2API-03v):
-        // on the page's own session, with the session recovery of the egress. The
-        // app's token is no Bearer qwen.ai takes, and the call brings none.
-        const response = browserEgress().enabled()
+        const response = viaPage
             ? await browserEgress().egressJson({
-                account, url: UPLOAD_CONFIG.stsTokenUrl, method: 'POST',
+                account, url: UPLOAD_CONFIG.stsTokenUrlOfPage, method: 'POST',
                 body: JSON.stringify(payload), timeoutMs: UPLOAD_CONFIG.timeout
             })
             : await axios.post(UPLOAD_CONFIG.stsTokenUrl, payload, applyProxyToAxiosConfig({
@@ -150,9 +163,15 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
                 url: stsData.file_url,
                 path: stsData.file_path,
                 bucket: stsData.bucketname,
-                endpoint: stsData.region + '.aliyuncs.com',
+                // The page reads the endpoint off the answer (Qwen2API-3ue.12). The direct
+                // path's answer never carried one: its endpoint is built from the region as before.
+                endpoint: (viaPage && stsData.endpoint) || stsData.region + '.aliyuncs.com',
                 id: stsData.file_id
             }
+            // The page signs what it uploads V4, in the region the answer names — the
+            // signature takes the region. It travels with the answer of the page's address
+            // alone; the direct path's uploads are signed as they always were (Qwen2API-3ue.12).
+            if (viaPage && stsData.region) fileInfo.region = stsData.region
 
             // 检查必要字段
             const requiredCredentials = ['access_key_id', 'access_key_secret', 'security_token']
@@ -255,7 +274,7 @@ const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileConte
         }
 
         const proxyAgent = getProxyAgent(account);
-        const client = new OSS({
+        const clientOptions = {
             accessKeyId: stsCredentials.access_key_id,
             accessKeySecret: stsCredentials.access_key_secret,
             stsToken: stsCredentials.security_token,
@@ -266,9 +285,13 @@ const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileConte
             httpsAgent: proxyAgent,
             urllib: createOssProxyClient(account),
             timeout: UPLOAD_CONFIG.timeout
-        })
+        };
+        // As the page's own client signs (front end 0.3.50): V4, in the region the STS answer
+        // named. Only that answer carries the region; the direct path's uploads sign as before (Qwen2API-3ue.12).
+        if (ossInfo.region) Object.assign(clientOptions, { authorizationV4: true, region: ossInfo.region });
+        const client = new OSS(clientOptions)
 
-        logger.info(`上传文件到OSS: ${ossInfo.path} (${fileBuffer.length} bytes)`, 'UPLOAD', '📤')
+        logger.info(`上传文件到OSS: ${ossInfo.path} (${fileBuffer.length} bytes${ossInfo.region ? `, V4 ${ossInfo.region}` : ''})`, 'UPLOAD', '📤')
 
         const result = await client.put(ossInfo.path, fileBuffer, {
             headers: {
