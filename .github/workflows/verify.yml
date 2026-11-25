@@ -2,11 +2,55 @@ name: Verify and build
 
 on:
   workflow_call:
+    inputs:
+      filter-builds:
+        description: 'Limit builds to changes that affect build inputs'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      binaries: ${{ steps.plan.outputs.binaries }}
+    steps:
+      - uses: actions/checkout@v4
+        if: inputs.filter-builds
+        continue-on-error: true
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect changes that need builds
+        id: plan
+        shell: node {0}
+        env:
+          FILTER_BUILDS: ${{ inputs.filter-builds }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.after }}
+        run: |
+          const { execFileSync } = require('node:child_process')
+          const { appendFileSync } = require('node:fs')
+          const { FILTER_BUILDS, GITHUB_EVENT_NAME, BASE_SHA, HEAD_SHA, GITHUB_OUTPUT } = process.env
+
+          let binaries = true
+          if (FILTER_BUILDS === 'true' && ['pull_request', 'push'].includes(GITHUB_EVENT_NAME) && BASE_SHA && HEAD_SHA) {
+            const range = GITHUB_EVENT_NAME === 'pull_request' ? [`${BASE_SHA}...${HEAD_SHA}`] : [BASE_SHA, HEAD_SHA]
+            try {
+              // Include both paths when a build input is moved out of a build directory.
+              const output = execFileSync('git', ['diff', '--name-only', '-z', '--no-renames', ...range, '--'], { encoding: 'utf8' })
+              const paths = output.split('\0').filter(Boolean)
+              const buildPath = /^(?:(?:src|signin-worker|public|docker|tools|\.github\/workflows)\/|(?:package\.json|bun\.lock|\.dockerignore)$)/
+              binaries = paths.length === 0 || paths.some(file => buildPath.test(file))
+            } catch {
+              console.warn('Unable to list changed paths. Running all builds.')
+            }
+          }
+          appendFileSync(GITHUB_OUTPUT, `binaries=${binaries}\n`)
+
   regression:
     runs-on: ubuntu-24.04
     # The gate may consume 2 x 300s; leave time for installation and lint.
@@ -40,6 +84,8 @@ jobs:
           TEST_GATE_ATTEMPTS: 2
 
   frontend:
+    needs: changes
+    if: needs.changes.outputs.binaries == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
