@@ -1178,6 +1178,51 @@ const extractVideoInfoFromChatDetail = (chatDetail, responseIDs = []) => {
     }
 }
 
+// qwen.ai's silence on a poll, once it has crossed the egress: a call the
+// worker could not get answered (`upstream_transport_error`) because qwen.ai
+// said nothing for the call's whole budget (`egress_timeout`) or the road to
+// it failed (`egress_failed`) — qwen.ai's doing or the road's, as the text
+// path reads the same two (UPSTREAM_FAULTS in browser-egress.js). It is not
+// the worker's refusal, which is every other code: a page that closed or
+// hung, its limit of pages, a worker that is not there (no code at all); nor
+// a session refused or a challenge page, which are the session's to recover.
+const POLL_SILENCE = new Set(['egress_timeout', 'egress_failed'])
+const isPollSilence = error => error?.code === 'upstream_transport_error' && POLL_SILENCE.has(error.workerCode)
+
+// How many polls in a row qwen.ai may let go unanswered before the request is
+// given up. A video is generated for minutes and polled six to fifteen times:
+// one slow leg of qwen.ai must not lose the generation that is already paid
+// for — the client would only ask for it again (Qwen2API-03v).
+const MAX_SILENT_POLLS = 2
+
+/**
+ * qwen.ai's silence from one poll to the next of a request. A poll answered —
+ * done or not done, by qwen.ai itself — starts the count over.
+ * @returns {{skipped: function(Error): boolean, answered: function(): void}}
+ */
+const pollSilence = () => {
+    let inARow = 0
+    return {
+        // Whether the poll that failed as `error` went unanswered: counted,
+        // said in the log, and the caller is on to its next poll as after
+        // "not done". False for anything else — the worker's refusal, and the
+        // silence past the allowance — which is the caller's to fail with.
+        skipped: error => {
+            if (!isPollSilence(error)) return false
+            inARow += 1
+            if (inARow > MAX_SILENT_POLLS) {
+                logger.warn(`опрос не отвечен ${inARow} раза подряд: qwen.ai молчит (${error.workerCode}) — запрос завершается отказом`, 'CHAT')
+                return false
+            }
+            logger.warn(`опрос пропущен: qwen.ai молчит через страницу (${error.workerCode}), ${inARow} из ${MAX_SILENT_POLLS} подряд`, 'CHAT')
+            return true
+        },
+        answered: () => {
+            inARow = 0
+        }
+    }
+}
+
 /**
  * 解析图片生成结果链接
  * @param {*} responseData - 上游响应
@@ -1197,8 +1242,18 @@ const resolveImageResultContentUrl = async (responseData, chatID, token, account
     if (!contentUrl && chatID) {
         logger.info(`图片上游未直接返回链接，尝试从聊天详情补取，chat_id=${chatID} responseIDs=${JSON.stringify(responseIDs)}`, 'CHAT')
 
+        const silence = pollSilence()
         for (let attempt = 1; attempt <= 5; attempt++) {
-            const chatDetail = await getChatDetail(chatID, token, account)
+            let chatDetail
+            try {
+                chatDetail = await getChatDetail(chatID, token, account)
+            } catch (error) {
+                // qwen.ai let this lookup go by: the pause, and the next lookup, as after "not ready yet".
+                if (!silence.skipped(error)) throw error
+                await sleep(800)
+                continue
+            }
+            silence.answered()
             const extractedInfo = extractVideoInfoFromChatDetail(chatDetail, responseIDs)
             if (extractedInfo.contentUrl) {
                 contentUrl = extractedInfo.contentUrl
@@ -1241,11 +1296,27 @@ const resolveVideoResultContentUrl = async (responseStream, token, chatID, accou
     let resolvedContentUrl = upstreamContentUrl
     let resolvedTaskCandidates = [...videoTaskCandidates]
 
+    // One count of qwen.ai's silence for the whole request. Between the lookups
+    // in the chat and the polls of the task it makes no difference — a lookup
+    // is left only by an answer, which starts the count over. It runs on where
+    // a count per loop would be lost: from one task candidate to the next,
+    // when the first has been polled out to its sixtieth "not done".
+    const silence = pollSilence()
+
     if (!resolvedContentUrl && resolvedTaskCandidates.length === 0 && chatID) {
         logger.info(`视频上游未直接返回任务信息，尝试从聊天详情补取，chat_id=${chatID} responseIDs=${JSON.stringify(responseIDs)}`, 'CHAT')
 
         for (let attempt = 1; attempt <= 5; attempt++) {
-            const chatDetail = await getChatDetail(chatID, token, account)
+            let chatDetail
+            try {
+                chatDetail = await getChatDetail(chatID, token, account)
+            } catch (error) {
+                // qwen.ai let this lookup go by: the pause, and the next lookup, as after "nothing there yet".
+                if (!silence.skipped(error)) throw error
+                await sleep(1200)
+                continue
+            }
+            silence.answered()
             const extractedInfo = extractVideoInfoFromChatDetail(chatDetail, responseIDs)
 
             if (!resolvedContentUrl && extractedInfo.contentUrl) {
@@ -1284,7 +1355,16 @@ const resolveVideoResultContentUrl = async (responseStream, token, chatID, accou
         logger.info(`开始轮询视频任务ID: ${taskCandidate}`, 'CHAT')
 
         for (let i = 0; i < maxAttempts; i++) {
-            const content = await getVideoTaskStatus(taskCandidate, token, account)
+            let content
+            try {
+                content = await getVideoTaskStatus(taskCandidate, token, account)
+            } catch (error) {
+                // One poll qwen.ai let go by is one of the task's sixty, as its "not done" is.
+                if (!silence.skipped(error)) throw error
+                await sleep(delay)
+                continue
+            }
+            silence.answered()
             if (content) {
                 return content
             }
