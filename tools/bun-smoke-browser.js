@@ -164,14 +164,18 @@ function standIn() {
                 type: 'error', code, message: `In-page fetch failed (${code}).`
             })}\n`)
         }
-        // The app closing its side of the relay is how it says "stop".
-        const gone = new Promise(resolve => response.once('close', resolve))
+        // The app says "stop" by closing its side of the relay — which this stand-in does not
+        // learn: it is served by Bun, and a server on Bun that has read the request body gets
+        // no event and no flag when the client goes (2026-11-25, Bun 1.3.11 and 1.3.14). So
+        // nothing here waits for it: the scenario alone lets the rest of the answer go, and a
+        // scenario that gave up leaves the smoke without it. (When the hang-up itself must be
+        // seen, the stand-in stands in a Node process — tools/client-gone-smoke.js.)
         event({
             type: 'head', status: 200, url: call.url, redirected: false,
             headers: { 'content-type': 'text/event-stream' }, cookies: [cookie('cna', 'from-head')]
         })
         event({ type: 'chunk', data: Buffer.from(FIRST_FRAME).toString('base64') })
-        await Promise.race([hold || Promise.resolve(), gone])
+        await (hold || Promise.resolve())
         event({ type: 'chunk', data: Buffer.from(REST).toString('base64') })
         response.end(`${JSON.stringify({ type: 'end', cookies: [cookie('ssxmod_itna', 'from-end')] })}\n`)
     }
