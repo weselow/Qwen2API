@@ -24,6 +24,12 @@
  * 200, SSE, the model answered). The body and x-accel-buffering: no did not
  * rescue the XMLHttpRequest, nor did the Baxia signature; why the server
  * tells two calls with the same headers apart is not known.
+ *
+ * Since Qwen2API-xun and Qwen2API-0c6 (2026-11-26) the module also carries
+ * what is the page's own about its token — how long it has left, and the
+ * front end's call that renews it without a reload (pageTokenState,
+ * pageRefreshToken) — and what the log quotes of a whole answer that qwen.ai
+ * refused (answerNote).
  */
 
 const crypto = require('node:crypto')
@@ -415,6 +421,218 @@ const pageAbortStream = ({ registry, id, reason }) => {
     return Boolean(controller)
 }
 
+// Since Qwen2API-xun a page's token is renewed in place, by the call the page's
+// own front end makes for it (pageTokenState, pageRefreshToken below). What the
+// front end of 0.3.50 does was read off its main.js: the token of a call is the
+// one in localStorage ("token"); it is an access token of 15 minutes; the front
+// end trades it for a new one by GET /api/v2/auths/refresh on the auth host,
+// by XMLHttpRequest with the session's cookies and no Bearer, and writes the
+// answer with one function (IC) to three places at once — the state it reads
+// first ("qwen_access_token_state"), and the two keys it falls back on. It
+// makes that call only for a request of its own, when the token has less than
+// three minutes left, or after it was refused as unauthorized: never on a
+// timer. So a page that only the worker talks to keeps an expired token until
+// qwen.ai refuses a call for it.
+
+// The two functions below run in the page as their source, and carry the names
+// the front end keeps its token under as literals: the state it reads first
+// ("qwen_access_token_state"), the token ("token"), its expiry ("at_expire_time"),
+// and the mark of a session logged out ("qwen_token_logged_out_marker").
+
+/**
+ * Runs INSIDE the page. page.evaluate serializes this function by source, so
+ * it must not reference anything from this module.
+ *
+ * The page's token and how long it has left, read the way the front end's kC
+ * reads it: the state first, then the two keys it wrote before it kept a state.
+ * The token itself stays in the page.
+ *
+ * @returns {{present: boolean, msLeft: number|null, expiresAt: number|null, source: 'state'|'keys'|'jwt'|'none'}}
+ *   `present` false when the page keeps no token; `msLeft` null when how long
+ *   it lasts cannot be read
+ */
+function pageTokenState() {
+    const read = name => {
+        try {
+            return localStorage.getItem(name)
+        } catch {
+            return null
+        }
+    }
+    const expOf = token => {
+        const part = String(token || '').split('.')[1]
+        if (!part) return null
+        try {
+            const payload = JSON.parse(atob(part.replace(/-/g, '+').replace(/_/g, '/')))
+            return Number.isFinite(payload.exp) ? payload.exp * 1000 : null
+        } catch {
+            return null
+        }
+    }
+    let token = null
+    let expiresAt = null
+    let source = 'none'
+    try {
+        const state = JSON.parse(read('qwen_access_token_state') || 'null')
+        if (state && typeof state.token === 'string' && state.token && Number.isFinite(state.expiresAt)) {
+            token = state.token
+            expiresAt = state.expiresAt
+            source = 'state'
+        }
+    } catch { /* no state, or none that reads: the two keys below */ }
+    if (!token) {
+        token = read('token')
+        const written = Number(read('at_expire_time'))
+        if (token && written > 0) {
+            expiresAt = written
+            source = 'keys'
+        }
+    }
+    if (!token) return { present: false, msLeft: null, expiresAt: null, source: 'none' }
+    if (!expiresAt || expiresAt <= 0) {
+        expiresAt = expOf(token)
+        source = 'jwt'
+    }
+    return { present: true, expiresAt, msLeft: expiresAt ? expiresAt - Date.now() : null, source }
+}
+
+/**
+ * Runs INSIDE the page. page.evaluate serializes this function by source, so
+ * it must not reference anything from this module.
+ *
+ * The front end's own token refresh (main.js of 0.3.50, performHttpRefresh and
+ * the request interceptor SV): a GET on the auth host — another origin than the
+ * chat's, so the session's cookies ride along by `withCredentials` and the
+ * browser asks the host first whether it may send these headers — made as an
+ * XMLHttpRequest, with no Bearer and no body. Of its headers, what every
+ * request of the page's own API client carries; Content-Type is not among them,
+ * as axios drops it from a request that has no body. A fresh access token is
+ * the answer; it is written the way the front end's IC writes one, so that the
+ * front end's own requests find it too. Listened to with addEventListener, as
+ * pageCall listens: the page's request hooks are known to hold an answer back
+ * from the onload PROPERTIES.
+ *
+ * Nothing here goes through the front end's own interceptors, so what they do
+ * on a refusal — clear the token, mark the session logged out — is not done:
+ * the token stays as it was, and the worker decides (resident-pages.js).
+ *
+ * @param {object} options
+ * @param {string} options.url - The refresh call's address
+ * @param {number} options.timeoutMs
+ * @param {string} options.sourceId - What the written state names as its source
+ * @returns {Promise<object>} `{ ok: true, status, expiresAt, msLeft }` when the page now holds a
+ *   token with time left; else `{ ok: false, status, code, reason, message? }` with `reason` one of
+ *   'refused' (qwen.ai answered, and not with a token), 'network_error', 'timeout', 'aborted',
+ *   'page_error'. `tookMs` always. The token is never in it.
+ */
+function pageRefreshToken({ url, timeoutMs, sourceId }) {
+    return new Promise(resolve => {
+        const started = Date.now()
+        let settled = false
+        const end = result => {
+            if (settled) return
+            settled = true
+            resolve({ ...result, tookMs: Date.now() - started })
+        }
+        const expOf = token => {
+            const part = String(token || '').split('.')[1]
+            if (!part) return null
+            try {
+                const payload = JSON.parse(atob(part.replace(/-/g, '+').replace(/_/g, '/')))
+                return Number.isFinite(payload.exp) ? payload.exp * 1000 : null
+            } catch {
+                return null
+            }
+        }
+        const uuid = () => (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function')
+            ? globalThis.crypto.randomUUID()
+            : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, char => {
+                const roll = 16 * Math.random() | 0
+                return (char === 'x' ? roll : 3 & roll | 8).toString(16)
+            })
+        // What the page's own requests carry (SV), and what the page is the authority on.
+        const headers = () => {
+            let locale = null
+            try {
+                locale = localStorage.getItem('locale')
+            } catch { /* the page keeps no locale of its own */ }
+            locale = locale || navigator.language || 'en-US'
+            const withVersion = Array.from(document.scripts, script => script.src || '')
+                .find(src => /qwen-chat-fe\/\d+\.\d+\.\d+\//.test(src))
+            const version = withVersion && /qwen-chat-fe\/(\d+\.\d+\.\d+)\//.exec(withVersion)?.[1]
+            const sent = {
+                accept: 'application/json',
+                'accept-language': `${locale},${locale.split('-')[0]};q=0.9`,
+                source: 'web',
+                // The front end's own form: the date's string without the zone's name in brackets.
+                timezone: new Date().toString().replace(/\s*\(.+\)$/, ''),
+                'x-request-id': uuid()
+            }
+            if (version) sent.version = version
+            return sent
+        }
+        let xhr
+        try {
+            xhr = new XMLHttpRequest()
+        } catch (error) {
+            return end({ ok: false, status: 0, code: null, reason: 'page_error', message: String((error && error.message) || error) })
+        }
+        xhr.addEventListener('load', () => {
+            const status = xhr.status
+            let text = ''
+            try {
+                text = xhr.responseText
+            } catch { /* a hook's getter: nothing is known to have arrived */ }
+            let payload = null
+            try {
+                payload = JSON.parse(text)
+            } catch { /* not JSON: a page, or nothing */ }
+            const data = payload && typeof payload === 'object' ? payload.data : null
+            const code = (payload && typeof payload === 'object'
+                ? [payload.code, payload.data?.code, payload.error?.code, payload.error]
+                : []).find(value => typeof value === 'string' && value) || null
+            const token = data && typeof data === 'object' ? data.access_token : null
+            if (status >= 200 && status < 300 && payload?.success === true && typeof token === 'string' && token) {
+                const expiresAt = Number.isFinite(data.expires_at) && data.expires_at > 0
+                    ? data.expires_at * 1000
+                    : (expOf(token) || Date.now() + 900000)
+                if (expiresAt <= Date.now()) {
+                    return end({ ok: false, status, code, reason: 'refused', message: 'the token is already spent' })
+                }
+                try {
+                    localStorage.setItem('qwen_access_token_state', JSON.stringify({
+                        version: 1, stateId: uuid(), token, expiresAt, updatedAt: Date.now(), sourceId
+                    }))
+                    localStorage.setItem('token', token)
+                    localStorage.setItem('at_expire_time', String(expiresAt))
+                    localStorage.removeItem('qwen_token_logged_out_marker')
+                } catch (error) {
+                    return end({ ok: false, status, code: null, reason: 'page_error', message: String((error && error.message) || error) })
+                }
+                return end({ ok: true, status, expiresAt, msLeft: expiresAt - Date.now() })
+            }
+            const said = data && typeof data === 'object' ? (data.details || data.message) : null
+            end({
+                ok: false, status, code, reason: status ? 'refused' : 'network_error',
+                ...(said || payload?.message ? { message: String(said || payload.message).slice(0, 200) } : {})
+            })
+        })
+        xhr.addEventListener('error', () => end({ ok: false, status: 0, code: null, reason: 'network_error' }))
+        xhr.addEventListener('abort', () => end({ ok: false, status: 0, code: null, reason: 'aborted' }))
+        xhr.addEventListener('timeout', () => end({ ok: false, status: 0, code: null, reason: 'timeout' }))
+        try {
+            xhr.open('GET', url, true)
+            // Another origin than the page's: the session's cookies go with it only when asked for.
+            xhr.withCredentials = true
+            xhr.timeout = timeoutMs
+            for (const [name, value] of Object.entries(headers())) xhr.setRequestHeader(name, value)
+            xhr.send()
+        } catch (error) {
+            end({ ok: false, status: 0, code: null, reason: 'page_error', message: String((error && error.message) || error) })
+        }
+    })
+}
+
 // What the page reported -> worker error code. Anything else is a network
 // failure on the browser side. `page_fault`: a script of the page cut the
 // request or broke its reporting — the page's doing, neither qwen.ai's nor
@@ -449,6 +667,89 @@ function isChallengePage(headers, body) {
     if (!isHtmlAnswer(headers)) return false
     const text = Buffer.isBuffer(body) ? body.toString('utf8') : String(body || '')
     return CHALLENGE_PAGE.test(text.slice(0, CHALLENGE_HEAD_BYTES))
+}
+
+// Since Qwen2API-0c6 the worker's line about a whole answer says more of it than
+// its status. On 2026-11-26 qwen.ai refused chats/new in the body of a 200
+// ({"success":false, "code":"unauthorized"}), twice in an hour, and the line
+// read exactly like an accepted call; on 2026-11-25 it answered a file call
+// with 405, and whether the header that names a regional block was there could
+// not be told afterwards. The app classifies the answer; the log only quotes it.
+
+// Headers whose values could hold a credential never reach a log line, whatever their case.
+const PRIVATE_HEADER = /cookie|token|key|secret|authorization|session/i
+// What looks like a credential inside a body: a Bearer, a JWT.
+const CREDENTIAL = /\bBearer\s+\S+|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}/g
+// A refusal is short: a longer body than this is not looked into.
+const REFUSAL_BODY_CHARS = 256 * 1024
+const QUOTED_BODY_CHARS = 300
+const QUOTED_HEADERS = 12
+
+/** The value on one line of log, control characters and all: nothing longer than `max`. */
+// eslint-disable-next-line no-control-regex
+const quoted = (value, max) => String(value ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, max)
+
+/**
+ * The code qwen.ai refused an answer in the body with, where the app reads it
+ * (src/utils/browser-egress.js#isUnauthorized, and the front end's own reader
+ * of a punish envelope, NV): a string on the answer, on its data or on its
+ * error, or the lines of its `ret`. Null when none is there.
+ */
+function refusalCode(payload) {
+    if (!payload || typeof payload !== 'object') return null
+    const candidates = [payload.code, payload.data?.code, payload.error?.code, payload.error]
+    const code = candidates.find(value => typeof value === 'string' && value.trim())
+    if (code) return code
+    if (Array.isArray(payload.ret)) {
+        const lines = payload.ret.filter(value => typeof value === 'string' && value.trim())
+        if (lines.length) return lines.join(' | ')
+    }
+    return null
+}
+
+/**
+ * Whether a JSON answer is a refusal: it says so (success false), or it carries
+ * what only a refusal does — an error with a code, or the lines of the punish
+ * envelope qwen.ai's risk control answers with.
+ */
+function isRefusal(payload) {
+    if (!payload || typeof payload !== 'object') return false
+    if (payload.success === false) return true
+    return typeof payload.error?.code === 'string' ||
+        (Array.isArray(payload.ret) && payload.ret.some(line => typeof line === 'string' && line.trim()))
+}
+
+/**
+ * What the log says of qwen.ai's whole answer beyond its status (Qwen2API-0c6).
+ * A refusal that travels in the body of a 2xx is said by its code — that is
+ * what told an accepted call from a refused one on 2026-11-26. An answer that
+ * is no 2xx is said by its code, its headers (none that could hold a
+ * credential) and the start of its body. Whether an answer is a WAF challenge
+ * page is said beside this (server.js, CHALLENGE_NOTE), not here.
+ *
+ * @param {{status: number, headers: Object<string,string>, body: string}} answer - As fetch() returns it
+ * @returns {string} '' for an answer its status says enough of; else ' — …'
+ */
+function answerNote({ status, headers, body }) {
+    const text = String(body ?? '')
+    let payload = null
+    if (text.length <= REFUSAL_BODY_CHARS) {
+        try {
+            payload = JSON.parse(text)
+        } catch { /* not JSON: a page, or text */ }
+    }
+    const code = refusalCode(payload)
+    const notes = []
+    if (code && isRefusal(payload)) notes.push(`code ${quoted(code, 80)}`)
+    if (!(status >= 200 && status < 300)) {
+        const shown = Object.entries(headers || {})
+            .filter(([name]) => !PRIVATE_HEADER.test(name))
+            .slice(0, QUOTED_HEADERS)
+            .map(([name, value]) => `${quoted(name, 64)}=${quoted(value, 120)}`)
+        notes.push(`headers: ${shown.length ? shown.join(', ') : 'none'}`)
+        notes.push(`body: ${quoted(text.replace(CREDENTIAL, '<credential>'), QUOTED_BODY_CHARS)}`)
+    }
+    return notes.length ? ` — ${notes.join('; ')}` : ''
 }
 
 /**
@@ -521,6 +822,7 @@ function normalizeEgress(body, { chatOrigin, defaultTimeoutMs, maxTimeoutMs }) {
 }
 
 module.exports = {
-    pageCall, pageAbortStream, readFrontEndVersion, normalizeEgress, isChallengePage, isHtmlAnswer, CODE_FOR_OUTCOME,
+    pageCall, pageAbortStream, pageTokenState, pageRefreshToken, readFrontEndVersion, normalizeEgress,
+    isChallengePage, isHtmlAnswer, answerNote, CODE_FOR_OUTCOME,
     ABORT_REASON, STREAM_CHANNEL, STREAM_ABORTS, PAGE_HEADERS, CHALLENGE_HEAD_BYTES
 }

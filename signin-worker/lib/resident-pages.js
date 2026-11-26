@@ -16,11 +16,27 @@
  * calls on one page stay concurrent.
  *
  * Since Qwen2API-3ue.3 a page also carries streams (stream()): the answer is
- * relayed while it arrives, and it may take minutes. A stream is deliberately
- * NOT an in-flight call: it does not hold the page against eviction, and a
- * renewal does not wait for it. What that costs is that a page reloaded or
- * evicted meanwhile ends its streams — they fail as page_closed, the way a
- * call does when its page dies.
+ * relayed while it arrives, and may take minutes. A stream is deliberately
+ * NOT an in-flight call: it does not hold the page against eviction. What that
+ * costs is that a page evicted meanwhile ends its streams — they fail as
+ * page_closed, the way a call does when its page dies.
+ *
+ * Since Qwen2API-nch (2026-11-26) a page that is about to navigate on purpose
+ * — a renewal or a sign-in on it (exclusive), or the close before a page is
+ * opened anew or on another proxy (retire) — waits first for the streams
+ * running on it, up to streamWaitMs. Measured without a network, on the real
+ * Chromium and with the real app: a reload cuts every call on the page at
+ * once, and an answer the app had begun to hand to its client is lost to that
+ * client (a stream ends in an error frame, a whole answer is a 502). Waiting
+ * lets an answer finish; the request that asked for the reload waits too, and
+ * so do the account's new calls, which then run on the reloaded page. An
+ * eviction, which closes a page, picks one without a stream when it can.
+ *
+ * Since Qwen2API-xun (2026-11-26) the page's token is renewed in place before
+ * a call that finds it nearly spent (freshen()): by the front end's own
+ * refresh call (egress-fetch.js#pageRefreshToken), not by a reload. A reload
+ * was what the app's recovery made of every call that came after fifteen
+ * minutes without one — and it cut every stream on the page.
  *
  * Since Qwen2API-3ue.6 a WAF challenge page is recognised as what it is, at
  * once. The page's own request hooks keep an answer they take for a block away
@@ -43,11 +59,13 @@
 const fs = require('node:fs')
 const { WorkerError } = require('./worker-errors')
 const {
-    pageCall, pageAbortStream, readFrontEndVersion, isChallengePage, isHtmlAnswer, CODE_FOR_OUTCOME,
-    ABORT_REASON, STREAM_CHANNEL, STREAM_ABORTS, CHALLENGE_HEAD_BYTES
+    pageCall, pageAbortStream, pageTokenState, pageRefreshToken, readFrontEndVersion, isChallengePage, isHtmlAnswer,
+    CODE_FOR_OUTCOME, ABORT_REASON, STREAM_CHANNEL, STREAM_ABORTS, CHALLENGE_HEAD_BYTES
 } = require('./egress-fetch')
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+// How long the page gets to say what became of its token.
+const TOKEN_STATE_MS = 2000
 
 /**
  * @param {object} options
@@ -65,6 +83,23 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
  *   (re)load before a call may go out. Default 2500
  * @param {number} [options.settlePollMs] - How often it is read meanwhile. Default 250
  * @param {number} [options.settleTimeoutMs] - How long the wait may take at most. Default 20000
+ * @param {boolean} [options.pageTokenRefresh] - Whether a call first renews the page's token when it
+ *   is nearly spent (Qwen2API-xun). Default true
+ * @param {string} [options.authOrigin] - The auth host: where the front end's refresh call goes.
+ *   Default https://auth.qwen.ai
+ * @param {number} [options.tokenRefreshMarginMs] - A token with less than this left is renewed before
+ *   a call. Default 180000, the front end's own margin
+ * @param {number} [options.tokenRefreshTimeoutMs] - Budget of the refresh call. Default 10000
+ * @param {() => Promise<void>} [options.beforeTokenRefresh] - Waits for the worker's turn before a
+ *   refresh: the refreshes of every page are kept apart
+ * @param {number} [options.tokenRetryMs] - After a refresh that failed, none is tried for this long.
+ *   Default 30000
+ * @param {number} [options.tokenReadAgainMs] - What was read of the page's token stands this long at most
+ *   before it is read again. Default 60000
+ * @param {number} [options.streamWaitMs] - How long a navigation on a live page waits for the streams
+ *   running on it (Qwen2API-nch). Default 20000; 0 = it does not wait
+ * @param {() => Promise<void>} [options.beforeLoad] - Waits for the worker's turn before a page is
+ *   loaded (Qwen2API-nch, Qwen2API-ops): every load of every account is kept apart
  */
 function createResidents({
     signer,
@@ -85,6 +120,15 @@ function createResidents({
     drainMs = 5000,
     backstopMs = 5000,
     closeMs = 5000,
+    pageTokenRefresh = true,
+    authOrigin = 'https://auth.qwen.ai',
+    tokenRefreshMarginMs = 180000,
+    tokenRefreshTimeoutMs = 10000,
+    beforeTokenRefresh = async () => {},
+    tokenRetryMs = 30000,
+    tokenReadAgainMs = 60000,
+    streamWaitMs = 20000,
+    beforeLoad = async () => {},
     log = () => {},
     onHarvest = () => {},
     onCookies = () => {}
@@ -119,6 +163,25 @@ function createResidents({
         while (entry.inflight > 0 && Date.now() < deadline) await sleep(25)
     }
 
+    /**
+     * Wait for the streams running on the page, up to `streamWaitMs`
+     * (Qwen2API-nch): a navigation ends them, and what the app had begun to
+     * hand to its client is lost to that client. Only when there is something
+     * to wait for. Says how it went — the line is how a reload that waited for
+     * the page's answers is told from one that cut them.
+     * @param {object} entry
+     * @returns {Promise<{waited: number, left: number}>} how long it waited, and how many streams were still running then
+     */
+    async function waitForStreams(entry) {
+        if (!(streamWaitMs > 0) || entry.streams.size === 0) return { waited: 0, left: 0 }
+        const started = Date.now()
+        while (entry.streams.size > 0 && Date.now() - started < streamWaitMs) await sleep(25)
+        const waited = Date.now() - started
+        const left = entry.streams.size
+        log('resident-wait', `${left ? `${left} still running` : 'ended'} (waited ${waited} ms for the page's streams)`)
+        return { waited, left }
+    }
+
     /** Remove the page from the registry and close its browser (bounded). */
     function close(entry, reason, timeoutMs = closeMs) {
         if (pages.get(entry.email) === entry) pages.delete(entry.email)
@@ -138,12 +201,14 @@ function createResidents({
     }
 
     /**
-     * Close the page for good, letting its in-flight fetches finish first.
+     * Close the page for good, letting what runs on it finish first: its
+     * streams (Qwen2API-nch), then its in-flight fetches.
      * Caller holds the account lock.
      */
     async function retire(entry, reason) {
         entry.exclusive = true
         try {
+            await waitForStreams(entry)
             await drain(entry)
             await close(entry, reason)
         } finally {
@@ -191,7 +256,12 @@ function createResidents({
     /** Make room for one more page: evict the least recently used idle one. */
     async function evictForSlot() {
         if (pages.size < maxPages) return
-        const victim = [...pages.values()].filter(idle).sort((a, b) => a.lastUsed - b.lastUsed)[0]
+        // Among the idle, one with no stream running goes first, and of those
+        // the least recently used (Qwen2API-nch): a page closed takes its
+        // streams with it. When every idle page has one, it is the least
+        // recently used of them, as it always was.
+        const victim = [...pages.values()].filter(idle)
+            .sort((a, b) => Number(a.streams.size > 0) - Number(b.streams.size > 0) || a.lastUsed - b.lastUsed)[0]
         if (!victim) {
             throw new WorkerError('resident_capacity', 'Every resident page is busy; none can be evicted.')
         }
@@ -266,12 +336,16 @@ function createResidents({
      * What the page answers to a question, or null: if it cannot be asked,
      * does not answer, or does not answer within `ms`. A page that does not
      * answer is not what any wait here is for, and no wait may hang on it.
+     * @param {object} entry
+     * @param {Function} question - Runs in the page, by source
+     * @param {number} ms
+     * @param {*} [arg] - What the question is given
      */
-    async function asked(entry, question, ms) {
+    async function asked(entry, question, ms, arg) {
         let timer
         try {
             return await Promise.race([
-                Promise.resolve().then(() => entry.page.evaluate(question)).catch(() => null),
+                Promise.resolve().then(() => entry.page.evaluate(question, arg)).catch(() => null),
                 new Promise(resolve => {
                     timer = setTimeout(() => resolve(null), ms)
                     timer.unref?.()
@@ -313,6 +387,62 @@ function createResidents({
     }
 
     /**
+     * The page's token, made young enough for a call (Qwen2API-xun). The Bearer
+     * of a call is the page's own (egress-fetch.js#pageCall), an access token
+     * of fifteen minutes, and the page's front end renews it only for a
+     * request of its own — never on a timer. So a page only the worker talks
+     * to keeps an expired token, and qwen.ai refuses the first call that comes
+     * after it ran out; the app answers that with a reload of the page, which
+     * costs that request about five seconds and cuts every stream on the page.
+     *
+     * Here the call the front end makes for its token is made for it instead,
+     * and no page is reloaded: before a call, when the token has less than
+     * `tokenRefreshMarginMs` left (the front end's own margin). What was read
+     * of the page's token lately stands for a minute, or exactly as long as it
+     * leaves that margin — one question to the page per call at most.
+     *
+     * A refresh that fails costs the call its time and nothing else: the call
+     * goes out on the token there is, and a refusal is the app's recovery's to
+     * answer, as it was before (a reload, a retry). One refresh that failed is
+     * not followed by another for `tokenRetryMs`, whatever calls arrive.
+     *
+     * Caller holds the account lock: the calls of one page wait here for one
+     * refresh, and find a young token after it. Never throws but when the
+     * worker stops while it waits for its turn.
+     *
+     * @param {object} entry
+     */
+    async function freshen(entry) {
+        const now = Date.now()
+        if (now < entry.tokenCheckedUntil || now < entry.tokenRetryAt) return
+        const state = await asked(entry, pageTokenState, TOKEN_STATE_MS)
+        const left = Number.isFinite(state?.msLeft) ? state.msLeft : null
+        // How long this reading stands: a minute, or exactly as long as it leaves the margin.
+        entry.tokenCheckedUntil = Date.now() + (left === null ? tokenReadAgainMs : Math.max(0, Math.min(left - tokenRefreshMarginMs, tokenReadAgainMs)))
+        if (left === null || left >= tokenRefreshMarginMs) return
+        const queuedAt = Date.now()
+        await beforeTokenRefresh()
+        const queued = Date.now() - queuedAt
+        const wait = queued ? `, after a wait of ${queued} ms` : ''
+        const started = Date.now()
+        const answer = await asked(entry, pageRefreshToken, tokenRefreshTimeoutMs + backstopMs, {
+            url: `${authOrigin}/api/v2/auths/refresh`, timeoutMs: tokenRefreshTimeoutMs, sourceId: 'signin-worker'
+        })
+        const took = Date.now() - started
+        if (answer?.ok && Number.isFinite(answer.msLeft) && answer.msLeft > 0) {
+            entry.tokenCheckedUntil = Date.now() + Math.max(0, Math.min(answer.msLeft - tokenRefreshMarginMs, tokenReadAgainMs))
+            log('token-refresh', `ok (${took} ms, ${Math.round(answer.msLeft / 60000)} min left${wait})`)
+            return
+        }
+        // Said without what qwen.ai may have put in its message beyond its code: the message is for the app's log, when the app gets the refusal itself.
+        const why = !answer ? 'the page did not answer'
+            : answer.reason === 'refused' ? `refused, status ${answer.status}${answer.code ? `, code ${String(answer.code).slice(0, 80)}` : ''}`
+                : answer.reason
+        entry.tokenRetryAt = Date.now() + tokenRetryMs
+        log('token-refresh', `failed (${why}, ${took} ms${wait})`)
+    }
+
+    /**
      * The ready page for this account, if any.
      * @param {string} email
      */
@@ -337,9 +467,14 @@ function createResidents({
     async function acquire(email, proxy = null) {
         const current = pages.get(email)
         if (current && current.state === 'ready' && current.proxy === proxy) {
-            current.lastUsed = Date.now()
-            current.inflight++
-            return current
+            // The page's token is made young enough for the call first (Qwen2API-xun).
+            if (pageTokenRefresh) await freshen(current)
+            // Dropped while its token was seen to — a crash, a stop: opened anew below.
+            if (pages.get(email) === current && current.state === 'ready') {
+                current.lastUsed = Date.now()
+                current.inflight++
+                return current
+            }
         }
         if (current) await retire(current, current.proxy === proxy ? 'unready' : 'proxy_changed')
         if (!fs.existsSync(profileDir(email))) {
@@ -351,9 +486,17 @@ function createResidents({
         // that landed meanwhile (shutdown drops every page it can see) must
         // not be followed by a launch it cannot see.
         if (stopped) throw new WorkerError('page_closed', 'The worker is shutting down.')
+        // The page this opens is a page load like any other: it waits for the
+        // worker's turn (Qwen2API-nch, Qwen2API-ops) — here, before a browser
+        // is launched for it, so that a line of openings is not a line of
+        // browsers waiting.
+        await beforeLoad()
+        if (stopped) throw new WorkerError('page_closed', 'The worker is shutting down.')
         const entry = {
             email, proxy, context: null, page: null, state: 'opening',
-            lastUsed: Date.now(), inflight: 0, exclusive: false, polling: false, keepAlive: null
+            lastUsed: Date.now(), inflight: 0, exclusive: false, polling: false, keepAlive: null,
+            // The streams now running on it, by id; what was read of its token (freshen).
+            streams: new Set(), tokenCheckedUntil: 0, tokenRetryAt: 0
         }
         pages.set(email, entry)
         try {
@@ -379,10 +522,15 @@ function createResidents({
             entry.keepAlive = setInterval(() => { keepAlive(entry) }, keepAliveMs)
             entry.keepAlive.unref?.()
             entry.lastUsed = Date.now()
+            // Before the first call goes into it (Qwen2API-xun).
+            if (pageTokenRefresh) await freshen(entry)
             entry.inflight++
             log('resident-open', `ok (${pages.size}/${maxPages} pages, front-end ${await frontEnd(entry)})`)
             return entry
         } catch (error) {
+            // Stopping: the shutdown under way is what closes this page, and
+            // a line about a page that died would say what did not happen.
+            if (stopped) throw new WorkerError('page_closed', 'The worker is shutting down.')
             await close(entry, 'open_failed')
             throw error
         }
@@ -527,6 +675,8 @@ function createResidents({
             }
         }
         streams.set(id, live)
+        // Running on the page from here: what a navigation on it waits for (Qwen2API-nch).
+        entry.streams.add(id)
         entry.inflight--
         arm()
         const watch = watchAnswer(entry, request)
@@ -557,6 +707,7 @@ function createResidents({
                 await abort(id)
                 // Nothing the page reports from here on is relayed: the answer is out.
                 streams.delete(id)
+                entry.streams.delete(id)
                 const { body, ...head } = settled.kept
                 await live.receive({ type: 'head', ...head })
                 await live.receive({ type: 'chunk', data: body.toString('base64') })
@@ -578,6 +729,7 @@ function createResidents({
         } finally {
             clearTimeout(timer)
             streams.delete(id)
+            entry.streams.delete(id)
             watch.stop()
         }
     }
@@ -604,20 +756,33 @@ function createResidents({
      * operation closes the page: its state is unknown afterwards, and the
      * next fetch reopens it from the profile.
      *
+     * Since Qwen2API-nch (2026-11-26) the streams running on the page are
+     * waited for first (up to streamWaitMs): a navigation ends them. And the
+     * navigation itself, a page load, waits for the worker's turn like every
+     * other. The account's calls that arrive meanwhile wait on the lock, and
+     * run on the page as it is afterwards.
+     *
      * @param {object} entry
      * @param {(context: object) => Promise<object>} operation
      */
     async function exclusive(entry, operation) {
         entry.exclusive = true
         try {
+            await waitForStreams(entry)
             await drain(entry)
+            await beforeLoad()
             const result = await operation(entry.context)
             // The operation reloaded the page (or signed in on it): no call
             // goes out into it before its token has settled.
             await settle(entry)
+            // A new document: whatever was read of the page's token was the old one's.
+            entry.tokenCheckedUntil = 0
+            entry.tokenRetryAt = 0
             return result
         } catch (error) {
-            await close(entry, 'operation_failed')
+            // Stopping: the shutdown under way is what closes this page, and
+            // a line about a page that died would say what did not happen.
+            if (!stopped) await close(entry, 'operation_failed')
             throw error
         } finally {
             entry.exclusive = false

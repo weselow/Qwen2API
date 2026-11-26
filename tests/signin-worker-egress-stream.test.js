@@ -11,7 +11,7 @@ const { createResidents } = require('../signin-worker/lib/resident-pages')
 const {
     pageCall, pageAbortStream, STREAM_CHANNEL, STREAM_ABORTS, ABORT_REASON
 } = require('../signin-worker/lib/egress-fetch')
-const { pageGlobals, pageFetch, xmlHttpRequest, pageDocument } = require('./helpers/fake-xml-http-request')
+const { pageGlobals, pageFetch, pageStorage, xmlHttpRequest, pageDocument } = require('./helpers/fake-xml-http-request')
 
 // The streaming /egress (Qwen2API-3ue.3): qwen.ai's answer relayed to the app
 // as it arrives, and the app's going away aborting the fetch inside the page.
@@ -94,7 +94,7 @@ function fakeBrowser() {
       const realm = vm.createContext({})
       // Read at call time: a test re-scripts fetch while the page lives.
       const define = (name, get) => Object.defineProperty(realm, name, { get, configurable: true })
-      for (const [name, value] of Object.entries({ AbortController, setTimeout, clearTimeout, Blob, btoa, TextEncoder, URL })) {
+      for (const [name, value] of Object.entries({ AbortController, setTimeout, clearTimeout, Blob, btoa, atob, crypto, TextEncoder, URL })) {
         define(name, () => value)
       }
       define('fetch', () => pageFetch(script, page))
@@ -103,7 +103,7 @@ function fakeBrowser() {
       define('document', () => pageDocument(script))
       define('location', () => ({ href: `${CHAT}/` }))
       define('navigator', () => ({ language: script.language || 'en-US' }))
-      define('localStorage', () => ({ getItem: name => (name === 'token' && script.pageToken) || null }))
+      define('localStorage', () => pageStorage(script))
       page.realm = realm
       // What exposeFunction puts on a page: its streams report through it.
       page.exposeFunction = async (name, handler) => {
@@ -203,8 +203,9 @@ async function start(t, options) {
   const server = createServer({
     dataDir, token: 'secret', timeoutMs: 120000, maxPages: 16,
     minRenewDelayMs: 60000, keepAliveMs: 60000, drainMs: 1000, backstopMs: 5000, frontEndMs: 100, settleStableMs: 40, settlePollMs: 10, settleTimeoutMs: 300,
-    // Login pacing is signin-worker-pacing.test.js's subject.
-    minLoginIntervalMs: 1,
+    // Login pacing is signin-worker-pacing.test.js's subject. So is the queue
+    // that keeps the page loads of every account apart (Qwen2API-nch, Qwen2API-ops).
+    minLoginIntervalMs: 1, loadMinIntervalMs: 1, tokenRefreshMinIntervalMs: 1,
     ...options
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -712,7 +713,9 @@ test('a streaming /egress relays the answer as it arrives: the head, every chunk
   assert.deepEqual(await opened.next(), { type: 'end', cookies: [cookie('cna', 'live')] })
   assert.equal((await opened.next()).type, 'eof')
   assert.deepEqual(await health(), {
-    ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell'
+    ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell',
+    // Reported where a flip is verified, as the headless mode is (Qwen2API-xun, Qwen2API-nch); the queue of page loads is off in these tests.
+    pageTokenRefresh: true, streamWaitMs: 20000, loadMinIntervalMs: 1
   })
 })
 
@@ -949,11 +952,73 @@ test('the app giving up while its page is opening runs nothing there and holds n
   assert.equal(signer.contexts[0].closed, true)
 })
 
-test('a stream does not hold its page: a renewal does not wait for it', { timeout: 10000 }, async t => {
+// Since Qwen2API-nch (2026-11-26) a navigation on a live page waits for the
+// streams running on it. Measured without a network — the real worker on the
+// real Chromium, and the real app against a stand-in for it (NOTES Qwen2API-nch,
+// "26.11, 09:45 UTC"): a reload cut every call on the page at once, and an
+// answer the app had begun to hand to its client was lost to that client. A
+// stream is still no in-flight call: it does not hold the page against
+// eviction, and a stop does not wait for it.
+test('a renewal waits for the stream running on its page, and the answer reaches the app whole (Qwen2API-nch)', { timeout: 10000 }, async t => {
   const signer = fakeBrowser()
-  // drainMs is how long a renewal waits for the calls in flight. A stream
-  // may run for minutes: it must not cost the renewal even that.
-  const { streaming, post, health, dataDir } = await start(t, { signer, drainMs: 3000, minCacheSeconds: 7200 })
+  const { streaming, post, health, dataDir } = await start(t, { signer, streamWaitMs: 3000, minCacheSeconds: 7200 })
+  const email = 'renewed@example.invalid'
+  withProfile(dataDir, email)
+  const upstream = feedable()
+  signer.script.fetch = upstream.fetch
+  const opened = await streaming(email)
+  upstream.push('data: {"n":1}\n\n')
+  assert.equal((await opened.next()).type, 'chunk')
+  const renew = signer.renew
+  const reloaded = []
+  signer.renew = async context => { reloaded.push(Date.now()); return renew(context) }
+
+  const { status, lines, finishedAt } = await logged(async lines => {
+    const pending = post('/renew', { email })
+    // A moment into the wait: the page is still the one the stream runs on.
+    await new Promise(resolve => setTimeout(resolve, 200))
+    assert.equal(reloaded.length, 0, 'the renewal reloaded the page under a running stream')
+    const finishedAt = Date.now()
+    upstream.finish()
+    // Not an error frame: the answer ran to its end.
+    assert.deepEqual(kinds(await readAll(opened)), ['end'])
+    return { status: (await pending).status, lines, finishedAt }
+  })
+  assert.equal(status, 200, lines.join('\n'))
+  assert.equal(reloaded.length, 1)
+  assert.ok(reloaded[0] >= finishedAt, `the page was reloaded at ${reloaded[0] - finishedAt} ms of the stream's end`)
+  assert.ok(lines.some(line => /resident-wait ended \(waited \d+ ms for the page's streams\)$/.test(line)),
+    `the log does not say the renewal waited:\n${lines.join('\n')}`)
+  assert.equal((await health()).residentPages, 1)
+})
+
+test('a renewal waits for the streams on its page up to streamWaitMs; past it the page is reloaded and they are cut', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { streaming, post, health, dataDir } = await start(t, { signer, streamWaitMs: 300, minCacheSeconds: 7200 })
+  const email = 'patient@example.invalid'
+  withProfile(dataDir, email)
+  const upstream = feedable()
+  signer.script.fetch = upstream.fetch
+  const opened = await streaming(email)
+  upstream.push('data: {"n":1}\n\n')
+  assert.equal((await opened.next()).type, 'chunk')
+
+  // The stream does not end: the wait has its limit.
+  const since = Date.now()
+  const { status, lines } = await logged(async lines => ({ status: (await post('/renew', { email })).status, lines }))
+  assert.equal(status, 200, lines.join('\n'))
+  // Timers never fire early.
+  assert.ok(Date.now() - since >= 300, `the renewal gave up after ${Date.now() - since} ms`)
+  // The reload replaced the document the fetch ran in: the stream ends with it.
+  assert.deepEqual((await readAll(opened)).map(event => [event.type, event.code]), [['error', 'browser_error']])
+  assert.ok(lines.some(line => /resident-wait 1 still running \(waited \d+ ms for the page's streams\)$/.test(line)),
+    `the log does not say the renewal gave up waiting:\n${lines.join('\n')}`)
+  assert.equal((await health()).residentPages, 1)
+})
+
+test('a stream does not hold its page: with the wait at 0 a renewal does not wait for it', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { streaming, post, health, dataDir } = await start(t, { signer, streamWaitMs: 0, minCacheSeconds: 7200 })
   const email = 'renewed@example.invalid'
   withProfile(dataDir, email)
   const upstream = feedable()
@@ -963,12 +1028,86 @@ test('a stream does not hold its page: a renewal does not wait for it', { timeou
   assert.equal((await opened.next()).type, 'chunk')
 
   const since = Date.now()
-  const renewed = await post('/renew', { email })
-  assert.equal(renewed.status, 200)
+  const { status, lines } = await logged(async lines => ({ status: (await post('/renew', { email })).status, lines }))
+  assert.equal(status, 200, lines.join('\n'))
   assert.ok(Date.now() - since < 2000, `the renewal waited ${Date.now() - since} ms for the stream`)
-  // The reload replaced the document the fetch ran in: the stream ends with it.
   assert.deepEqual((await readAll(opened)).map(event => [event.type, event.code]), [['error', 'browser_error']])
+  assert.equal(lines.some(line => /^resident-wait /.test(line)), false, `nothing was waited for:\n${lines.join('\n')}`)
   assert.equal((await health()).residentPages, 1)
+})
+
+test('while a renewal waits for the page’s streams, the account’s calls wait too, and run on the page once it is reloaded (Qwen2API-nch)', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { streaming, post, streamCall, dataDir } = await start(t, { signer, streamWaitMs: 3000, minCacheSeconds: 7200 })
+  const email = 'queued@example.invalid'
+  withProfile(dataDir, email)
+  const upstream = feedable()
+  signer.script.fetch = upstream.fetch
+  const opened = await streaming(email)
+  upstream.push('data: {"n":1}\n\n')
+  assert.equal((await opened.next()).type, 'chunk')
+  // What reached qwen.ai, and the reload, in their order.
+  const order = []
+  const renew = signer.renew
+  signer.renew = async context => { order.push('reload'); return renew(context) }
+  signer.script.fetch = async url => { order.push(`call ${new URL(url).pathname}`); return jsonResponse({ success: true }) }
+
+  const renewal = post('/renew', { email })
+  await new Promise(resolve => setTimeout(resolve, 150))
+  // A call of the same account, while the renewal holds the page for its wait.
+  const call = post('/egress', { email, ...streamCall, stream: false })
+  await new Promise(resolve => setTimeout(resolve, 150))
+  assert.deepEqual(order, [], 'the call ran on a page that was about to be reloaded')
+  upstream.finish()
+  assert.equal((await call).status, 200)
+  assert.equal((await renewal).status, 200)
+  // The call found the page as the reload left it, not the page the stream was on.
+  assert.deepEqual(order, ['reload', 'call /api/v2/chat/completions'])
+  assert.deepEqual(kinds(await readAll(opened)), ['end'])
+})
+
+test('at the cap the page evicted is one without a stream, whatever was used last (Qwen2API-nch)', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { streaming, post, streamCall, health, dataDir } = await start(t, { signer, maxPages: 2 })
+  for (const who of ['x@example.invalid', 'y@example.invalid', 'z@example.invalid']) withProfile(dataDir, who)
+  const quiet = async () => jsonResponse({ success: true })
+  signer.script.fetch = quiet
+  assert.equal((await post('/egress', { email: 'x@example.invalid', ...streamCall, stream: false })).status, 200)
+  // y's page carries a stream...
+  const upstream = feedable()
+  signer.script.fetch = upstream.fetch
+  const opened = await streaming('y@example.invalid')
+  upstream.push('data: {"n":1}\n\n')
+  assert.equal((await opened.next()).type, 'chunk')
+  // ...and x's page was used since the stream began: by use alone, y's is the one to go.
+  signer.script.fetch = quiet
+  assert.equal((await post('/egress', { email: 'x@example.invalid', ...streamCall, stream: false })).status, 200)
+  // z arrives at the cap.
+  assert.equal((await post('/egress', { email: 'z@example.invalid', ...streamCall, stream: false })).status, 200)
+  assert.equal(signer.contexts[0].closed, true, "x's page, the one without a stream, was not the one evicted")
+  assert.equal(signer.contexts[1].closed, false, 'the page with the stream on it was evicted')
+  assert.equal((await health()).residentPages, 2)
+  upstream.finish()
+  assert.deepEqual(kinds(await readAll(opened)), ['end'])
+})
+
+test('a stop ends a renewal that waits for its turn to load with page_closed, and no page is said to have died (Qwen2API-nch)', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  // The page's own opening takes the worker's only turn for a long time: the renewal queues behind it.
+  const { post, streamCall, dataDir, server } = await start(t, { signer, loadMinIntervalMs: 60000, minCacheSeconds: 7200 })
+  const email = 'stopping@example.invalid'
+  withProfile(dataDir, email)
+  assert.equal((await post('/egress', { email, ...streamCall, stream: false })).status, 200)
+  const renewal = post('/renew', { email })
+  await new Promise(resolve => setTimeout(resolve, 150))
+  const { answer, lines } = await logged(async lines => {
+    await server.workerShutdown()
+    const response = await renewal
+    return { answer: { status: response.status, body: await response.json() }, lines }
+  })
+  assert.deepEqual(answer, { status: 502, body: { code: 'page_closed', message: 'The worker is shutting down.' } })
+  assert.equal(lines.some(line => /^resident-close (operation_failed|open_failed) /.test(line)), false,
+    `a page was said to have died while the worker was stopping:\n${lines.join('\n')}`)
 })
 
 test('a stream does not hold its page: at the cap the page makes room, and its stream ends', { timeout: 10000 }, async t => {
@@ -1397,4 +1536,53 @@ test('a chunk after a long silence, taken slowly by the app, is not a hung page'
   take()
   assert.deepEqual(await done, { cookies: [], aborted: false })
   assert.equal(signer.contexts[0].closed, false)
+})
+
+// Since Qwen2API-xun (2026-11-26; the page's token is signin-worker-egress.test.js's
+// subject): a stream is sent on the page's token like any other call, so that
+// token is renewed first when it is nearly spent.
+test('Qwen2API-xun: a stream on a page whose token is nearly spent is sent on the renewed token', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { streaming, dataDir } = await start(t, { signer })
+  const email = 'idle@example.invalid'
+  withProfile(dataDir, email)
+  // What the front end keeps of a token a minute from its end (main.js, IC).
+  const expiresAt = Date.now() + 60000
+  signer.script.storage = {
+    qwen_access_token_state: JSON.stringify({ version: 1, stateId: 'the-page', token: 'spent-access-token', expiresAt, updatedAt: 0, sourceId: 'page' }),
+    token: 'spent-access-token',
+    at_expire_time: String(expiresAt)
+  }
+  const renewals = []
+  const answer = () => Promise.resolve(new Response(new ReadableStream({
+    start(stream) {
+      stream.enqueue(new TextEncoder().encode('data: [DONE]\n\n'))
+      stream.close()
+    }
+  }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+  signer.script.fetch = (url, init) => {
+    if (url === 'https://auth.qwen.ai/api/v2/auths/refresh') {
+      renewals.push(Date.now())
+      return jsonResponse({
+        success: true, data: { access_token: 'renewed-access-token', expires_at: Math.floor(Date.now() / 1000) + 900 }
+      })
+    }
+    return answer()
+  }
+
+  // As the app makes the call: no Bearer of its own — the page’s token is the one sent (Qwen2API-jr9).
+  const opened = await streaming(email, { headers: { 'content-type': 'application/json' } })
+  // The refresh went out from the page, as the front end makes it — an XMLHttpRequest to the auth host, the session's cookies asked for...
+  assert.equal(renewals.length, 1)
+  assert.equal(signer.script.xhrs.length, 1)
+  const [refresh] = signer.script.xhrs
+  assert.equal(refresh.sent.url, 'https://auth.qwen.ai/api/v2/auths/refresh')
+  assert.equal(refresh.withCredentials, true)
+  // ...and the stream, which is a fetch, on what it brought.
+  assert.equal(signer.script.fetches.length, 1)
+  const [stream] = signer.script.fetches
+  assert.equal(stream.sent.init.headers.authorization, 'Bearer renewed-access-token')
+  assert.deepEqual(kinds(await readAll(opened)), ['data: [DONE]\n\n', 'end'])
+  // No page was reloaded for any of it.
+  assert.equal(signer.calls.filter(call => call.op === 'renew').length, 1)
 })

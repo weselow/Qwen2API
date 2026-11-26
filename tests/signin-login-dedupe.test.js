@@ -153,3 +153,22 @@ test('both compose stacks forward the login queue to the worker and the call bud
       `${file}: the app does not get SIGNIN_WORKER_TIMEOUT_MS`)
   }
 })
+
+test('both compose stacks forward the page settings of 2026-11-26 to the worker, each with its default', () => {
+  // Qwen2API-xun, Qwen2API-nch and Qwen2API-ops: each of these is there to be
+  // changed on prod without a rebuild — the refresh of a page's token switched
+  // off in a deployed image, a wait shortened or lengthened — so each has to
+  // reach the worker through Compose, or it silently does nothing.
+  for (const file of ['docker-compose.signin.yml', 'docker-compose.prod.yml']) {
+    const { services } = parse(fs.readFileSync(require.resolve(`../docker/${file}`), 'utf8'))
+    const environment = services['signin-worker'].environment
+    for (const entry of [
+      'SIGNIN_PAGE_TOKEN_REFRESH=${SIGNIN_PAGE_TOKEN_REFRESH:-true}',
+      'SIGNIN_TOKEN_REFRESH_MIN_INTERVAL_MS=${SIGNIN_TOKEN_REFRESH_MIN_INTERVAL_MS:-2000}',
+      'RESIDENT_STREAM_WAIT_MS=${RESIDENT_STREAM_WAIT_MS:-20000}',
+      'RESIDENT_LOAD_MIN_INTERVAL_MS=${RESIDENT_LOAD_MIN_INTERVAL_MS:-10000}'
+    ]) {
+      assert.ok(environment.includes(entry), `${file}: the worker does not get ${entry}`)
+    }
+  }
+})

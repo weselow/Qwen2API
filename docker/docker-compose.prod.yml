@@ -79,6 +79,18 @@ services:
       # as jitter): batched sign-ins from one IP feed the Baxia score.
       - SIGNIN_LOGIN_MIN_INTERVAL_MS=${SIGNIN_LOGIN_MIN_INTERVAL_MS:-30000}
       - SIGNIN_LOGIN_MAX_WAIT_MS=${SIGNIN_LOGIN_MAX_WAIT_MS:-120000}
+      # Since 2026-11-26 (Qwen2API-xun, Qwen2API-nch, Qwen2API-ops), for many accounts.
+      # A page's token is renewed in place before a call that finds it nearly spent, instead
+      # of the page being reloaded for the refused call; false = off, and a refusal is the
+      # app's recovery's alone. The refreshes of every page start at least this far apart; 1 = not kept apart.
+      - SIGNIN_PAGE_TOKEN_REFRESH=${SIGNIN_PAGE_TOKEN_REFRESH:-true}
+      - SIGNIN_TOKEN_REFRESH_MIN_INTERVAL_MS=${SIGNIN_TOKEN_REFRESH_MIN_INTERVAL_MS:-2000}
+      # A navigation on a live page (a renewal, a sign-in) waits this long for the streams
+      # running on it, which a reload cuts; 0 = it does not wait.
+      - RESIDENT_STREAM_WAIT_MS=${RESIDENT_STREAM_WAIT_MS:-20000}
+      # Every page load of every account (a lazy open, a renewal, a sign-in) starts this far
+      # from the previous one, plus up to the same again as jitter; 1 = no queue.
+      - RESIDENT_LOAD_MIN_INTERVAL_MS=${RESIDENT_LOAD_MIN_INTERVAL_MS:-10000}
     # One Chromium profile per account; keep them on a volume so auth.qwen.ai
     # sessions survive restarts and renewal stays a silent reload.
     volumes:
