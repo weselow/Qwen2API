@@ -34,11 +34,12 @@
 const assert = require('node:assert/strict')
 const { spawn } = require('node:child_process')
 const { createServer } = require('node:http')
-const { chmod, copyFile, mkdir, mkdtemp, rm, writeFile } = require('node:fs/promises')
+const { chmod, copyFile, mkdir, mkdtemp, writeFile } = require('node:fs/promises')
 const { tmpdir } = require('node:os')
 const path = require('node:path')
 const { parseArgs } = require('node:util')
 const { setTimeout: delay } = require('node:timers/promises')
+const { discardTemporaryDirectory } = require('./remove-directory')
 
 const API_KEY = 'client-gone-smoke-key'
 // The heavy endpoints take 30 requests a minute, per key (src/middlewares/authorization.js):
@@ -577,7 +578,8 @@ async function main() {
     if (application && application.exitCode === null && application.signalCode === null) application.kill('SIGKILL')
     if (applicationClosed) await applicationClosed
     await closeListener(standIn)
-    await rm(temporaryDirectory, { recursive: true, force: true })
+    // Not a check: a directory Windows still holds is left, and said — not failed over (Qwen2API-3ue.13).
+    await discardTemporaryDirectory(temporaryDirectory)
   }
 }
 

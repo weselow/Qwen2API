@@ -43,10 +43,11 @@
 const assert = require('node:assert/strict')
 const { randomUUID } = require('node:crypto')
 const { createServer } = require('node:http')
-const { mkdir, mkdtemp, readFile, rm, writeFile } = require('node:fs/promises')
+const { mkdir, mkdtemp, readFile, writeFile } = require('node:fs/promises')
 const { tmpdir } = require('node:os')
 const path = require('node:path')
 const { setTimeout: delay } = require('node:timers/promises')
+const { discardTemporaryDirectory } = require('./remove-directory')
 
 const API_KEY = 'bun-smoke-browser-key'
 const WORKER_TOKEN = 'bun-smoke-browser-worker-token'
@@ -459,7 +460,8 @@ async function run({ startApplication, stopApplication, disposeApplication, bina
     } finally {
         if (application) await disposeApplication(application)
         await closeListener(worker.server)
-        await rm(temporaryDirectory, { recursive: true, force: true })
+        // Not a check: a directory Windows still holds is left, and said — not failed over (Qwen2API-3ue.13).
+        await discardTemporaryDirectory(temporaryDirectory)
     }
 }
 
