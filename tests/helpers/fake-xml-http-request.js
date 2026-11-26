@@ -24,7 +24,12 @@
  *                                                 whose scripts show no version
  *   language   string                            the page's language (navigator.language)
  *   pageToken  string                            the session token the page keeps (localStorage.token)
- *   xhrs       XMLHttpRequest[]                  every XMLHttpRequest the page made, newest last
+ *   storage    object                            what the page keeps in localStorage besides: a test may seed it
+ *                                                 (the token's expiry, the front end's state), and reads here what the
+ *                                                 front end's token refresh wrote (Qwen2API-xun)
+ *   xhrs       XMLHttpRequest[]                  every XMLHttpRequest the page made, newest last; `sent` says what it
+ *                                                 was asked — the address, the headers, whether the session's cookies
+ *                                                 were wanted (`withCredentials`), its budget (`timeout`)
  *   fetches    object[]                          every fetch the page made, newest last: `sent` is what
  *                                                 it was asked (the address, and init as the call
  *                                                 made it), `aborted` whether its signal was
@@ -47,13 +52,31 @@ function pageGlobals(script, page = null) {
         XMLHttpRequest: xmlHttpRequest(script, page),
         fetch: pageFetch(script, page),
         TextEncoder,
+        // What a page gives the front end's own token refresh (Qwen2API-xun): its reader of a JWT, and its source of ids.
+        atob: value => atob(value),
+        crypto: globalThis.crypto,
         URL,
         location: { href: `${CHAT}/` },
         navigator: { get language() { return script.language || 'en-US' } },
-        // What the page keeps in localStorage: its session's token, when it has one.
-        localStorage: { getItem: name => (name === 'token' && script.pageToken) || null },
+        localStorage: pageStorage(script),
         document: pageDocument(script)
     }
+}
+
+/**
+ * What the page keeps in localStorage. Its session's token, when it has one
+ * (`script.pageToken`), and whatever a call wrote there: the front end's token
+ * refresh writes the token and its expiry back (Qwen2API-xun), where the call
+ * that follows reads them. What was written is in `script.storage`, a plain
+ * object, for a test to seed or to read.
+ */
+function pageStorage(script) {
+  const entries = () => (script.storage ||= {})
+  return {
+    getItem: name => (Object.hasOwn(entries(), name) ? entries()[name] : name === 'token' ? script.pageToken || null : null),
+    setItem(name, value) { entries()[name] = String(value) },
+    removeItem(name) { delete entries()[name] }
+  }
 }
 
 /**
@@ -118,6 +141,13 @@ function xmlHttpRequest(script, page) {
         setRequestHeader(name, value) {
             this.sent.headers[name.toLowerCase()] = value
         }
+
+        // What a call asks the browser for on a request: the session's cookies even to another
+        // origin (the front end's token refresh does, Qwen2API-xun), and a budget of its own.
+        set withCredentials(value) { this.sent.withCredentials = value }
+        get withCredentials() { return Boolean(this.sent.withCredentials) }
+        set timeout(value) { this.sent.timeout = value }
+        get timeout() { return this.sent.timeout }
 
         get responseText() {
             // As the browser's does before the first of the body: nothing.
@@ -297,4 +327,4 @@ function pageFetch(script, page) {
     }
 }
 
-module.exports = { pageGlobals, pageFetch, xmlHttpRequest, pageDocument }
+module.exports = { pageGlobals, pageFetch, pageStorage, xmlHttpRequest, pageDocument }

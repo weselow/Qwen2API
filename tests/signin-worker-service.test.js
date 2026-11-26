@@ -50,13 +50,17 @@ async function listen(server) {
   }
 }
 
+// Each server here has the queue off that keeps the page loads of every
+// account apart (Qwen2API-nch): signin-worker-pacing.test.js measures it.
+const worker = options => createServer({ loadMinIntervalMs: 1, ...options })
+
 test('signin worker serves acquired sessions, silent renewals and structured failures', async t => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwen-signin-worker-'))
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }))
 
   // 1. Happy path: acquire, then a cached renew that never touches the browser.
   const signer = fakeSigner()
-  const server = createServer({ signer, dataDir, token: 'secret', minRenewDelayMs: 50 })
+  const server = worker({ signer, dataDir, token: 'secret', minRenewDelayMs: 50 })
   const api = await listen(server)
   t.after(() => new Promise(resolve => server.close(resolve)))
 
@@ -100,7 +104,7 @@ test('signin worker serves acquired sessions, silent renewals and structured fai
   const rejected = fakeSigner({
     signin: () => { const error = new Error('Qwen rejected the credentials.'); error.code = 'invalid_credentials'; throw error }
   })
-  const rejectServer = createServer({ signer: rejected, dataDir })
+  const rejectServer = worker({ signer: rejected, dataDir })
   const rejectApi = await listen(rejectServer)
   t.after(() => new Promise(resolve => rejectServer.close(resolve)))
   const refused = await rejectApi.post('/session', { email: 'b@example.invalid', password: 'wrong' })
@@ -111,7 +115,7 @@ test('signin worker serves acquired sessions, silent renewals and structured fai
   // persisted profile directory is what authorizes /renew without a password.
   const profileHash = crypto.createHash('sha256').update('a@example.invalid').digest('hex').slice(0, 32)
   fs.mkdirSync(path.join(dataDir, 'account-' + profileHash), { recursive: true })
-  const restarted = createServer({ signer, dataDir })
+  const restarted = worker({ signer, dataDir })
   const restartApi = await listen(restarted)
   t.after(() => new Promise(resolve => restarted.close(resolve)))
   const live = await restartApi.post('/renew', { email: 'a@example.invalid', proxy: 'http://p:8080' })
@@ -130,7 +134,7 @@ test('signin worker serves acquired sessions, silent renewals and structured fai
     renew: ({ generation }) => ({ token: `short-renewed-${generation}`, exp: Math.floor(Date.now() / 1000) + 3600,
       cookies: [{ name: 'cna', value: 'r', domain: 'chat.qwen.ai', path: '/' }] })
   })
-  const timerServer = createServer({ signer: shortTtl, dataDir, minRenewDelayMs: 20, renewFraction: 0.5 })
+  const timerServer = worker({ signer: shortTtl, dataDir, minRenewDelayMs: 20, renewFraction: 0.5 })
   const timerApi = await listen(timerServer)
   t.after(() => new Promise(resolve => timerServer.close(resolve)))
   const short = await timerApi.post('/session', { email: 't@example.invalid', password: 'pw' })
@@ -168,7 +172,7 @@ test('signin worker serializes browser launches per account profile', async t =>
   const profileHash = crypto.createHash('sha256').update(email).digest('hex').slice(0, 32)
   const expectedDir = path.join(dataDir, 'account-' + profileHash)
   fs.mkdirSync(expectedDir, { recursive: true })
-  const server = createServer({ signer, dataDir, minRenewDelayMs: 60000, minLoginIntervalMs: 1 })
+  const server = worker({ signer, dataDir, minRenewDelayMs: 60000, minLoginIntervalMs: 1 })
   const api = await listen(server)
   t.after(() => new Promise(resolve => server.close(resolve)))
 

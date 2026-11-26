@@ -19,6 +19,15 @@
  * a fetch with the page's headers, with SSE. The worker's stream is that
  * fetch — made the old way, it gets the challenge here.
  *
+ * Since Qwen2API-xun, Qwen2API-nch and Qwen2API-ops (2026-11-26): a page's
+ * token nearly spent is renewed in place by the front end's own refresh call —
+ * a cross-origin XMLHttpRequest from the page to the auth host, which the
+ * stand-in plays from ANOTHER loopback address (127.0.0.2), with the browser's
+ * preflight and its rule about credentials, as on chat.qwen.ai → auth.qwen.ai;
+ * a renewal waits for the streams on its page, up to its limit; the page loads
+ * of two accounts take turns. (Not what qwen.ai makes of that call: it is
+ * never asked.)
+ *
  * qwen.ai is never contacted: run this freely, it is not a live probe. Use it
  * after touching the worker's browser paths: signin-worker/server.js (the
  * sign-in path), lib/login-pacer.js, lib/resident-pages.js,
@@ -82,6 +91,9 @@ function pageHook(strict) {
         // What tells the stand-in this went out as an XMLHttpRequest. How the
         // real server tells one from a fetch is not known.
         this.setRequestHeader('x-stub-transport', 'xhr')
+        // Whether the session's cookies were asked for: what the front end's
+        // refresh asks on a request to another origin (Qwen2API-xun).
+        this.setRequestHeader('x-stub-credentials', String(this.withCredentials))
         // An answer taken for a block is never told to these.
         for (const name of ['onload', 'onloadend']) {
             const own = this[name]
@@ -148,21 +160,64 @@ function sseFrames(res) {
  */
 function startStandIn() {
     let pageLoads = 0
+    // When each load of the root page was asked for: page loads take turns since Qwen2API-nch.
+    const pageLoadTimes = []
     // What /api/sse-long saw when its client went away — which, for a relay,
     // is the fetch inside the page being aborted.
     const longStream = { sent: 0, closedAt: 0 }
     // What the third-party frame saw of itself, the last time it loaded.
     const frame = { document: null, request: null, page: null }
-    // Whether the page loaded next hides blocked answers from listeners too.
-    const state = { holdListeners: false }
+    // Whether the page loaded next hides blocked answers from listeners too,
+    // and how many seconds the token it keeps has left.
+    const state = { holdListeners: false, tokenSeconds: 3600 }
     // The last completions the stand-in was asked for: how it went out.
     const completions = { last: null }
+    // The auth host for the front end's token refresh (Qwen2API-xun), which
+    // the "other" site plays: another loopback address, so another site to the
+    // browser — as auth.qwen.ai is to chat.qwen.ai. `refresh` is what it
+    // answers the next refresh with; every refresh it was asked is written down.
+    const auth = { refresh: 'ok', asked: [], preflights: 0, token: null }
     const other = http.createServer((req, res) => {
         if (req.url === '/frame' && req.method === 'GET') {
             frame.document = req.headers['user-agent'] || null
-            res.writeHead(200, { 'content-type': 'text/html' })
+            // A cookie the session's refresh is known by, as auth.qwen.ai's must
+            // be for a call made from chat.qwen.ai: one a request from another
+            // site is allowed to carry.
+            res.writeHead(200, {
+                'content-type': 'text/html',
+                'set-cookie': 'standin_auth=1; Path=/; SameSite=None; Secure'
+            })
             return res.end(`<html><body>frame<script>fetch('/api/echo',{method:'POST',headers:{
                 'content-type':'application/json'},body:JSON.stringify({userAgent:navigator.userAgent})})</script></body></html>`)
+        }
+        if (req.url === '/api/v2/auths/refresh') {
+            // What the browser asks first of a request to another origin with
+            // headers of its own: whether it may send them, and with the
+            // session's cookies.
+            if (req.method === 'OPTIONS') {
+                auth.preflights++
+                res.writeHead(204, {
+                    'access-control-allow-origin': `http://127.0.0.1:${server.address().port}`,
+                    'access-control-allow-credentials': 'true',
+                    'access-control-allow-methods': 'GET',
+                    'access-control-allow-headers': req.headers['access-control-request-headers'] || ''
+                })
+                return res.end()
+            }
+            auth.asked.push({ method: req.method, headers: req.headers, at: Date.now() })
+            const allowed = {
+                'access-control-allow-origin': `http://127.0.0.1:${server.address().port}`,
+                'access-control-allow-credentials': 'true',
+                'content-type': 'application/json'
+            }
+            // qwen.ai refusing the session: as the front end is refused, under 401.
+            if (auth.refresh === 'refused') {
+                res.writeHead(401, allowed)
+                return res.end(JSON.stringify({ success: false, data: { code: 'unauthorized', details: 'stub refusal' } }))
+            }
+            auth.token = tokenExpiringIn(900)
+            res.writeHead(200, allowed)
+            return res.end(JSON.stringify({ success: true, data: { access_token: auth.token, expires_at: Math.floor(Date.now() / 1000) + 900 } }))
         }
         if (req.url === '/api/echo' && req.method === 'POST') {
             frame.request = req.headers['user-agent'] || null
@@ -180,14 +235,23 @@ function startStandIn() {
     const server = http.createServer((req, res) => {
         if (req.url === '/' && req.method === 'GET') {
             pageLoads++
+            pageLoadTimes.push(Date.now())
+            // How the front end keeps a token once its refresh wrote it (main.js of 0.3.50, IC):
+            // the state it reads first, and the two keys it falls back on. `state.tokenSeconds`
+            // is how long the page's token has left: the default is an hour; a test makes it less.
+            const expiresAt = Date.now() + state.tokenSeconds * 1000
+            const token = tokenExpiringIn(state.tokenSeconds)
+            const kept = `localStorage.setItem('token', '${token}');localStorage.setItem('at_expire_time', '${expiresAt}');` +
+                `localStorage.setItem('qwen_access_token_state', JSON.stringify({version:1,stateId:'stand-in',token:'${token}',expiresAt:${expiresAt},updatedAt:0,sourceId:'page'}))`
+            // What the page keeps now: a call that brings no Bearer goes out on it.
+            state.pageToken = token
             res.writeHead(200, {
                 'content-type': 'text/html', 'set-cookie': 'standin=1; Path=/',
                 // So that the calls the page makes carry the hints a guard can ask for.
                 'accept-ch': 'Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List'
             })
             return res.end(`<html><body>stand-in<iframe src="http://127.0.0.2:${
-                other.address().port}/frame" style="width:0;height:0;border:0"></iframe><script>localStorage.setItem('token', '${
-                tokenExpiringIn(3600)}')</script></body></html>`.replace(
+                other.address().port}/frame" style="width:0;height:0;border:0"></iframe><script>${kept}</script></body></html>`.replace(
                 '<script>localStorage', `<script src="/scripts/qwen-chat-fe/0.3.50/js/index.js"></script>` +
                 `<script>(${pageHook})(${state.holdListeners})</script><script>localStorage`))
         }
@@ -205,6 +269,7 @@ function startStandIn() {
             // it settles a token right there. Long-lived, so the worker's
             // session cache counts it as live next to the smoke's minCacheSeconds.
             pageLoads++
+            pageLoadTimes.push(Date.now())
             res.writeHead(200, { 'content-type': 'text/html', 'set-cookie': 'standin=1; Path=/' })
             return res.end(`<html><body>auth stand-in<script>localStorage.setItem('token', '${
                 tokenExpiringIn(30 * 86400)}')</script></body></html>`)
@@ -310,11 +375,13 @@ function startStandIn() {
         other,
         origin: `http://127.0.0.1:${server.address().port}`,
         pageLoads: () => pageLoads,
+        pageLoadTimes,
         state,
         completions,
         longStream,
-        frame
-    }))));
+        frame,
+        auth
+    }))))
 }
 
 // What the worker logs while `fn` runs — as it runs.
@@ -351,7 +418,15 @@ async function main() {
         // Short enough for a smoke, long enough to be seen: the second full
         // sign-in below has to wait for its slot.
         minLoginIntervalMs: 5000,
-        egressMaxBytes: 4096
+        egressMaxBytes: 4096,
+        // The queue that keeps the page loads of every account apart, and the
+        // turns of the pages' token refreshes, are off here: both are measured
+        // in tests, and the queue once more below, with two accounts
+        // (Qwen2API-nch, Qwen2API-ops). The auth host a page renews its token
+        // on is the stand-in's other site (Qwen2API-xun).
+        loadMinIntervalMs: 1,
+        tokenRefreshMinIntervalMs: 1,
+        authOrigin: `http://127.0.0.2:${standIn.other.address().port}`
     })
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
     const { port } = server.address()
@@ -703,24 +778,34 @@ async function main() {
             'no piece ended inside a multi-byte character')
         console.log(`ok stream, wide characters: ${wideBytes.length} pieces of 7 bytes, two-, three- and four-byte characters whole`)
 
-        // A stream does not pin the page: a live renewal reloads it without
-        // waiting, and the stream ends.
-        const during = await relay({ url: '/api/sse-long' })
+        // Since Qwen2API-nch a renewal waits for the streams on its page: the
+        // answer reaches the app whole, and the page is reloaded after it.
+        // (Before, the reload went through the stream, and the app's client
+        // got an error frame for an answer it had begun to read.) Measured
+        // without a network on 2026-11-26: NOTES Qwen2API-nch.
+        const loadsBeforeTheWait = standIn.pageLoads()
+        const during = await relay()
         assert.equal((await during.next()).type, 'head')
-        await during.next()
-        const loadsBefore = standIn.pageLoads()
         const renewStarted = Date.now()
-        const whileStreaming = await call('/renew', { email })
-        assert.equal(whileStreaming.status, 200, JSON.stringify(whileStreaming.body))
-        assert.equal(standIn.pageLoads(), loadsBefore + 1)
-        assert.ok(Date.now() - renewStarted < 4500, 'the renewal waited for the stream')
-        const ended = await during.next()
-        assert.equal(ended.type, 'error', JSON.stringify(ended))
-        // The document left from under the fetch: what /egress always
-        // called a page that merely navigated.
-        assert.equal(ended.code, 'browser_error')
+        const whileStreaming = await logged(async lines => ({
+            lines, answer: await call('/renew', { email })
+        }))
+        assert.equal(whileStreaming.answer.status, 200, JSON.stringify(whileStreaming.answer.body))
+        // Three frames and the end, not an error: the stream was over before the page was reloaded.
+        // (drain() stops at the end without keeping it: what is read here is everything, the end included.)
+        const rest = []
+        for (;;) {
+            const event = await during.next()
+            rest.push(event)
+            if (event.type === 'end' || event.type === 'eof') break
+        }
+        assert.deepEqual(rest.map(event => event.type), ['chunk', 'chunk', 'chunk', 'end'],
+            `${whileStreaming.lines.join('\n')}\n${JSON.stringify(rest.map(event => ({ ...event, data: undefined, cookies: undefined })))}`)
+        assert.ok(standIn.pageLoads() >= loadsBeforeTheWait + 1, 'the renewal did not reload the page')
+        assert.ok(whileStreaming.lines.some(line => /resident-wait ended \(waited \d+ ms for the page's streams\)$/.test(line)),
+            whileStreaming.lines.join('\n'))
         assert.equal((await health()).residentPages, 1)
-        console.log(`ok stream vs renewal: the renewal did not wait for the stream (${Date.now() - renewStarted} ms); the stream ended as browser_error`)
+        console.log(`ok stream vs renewal: the renewal waited for the stream (${Date.now() - renewStarted} ms), the answer reached the app whole, the page was reloaded after it`)
 
         // A live renewal on the account reloads the resident page. A second
         // launch on the same profile would hit Chromium's profile lock and
@@ -766,6 +851,80 @@ async function main() {
         assert.equal((await afterNavigations.next()).type, 'chunk')
         console.log('ok stream after navigation: the channel survived the reloads')
 
+        // Since Qwen2API-xun a page's token that is nearly spent is renewed in
+        // place, by the front end's own call from the page to the auth host:
+        // no page is reloaded, and the call goes out on the renewed token. The
+        // page is given a token with a minute of it left — as one is after
+        // fourteen minutes without a renewal — and then called. (What qwen.ai
+        // makes of that call is not asked here: the stand-in answers it.)
+        standIn.state.tokenSeconds = 60
+        assert.equal((await call('/renew', { email, force: true })).status, 200)
+        const loadsBeforeTheRenewal = standIn.pageLoads()
+        const { answer: onRenewedToken, lines: tokenLines } = await logged(async lines => ({
+            lines, answer: await egress({ headers: { 'content-type': 'application/json' } })
+        }))
+        assert.equal(onRenewedToken.status, 200, JSON.stringify(onRenewedToken.body))
+        assert.equal(standIn.auth.asked.length, 1, 'the page did not make exactly one refresh call')
+        assert.equal(standIn.pageLoads(), loadsBeforeTheRenewal, 'a page was loaded to renew a token')
+        // What reached the auth host from a real Chromium: the browser asked
+        // first whether it might send these headers, and with the session's
+        // cookies — the preflight a request to another origin gets...
+        assert.equal(standIn.auth.preflights, 1)
+        const refresh = standIn.auth.asked[0]
+        assert.equal(refresh.method, 'GET')
+        assert.equal(refresh.headers['x-stub-transport'], 'xhr', 'the front end makes the refresh as an XMLHttpRequest')
+        assert.equal(refresh.headers['x-stub-credentials'], 'true', 'the session’s cookies were not asked for')
+        // ...and the page's request hook signed it as one of the page's own.
+        assert.equal(refresh.headers['x-stub-v'], '2.5.37')
+        // No Bearer — the front end's interceptor sets none for /auths/refresh —
+        // no Content-Type, which axios drops from a request without a body, and
+        // no origin, which the front end sets for everything but /auths/*.
+        for (const name of ['authorization', 'content-type', 'x-request-origin']) {
+            assert.equal(refresh.headers[name], undefined, `${name} was sent`)
+        }
+        assert.equal(refresh.headers.accept, 'application/json')
+        assert.equal(refresh.headers['accept-language'], 'en-US,en;q=0.9')
+        assert.equal(refresh.headers.source, 'web')
+        assert.equal(refresh.headers.version, '0.3.50')
+        assert.match(refresh.headers.timezone, /^\S{3} \S{3} \d\d \d{4} \d\d:\d\d:\d\d GMT[+-]\d{4}$/)
+        assert.match(refresh.headers['x-request-id'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+        assert.equal(refresh.headers.origin, standIn.origin)
+        // The session's cookies of that origin went along — the cookie was
+        // made for it (SameSite=None, as a session of the auth host has to be
+        // for a call from the chat's pages): withCredentials asked for them.
+        assert.match(refresh.headers.cookie || '', /(^|;\s*)standin_auth=1/,
+            'the session’s cookies of the auth origin did not go along with the refresh')
+        // The page keeps what it was answered, as the front end writes a token: the call after it carries the renewed one.
+        assert.ok(standIn.auth.token.startsWith('eyJ'))
+        assert.equal(JSON.parse(onRenewedToken.body.body).authorization, `Bearer ${standIn.auth.token}`)
+        assert.notEqual(standIn.auth.token, standIn.state.pageToken)
+        assert.ok(tokenLines.some(line => /token-refresh ok \(\d+ ms, 15 min left\)$/.test(line)), tokenLines.join('\n'))
+        console.log(`ok page token: renewed in place by the front end's own call to another origin — the browser's preflight answered, ` +
+            `the session’s cookies of that origin went along, the page's hook signed it; the call went out on the renewed token, no page loaded`)
+
+        // A refresh that is refused costs the call its time and nothing else:
+        // the call goes out on the token the page had, and the app's recovery
+        // is what answers a refusal of it — as before.
+        standIn.state.tokenSeconds = 60
+        assert.equal((await call('/renew', { email, force: true })).status, 200)
+        standIn.auth.refresh = 'refused'
+        const { answer: unrenewed, lines: unrenewedLines } = await logged(async lines => ({
+            lines, answer: await egress({ headers: { 'content-type': 'application/json' } })
+        }))
+        assert.equal(unrenewed.status, 200, JSON.stringify(unrenewed.body))
+        assert.equal(standIn.auth.asked.length, 2)
+        assert.equal(JSON.parse(unrenewed.body.body).authorization, `Bearer ${standIn.state.pageToken}`)
+        assert.ok(unrenewedLines.some(line => /token-refresh failed \(refused, status 401, code unauthorized, \d+ ms\)$/.test(line)), unrenewedLines.join('\n'))
+        console.log('ok page token refused: the call went out all the same, on the token the page had')
+        standIn.auth.refresh = 'ok'
+
+        // A token with its margin left is left alone: no refresh call.
+        standIn.state.tokenSeconds = 3600
+        assert.equal((await call('/renew', { email, force: true })).status, 200)
+        assert.equal((await egress({ headers: { 'content-type': 'application/json' } })).status, 200)
+        assert.equal(standIn.auth.asked.length, 2, 'a token with its margin left was renewed')
+        console.log('ok page token young: not renewed')
+
         // A clean stop closes the browser, which flushes the profile.
         await server.workerShutdown()
         assert.equal((await health()).residentPages, 0)
@@ -780,7 +939,10 @@ async function main() {
         // stream cap is 32 bytes: less than the stand-in's first frame.
         const freshDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwen-worker-smoke-force-'))
         const fresh = createServer({
-            dataDir: freshDir, token: 'secret', chatOrigin: standIn.origin, keepAliveMs: 200, egressMaxStreamBytes: 32
+            dataDir: freshDir, token: 'secret', chatOrigin: standIn.origin, keepAliveMs: 200, egressMaxStreamBytes: 32,
+            loadMinIntervalMs: 1, tokenRefreshMinIntervalMs: 1,
+            // A renewal on this worker waits no longer than this for the streams on its page (Qwen2API-nch).
+            streamWaitMs: 400
         })
         await new Promise(resolve => fresh.listen(0, '127.0.0.1', resolve))
         const freshUrl = `http://127.0.0.1:${fresh.address().port}`
@@ -804,6 +966,26 @@ async function main() {
             assert.equal(new Set(forced.map(answer => answer.body.token)).size, 1)
             assert.equal(standIn.pageLoads(), loads + 1, 'three forced renewals, one reload')
             console.log('ok forced renewal: /renew {force} reloads despite a fresh cache; a burst shares one reload')
+
+            // ...and a renewal waits for the streams on its page up to its
+            // limit, not longer: a stream that has not ended when the limit
+            // comes is cut by the reload (Qwen2API-nch). This one says one
+            // frame and then nothing.
+            const stalling = await relay({ url: '/api/sse-stall' }, freshUrl)
+            assert.equal((await stalling.next()).type, 'head')
+            assert.equal((await stalling.next()).type, 'chunk')
+            const limitAt = Date.now()
+            const { answer: pastTheLimit, lines: pastTheLimitLines } = await logged(async lines => ({
+                lines, answer: await call('/renew', { email, force: true }, freshUrl)
+            }))
+            assert.equal(pastTheLimit.status, 200, JSON.stringify(pastTheLimit.body))
+            // Timers never fire early: the reload waited the whole limit.
+            const reloadAt = standIn.pageLoadTimes.at(-1)
+            assert.ok(reloadAt - limitAt >= 400, `the page was reloaded ${reloadAt - limitAt} ms into the wait`)
+            assert.deepEqual((await drain(stalling)).map(event => [event.type, event.code]), [['error', 'browser_error']])
+            assert.ok(pastTheLimitLines.some(line => /resident-wait 1 still running \(waited \d+ ms for the page's streams\)$/.test(line)),
+                pastTheLimitLines.join('\n'))
+            console.log(`ok stream vs renewal, the limit: the reload waited ${reloadAt - limitAt} ms for a stream that did not end, then went through it; the stream ended as browser_error`)
         } finally {
             await fresh.workerShutdown()
             await new Promise(resolve => fresh.close(resolve))
@@ -816,7 +998,8 @@ async function main() {
         // the full Chromium must resume — and on a worker that has not been
         // told anything else. The stand-in shows what reached it.
         const presented = createServer({
-            dataDir, token: 'secret', chatOrigin: standIn.origin, headlessMode: 'chrome', keepAliveMs: 200
+            dataDir, token: 'secret', chatOrigin: standIn.origin, headlessMode: 'chrome', keepAliveMs: 200,
+            loadMinIntervalMs: 1, tokenRefreshMinIntervalMs: 1
         })
         await new Promise(resolve => presented.listen(0, '127.0.0.1', resolve))
         const presentedUrl = `http://127.0.0.1:${presented.address().port}`
@@ -889,6 +1072,33 @@ async function main() {
         } finally {
             await presented.workerShutdown()
             await new Promise(resolve => presented.close(resolve))
+        }
+
+        // Since Qwen2API-nch and Qwen2API-ops every page load of every account
+        // takes a turn: two accounts opening their pages at once do not load
+        // qwen.ai at once. The queue's interval is short here, to be seen.
+        const queueDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwen-worker-smoke-queue-'))
+        const queued = createServer({ dataDir: queueDir, token: 'secret', chatOrigin: standIn.origin, keepAliveMs: 200, loadMinIntervalMs: 600 })
+        await new Promise(resolve => queued.listen(0, '127.0.0.1', resolve))
+        const queuedUrl = `http://127.0.0.1:${queued.address().port}`
+        try {
+            const accounts = ['first@example.invalid', 'second@example.invalid']
+            for (const who of accounts) {
+                fs.mkdirSync(path.join(queueDir, 'account-' + crypto.createHash('sha256').update(who).digest('hex').slice(0, 32)), { recursive: true })
+            }
+            const loadsBefore = standIn.pageLoads()
+            const opened = await Promise.all(accounts.map(who =>
+                call('/egress', { email: who, url: '/api/echo', method: 'POST', timeoutMs: 30000 }, queuedUrl)))
+            assert.deepEqual(opened.map(answer => answer.status), [200, 200], JSON.stringify(opened.map(answer => answer.body)))
+            const times = standIn.pageLoadTimes.slice(loadsBefore).sort((a, b) => a - b)
+            assert.equal(times.length, 2)
+            // Timers never fire early.
+            assert.ok(times[1] - times[0] >= 600, `the second page was loaded ${times[1] - times[0]} ms after the first`)
+            console.log(`ok page loads take turns: two accounts opening their pages at once loaded them ${times[1] - times[0]} ms apart (the queue's interval here: 600 ms)`)
+        } finally {
+            await queued.workerShutdown()
+            await new Promise(resolve => queued.close(resolve))
+            fs.rmSync(queueDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 })
         }
 
         console.log('SMOKE OK — real worker, real Chromium, stand-in origin; qwen.ai was not contacted')

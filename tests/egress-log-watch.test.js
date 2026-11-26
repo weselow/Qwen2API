@@ -422,6 +422,25 @@ test('the shapes it reads are the shapes the code prints', () => {
         [worker, "log('egress', `${new URL(request.url).pathname} -> ${result.status} ("],
         [worker, '(CHALLENGE_NOTE[result.challenge] || \'\')'],
         [worker, "const CHALLENGE_NOTE = { page: ' — WAF challenge page', network: ' — WAF challenge page, kept from the call by the page' }"],
+        // Since Qwen2API-0c6: what the line says of an answer beyond its status.
+        [worker, ' + answerNote(result))'],
+        [read('signin-worker/lib/egress-fetch.js'), 'notes.push(`code ${shown}`)'],
+        [read('signin-worker/lib/egress-fetch.js'), "notes.push('refused, no code')"],
+        [read('signin-worker/lib/egress-fetch.js'), "notes.push(`headers: ${shown.length ? shown.join(', ') : 'none'}`)"],
+        [read('signin-worker/lib/egress-fetch.js'), "return notes.length ? ` — ${notes.join('; ')}` : ''"],
+        // Since Qwen2API-xun, Qwen2API-nch and Qwen2API-ops: the page's token, a navigation's wait, a load's turn.
+        [residents, "log('token-refresh', `ok (${took} ms, "],
+        [residents, "log('token-refresh', `failed ("],
+        [residents, "(waited ${waited} ms for the page's streams)"],
+        [residents, "`${left ? `${left} still running` : 'ended'} ("],
+        [read('signin-worker/lib/page-load-queue.js'), "log('page-load', `waited ("],
+        [read('signin-worker/lib/page-load-queue.js'), "ms${entry.packed ? ', a long line packed' : ''})`)"],
+        // A renewal answered by a session that turned live while it waited.
+        [worker, "log('renew', `${outcome.reloaded ? `ok${forced ? ' (forced)' : ''}` : 'no reload'} (${sessions.size} sessions)`)"],
+        // And three of the app's own lines.
+        [read('src/controllers/chat.js'), "logger.error('聊天处理错误', 'CHAT', '', error)"],
+        [read('src/controllers/chat.js'), "logger.error('非流式聊天处理错误'"],
+        [request, '`聊天请求传输错误 (尝试 ${attempt}/${totalAttempts}, code='],
         [worker, '`${pathname} -> ${event.status} (${Date.now() - started} ms, `'],
         [worker, '`${pathname} cancelled (${Date.now() - started} ms)`'],
         [worker, '`${pathname} end (${Date.now() - started} ms)'],
@@ -429,7 +448,6 @@ test('the shapes it reads are the shapes the code prints', () => {
         [worker, "log('request', `${req.method} ${req.url} -> ${res.statusCode} ${Date.now() - started}ms`)"],
         [residents, "log('resident-open', `ok (${pages.size}/${maxPages} pages, front-end "],
         [residents, "log('resident-close', `${reason} (${pages.size} pages)`)"],
-        [worker, "log('renew', `ok${forced ? ' (forced)' : ''} (${sessions.size} sessions)`)"],
         [worker, "log('session', `acquired (${sessions.size} sessions)`)"],
         [worker, 'log(\'session\', \'cached\')'],
         [worker, "log('session', `queued (${Math.ceil(slot.waitMs)}ms)`)"],
@@ -448,4 +466,142 @@ test('the shapes it reads are the shapes the code prints', () => {
         [read('src/server.js'), 'completionsTransport: config.completionsTransport']
     ]
     for (const [source, template] of printed) assert.ok(source.includes(template), `reworded: ${template}`)
+})
+
+// Since Qwen2API-0c6 and Qwen2API-nch (2026-11-26): what the worker says beyond a status, and
+// what the app says of an answer a reload cut.
+
+test('a refusal qwen.ai put in the body of a 2xx is counted as the refusal it is, and said — not as a 200 (Qwen2API-0c6)', () => {
+    // What the worker prints since Qwen2API-0c6. Before, the line of a refused chats/new read exactly like an accepted one (twice in the hour of 2026-11-26).
+    const lines = [
+        ...generation(1, { first: true }),
+        `${at(11)} egress /api/v2/chats/new -> 200 (1/16 pages) — code unauthorized`,
+        `${at(11)} request POST /egress -> 200 4ms`,
+        `${at(11)} renew ok (forced) (1 sessions)`,
+        `${at(11)} egress /api/v2/chats/new -> 200 (1/16 pages)`,
+        `${at(11)} egress-stream ${COMPLETIONS} -> 200 (900 ms, 1/16 pages)`,
+        `${at(11)} egress-stream ${COMPLETIONS} end (5200 ms)`,
+        `${at(12)} egress /api/v2/files/parse/status -> 200 (1/16 pages) — code ParseFailed`,
+        `${at(12)} egress /api/v1/tasks/status/x -> 200 (1/16 pages) — code FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::x`,
+        // A refusal that names no code is a refusal all the same; and a path is a path, dots or no dots.
+        `${at(13)} egress /api/v2/chats/new -> 200 (1/16 pages) — refused, no code`,
+        `${at(13)} egress /api/v2.1/tasks/status/x -> 200 (1/16 pages) — code RGV587_ERROR::SM::x`,
+        // A code with a separator of the worker's own in it is not cut at it.
+        `${at(13)} egress /api/v2/chats/new -> 200 (1/16 pages) — code a; b`,
+        // Not a 2xx: said by its status, as before. What it quotes of a body is not looked into for a code.
+        `${at(12)} egress /api/v2/files/getstsToken -> 405 (1/16 pages) — headers: content-type=text/html, x-region-restriction=true; body: <!doctype html><p>405; code in a body</p>`,
+        `${at(13)} egress /api/v2/files/getstsToken -> 405 (1/16 pages) — code Method Not Allowed; headers: none; body: {"code":"Method Not Allowed"}`
+    ]
+    const report = watch.summarize(lines)
+    // The accepted ones only.
+    assert.equal(report.counts.get('egress.chatsNew.200'), 2)
+    assert.equal(report.counts.get('egress.chatsNew.refused.unauthorized'), 1)
+    assert.equal(report.counts.get('egress.chatsNew.refused.no_code'), 1)
+    assert.equal(report.counts.get('egress./api/v2/files/parse/status.refused.ParseFailed'), 1)
+    assert.equal(report.counts.get('egress./api/v1/tasks/status/x.refused.FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::x'), 1)
+    assert.equal(report.counts.get('egress./api/v2.1/tasks/status/x.refused.RGV587_ERROR::SM::x'), 1)
+    assert.equal(report.counts.get('egress.chatsNew.refused.a; b'), 1)
+    assert.equal(report.counts.get('egress./api/v2/files/getstsToken.405'), 2)
+    assert.equal([...report.counts].filter(([name]) => name.startsWith('unparsed.')).length, 0)
+    const { verdict, why, text } = watch.render(report)
+    assert.equal(verdict, 'LOOK')
+    assert.ok(why.includes('qwen.ai refused 6 call(s) in the body of a 2xx: chats/new unauthorized 1, ' +
+        '/api/v2/files/parse/status ParseFailed 1, /api/v1/tasks/status/x FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::x 1, ' +
+        'chats/new no_code 1, /api/v2.1/tasks/status/x RGV587_ERROR::SM::x 1, chats/new a; b 1'), why.join('\n'))
+    assert.ok(why.includes('egress./api/v2/files/getstsToken.405: 2'), why.join('\n'))
+    assert.match(text, /refused\.unauthorized {2}1/)
+})
+
+test('a challenge page that is no 2xx is still a challenge, whatever is quoted after it', () => {
+    const report = watch.summarize([
+        `${at(5)} egress /api/v2/chats/new -> 403 (1/16 pages) — WAF challenge page — headers: server=Tengine; body: <html>…`
+    ])
+    assert.equal(report.counts.get('egress.chatsNew.challenge'), 1)
+    assert.equal(report.counts.get('egress.chatsNew.403'), undefined)
+    assert.equal([...report.counts].filter(([name]) => name.startsWith('unparsed.')).length, 0)
+})
+
+test('the worker’s new lines are counted: a page’s token renewed in place, a navigation that waited, a load that waited for its turn', () => {
+    const lines = [
+        `${at(0)} resident-open ok (1/16 pages, front-end 0.3.50)`,
+        `${at(0)} page-load waited (12340 ms)`,
+        // A line longer than its limit, packed closer: said so.
+        `${at(15)} page-load waited (119300 ms, a long line packed)`,
+        `${at(10)} token-refresh ok (412 ms, 15 min left)`,
+        `${at(20)} token-refresh ok (380 ms, 15 min left, after a wait of 2130 ms)`,
+        `${at(25)} resident-wait ended (waited 4312 ms for the page's streams)`,
+        ...generation(25),
+        `${at(27)} resident-wait ended (waited 900 ms for the page's streams)`,
+        `${at(30)} resident-wait 1 still running (waited 20000 ms for the page's streams)`,
+        `${at(30)} egress-stream ${COMPLETIONS} -> 200 (900 ms, 1/16 pages)`,
+        `${at(30)} egress-stream ${COMPLETIONS} browser_error (20010 ms)`,
+        // A renewal answered by a session that turned live while it waited: no page was loaded for it.
+        `${at(31)} renew no reload (1 sessions)`
+    ]
+    const report = watch.summarize(lines)
+    assert.equal(report.counts.get('tokenRefresh.ok'), 2)
+    assert.equal(report.counts.get('renew.answered'), 1)
+    // Two of one and one of the other: told apart, come what may.
+    assert.equal(report.counts.get('pageWait.ended'), 2)
+    assert.equal(report.counts.get('pageWait.timedOut'), 1)
+    assert.equal(report.counts.get('pageLoad.waits'), 2)
+    // One of them was made to begin closer than planned: there was more to load than the spacing fits in the limit.
+    assert.equal(report.counts.get('pageLoad.packed'), 1)
+    assert.equal([...report.counts].filter(([name]) => name.startsWith('unparsed.')).length, 0)
+    const { text } = watch.render(report)
+    assert.match(text, /ok {2}2/)
+    assert.match(text, /packed {2}1/)
+    assert.match(text, /longest wait for a turn to load a page: 119300 ms/)
+    assert.match(text, /longest a navigation waited for the page's streams: 20000 ms/)
+    // A wait that ran out cut a stream: that is what is said, not the wait.
+    assert.deepEqual(watch.complaints(report), [
+        '1 stream(s) ended with an error',
+        '1 page load(s) began closer than planned: the line was longer than its limit'
+    ])
+})
+
+test('a refresh of a page’s token that failed is said, by why', () => {
+    for (const [line, name] of [
+        ['token-refresh failed (refused, status 401, code unauthorized, 12 ms)', 'tokenRefresh.failed.refused'],
+        ['token-refresh failed (refused, status 200, code unauthorized, 12 ms, after a wait of 2130 ms)', 'tokenRefresh.failed.refused'],
+        ['token-refresh failed (network_error, 3 ms)', 'tokenRefresh.failed.network_error'],
+        ['token-refresh failed (timeout, 10002 ms)', 'tokenRefresh.failed.timeout'],
+        ['token-refresh failed (the page did not answer, 15000 ms)', 'tokenRefresh.failed.no answer']
+    ]) {
+        const report = watch.summarize([`${at(5)} ${line}`, ...generation(5)])
+        assert.equal(report.counts.get(name), 1, line)
+        assert.equal([...report.counts].filter(([name]) => name.startsWith('unparsed.')).length, 0)
+        assert.deepEqual(watch.complaints(report), ["a page's token was not renewed 1 time(s)"], line)
+    }
+    // A line of a shape it does not know is said as such.
+    for (const line of ['token-refresh something else', 'resident-wait for a while', 'page-load waited (a while)']) {
+        assert.equal(watch.summarize([`${at(5)} ${line}`]).counts.get('unparsed.worker'), 1, line)
+    }
+})
+
+test('the app’s own lines after a page was reloaded under its answers are counted as what they are (Qwen2API-nch)', () => {
+    // What the application logged in the run without a network (NOTES Qwen2API-nch, "26.11, 09:45 UTC"): what the Bun runtime prints, dump included.
+    const lines = [
+        ...generation(1),
+        appLine(1, 'WARN', 'REQUEST', '⚠️ 聊天请求传输错误 (尝试 1/2, code=ECONNRESET): signin-worker egress: browser_error (The resident page could not run the request.)'),
+        appLine(1, 'WARN', 'REQUEST', '⚠️ 聊天请求传输错误 (尝试 1/2, code=ECONNRESET): signin-worker egress: browser_error (Signin worker rejected the request.)'),
+        appLine(1, 'ERROR', 'CHAT', '❌ 非流式聊天处理错误'),
+        '223 | // What qwen.ai did, or the road to it, as the page reports it.',
+        'error: signin-worker egress: browser_error (The resident page could not run the request.)',
+        appLine(1, 'ERROR', 'CHAT', '❌ 聊天处理错误'),
+        `${at(1)} egress-stream ${COMPLETIONS} browser_error (1465 ms)`,
+        `${at(1)} request POST /egress -> 500 1460ms`
+    ]
+    const report = watch.summarize(lines)
+    assert.equal(report.counts.get('app.retried'), 2)
+    assert.equal(report.counts.get('app.chatFailed'), 1)
+    assert.equal(report.counts.get('app.wholeAnswerFailed'), 1)
+    assert.equal(report.counts.get('app.unclassified.ERROR'), undefined)
+    assert.equal(report.counts.get('app.unclassified.WARN'), undefined)
+    assert.equal(report.unknown.size, 0)
+    assert.deepEqual(watch.complaints(report), [
+        '2 answer(s) failed while the application handled them: 1 with a stream, 1 without',
+        'the worker answered 1 egress call(s) with HTTP 500',
+        '1 stream(s) ended with an error'
+    ])
 })
