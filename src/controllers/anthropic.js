@@ -17,7 +17,10 @@ const {
   // Fuente unica del tope por turno. Antes esto era un literal `= 4` propio dentro de
   // buildInternalRequest: dos numeros que nada relacionaba, y bajar ESTE a 2 no rompia
   // ninguna de las 889 pruebas. Ver chat-helpers.js#HARVEST_MEDIA_CAP.
-  HARVEST_MEDIA_CAP
+  HARVEST_MEDIA_CAP,
+  // La unica cuenta de una peticion (Qwen2API-fjk): las imagenes se suben desde su pagina
+  // y el chat se crea en ella tambien.
+  oneAccountForRequest
 } = require('../utils/chat-helpers.js');
 const {
   buildToolSystemPrompt,
@@ -805,7 +808,11 @@ const buildInternalRequest = async (anthropicReq) => {
   const enable_thinking = !!(thinking && thinking.type === 'enabled');
   const thinkingCfg = await isThinkingEnabled(model, enable_thinking, thinking?.budget_tokens);
   const chatType = isChatType(model);
-  const parsedMessages = await parserMessages(flat, thinkingCfg, chatType);
+  // The account this request is made on, taken once for all of it (Qwen2API-fjk): a picture
+  // is uploaded from its page, and the chat is made on it too. Nothing is taken for a
+  // request that uploads nothing.
+  const uploadAccount = oneAccountForRequest();
+  const parsedMessages = await parserMessages(flat, thinkingCfg, chatType, uploadAccount.get);
   const parsedModel = await parserModel(model);
 
   // 4. 合并 system 文本与工具提示词到最终用户消息开头
@@ -982,7 +989,9 @@ const buildInternalRequest = async (anthropicReq) => {
     toolSchemas,
     enable_thinking: thinkingCfg.thinking_enabled,
     model: parsedModel,
-    contextPrefixKey
+    contextPrefixKey,
+    // The account the pictures were uploaded on, null where none was (Qwen2API-fjk).
+    uploadAccount: uploadAccount.chosen()
   };
 };
 
@@ -2726,7 +2735,12 @@ const handleAnthropicMessages = async (req, res) => {
     // la clave de sesion el reintento reutiliza el prefijo de historial ya subido en vez
     // de subir y parsear el historial entero otra vez (hasta 3 parses por turno HTTP).
     const upstreamOptions = { allowContextCompaction: !hasTools, contextPrefixKey };
-    upstreamResp = await sendChatRequest(body, upstreamOptions);
+    // The request's pictures were uploaded from this account's page: its chat is made on
+    // it too (Qwen2API-fjk). A request that uploaded nothing names no account here.
+    upstreamResp = await sendChatRequest(body, {
+      ...upstreamOptions,
+      ...(built.uploadAccount ? { currentAccount: built.uploadAccount } : {})
+    });
     currentAccount = upstreamResp.currentAccount || null;
     if (!upstreamResp.status || !upstreamResp.response) {
       // El fallo dice por que fallo: cuota 429 `rate_limit_error`, sobrecarga 529

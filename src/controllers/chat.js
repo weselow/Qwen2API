@@ -1223,7 +1223,12 @@ const handleChatCompletion = async (req, res) => {
                 firstMessage: requestMessages.find(message => message?.role !== 'system') ?? null
             })
         }
-        const response_data = await sendChatRequest(req.body, upstreamOptions)
+        const response_data = await sendChatRequest(req.body, {
+            ...upstreamOptions,
+            // The request's pictures were uploaded from this account's page: its chat is made
+            // on it too (Qwen2API-fjk). A request that uploaded nothing names no account here.
+            ...(req.upload_account ? { currentAccount: req.upload_account } : {})
+        })
 
         if (!response_data.status || !response_data.response) {
             // El fallo dice por que fallo: cuota 429 `insufficient_quota`, sobrecarga o

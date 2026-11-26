@@ -4,12 +4,16 @@
 // (Qwen2API-mxs). Offline smoke: the real application under Bun, its completions relayed
 // from a stand-in for the signin worker, and a client that breaks off.
 //
-// Next to tests/client-gone.test.js, which drives the handlers with what was measured,
-// this runs the real thing: a real client on a real socket, and the stand-in watching
-// the application's side of the relay. No test in one process can show a hang-up — the
-// socket never closes under it — and this one showed what the tests could not: on Bun
-// 1.3.14 a server reports nothing of its client leaving once the request body was
-// read. All it leaves is the socket losing its address (utils/client-gone.js).
+// Since Qwen2API-3ue.10 the same for images and video: a picture being generated, a
+// video task polled — where a client left alone kept a generation going for minutes.
+//
+// Next to tests/client-gone.test.js and tests/client-gone-media.test.js, which drive
+// the handlers with what was measured, this runs the real thing: a real client on a
+// real socket, and the stand-in watching the application's side of the relay. No test
+// in one process can show a hang-up — the socket never closes under it — and this one
+// showed what the tests could not: on Bun 1.3.14 a server reports nothing of its
+// client leaving once the request body was read. All it leaves is the socket losing
+// its address (utils/client-gone.js).
 //
 //   node tools/client-gone-smoke.js --runtime <bun> [--tree <dir holding src/server.js>] [--binary <build>]
 //
@@ -37,6 +41,10 @@ const { parseArgs } = require('node:util')
 const { setTimeout: delay } = require('node:timers/promises')
 
 const API_KEY = 'client-gone-smoke-key'
+// The heavy endpoints take 30 requests a minute, per key (src/middlewares/authorization.js):
+// the steps of images and video bring a key of their own, so that the limit is not what
+// the smoke measures.
+const MEDIA_KEY = 'client-gone-smoke-media-key'
 const WORKER_TOKEN = 'client-gone-smoke-worker-token'
 const MODEL = 'qwen-smoke-test'
 const PROJECT_ROOT = path.resolve(__dirname, '..')
@@ -48,6 +56,19 @@ const LONG_ANSWER = { frames: 80, everyMs: 100 }
 // room for a loaded machine, and is far from the seconds an application that kept
 // reading would take.
 const CLOSE_WITHIN_MS = 1500
+// The models of the two media paths, named as the application tells them by
+// (utils/chat-helpers.js#isChatType): the routes pick the image and the video
+// controller by the suffix.
+const IMAGE_MODEL = 'qwen-smoke-image'
+const VIDEO_MODEL = 'qwen-smoke-video'
+// What the answers carry: links only, on a host the smoke never asks.
+const IMAGE_URL = 'https://cdn.example.invalid/a.png'
+const VIDEO_URL = 'https://cdn.example.invalid/v.mp4'
+const TASK_ID = 'client-gone-smoke-task'
+// A video task is polled every twenty seconds (src/controllers/chat.image.video.js).
+// A request left alone polls again on the far side of that pause: waiting it out
+// is what tells a request that ended from one still asleep.
+const POLL_PAUSE_MS = 20000
 
 const startListener = server => new Promise((resolve, reject) => {
   server.once('error', reject)
@@ -71,6 +92,7 @@ const readBody = async request => {
 }
 const sse = payload => `data: ${JSON.stringify(payload)}\n\n`
 const answerFrame = content => sse({ choices: [{ delta: { phase: 'answer', content }, finish_reason: null }] })
+const pictureFrame = content => sse({ choices: [{ delta: { phase: 'image_gen', content }, finish_reason: null }] })
 const closingFrames = () => [
   sse({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 4, completion_tokens: 1 } }),
   'data: [DONE]\n\n'
@@ -96,8 +118,28 @@ const PLANS = {
     { ms: 0, frame: answerFrame('hm') },
     { ms: LONG_ANSWER.frames * LONG_ANSWER.everyMs, frame: answerFrame('late') },
     ...closingFrames().map(frame => ({ ms: 0, frame }))
-  ]
+  ],
+  // A picture being drawn (Qwen2API-3ue.10): a frame every so often, with no picture in
+  // it — the generation goes on for a good while, and never brings a link.
+  picture: () => [
+    { ms: 0, frame: pictureFrame('drawing') },
+    ...Array.from({ length: LONG_ANSWER.frames }, () => ({ ms: LONG_ANSWER.everyMs, frame: pictureFrame('drawing') }))
+  ],
+  // A picture, for a client that stays: the frame with its link, and the end.
+  pictureShort: () => [
+    { ms: 0, frame: pictureFrame(`![image](${IMAGE_URL})`) },
+    ...closingFrames().map(frame => ({ ms: 0, frame }))
+  ],
+  // A video's answer: JSON, whole — the task to poll (the controller reads it to its end).
+  videoTask: () => [{ ms: 0, frame: JSON.stringify({ success: true, data: { task_id: TASK_ID } }) }]
 }
+// Which plans answer SSE, and which answer JSON.
+const ANSWERS_JSON = new Set(['videoTask'])
+// What the page answers the video task's status with: done, with the video — or, for
+// a request that is to be left alone, not done.
+const TASK_DONE = { task_status: 'success', content: VIDEO_URL }
+const TASK_RUNNING = { task_status: 'running' }
+let taskStatus = TASK_DONE
 
 async function main() {
   const { values } = parseArgs({ options: {
@@ -112,6 +154,8 @@ async function main() {
 
   // Every relay the stand-in served: what it was asked, how it ended.
   const relays = []
+  // Every poll of the video task's status the stand-in answered, and when.
+  const polls = []
   let plan = { name: 'short', wrapped: false }
   const expires = Math.floor(Date.now() / 1000) + 86400
   // A token of the shape the application parses, and nothing more.
@@ -132,7 +176,8 @@ async function main() {
     }
     if (route === '/api/models') {
       request.resume()
-      return json(200, { data: [{ id: MODEL, name: MODEL, info: { meta: { chat_type: ['t2t'], abilities: {} } } }] })
+      const model = (id, chatType) => ({ id, name: id, info: { meta: { chat_type: [chatType], abilities: {} } } })
+      return json(200, { data: [model(MODEL, 't2t'), model(IMAGE_MODEL, 't2i'), model(VIDEO_MODEL, 't2v')] })
     }
     if (route !== '/egress') {
       request.resume()
@@ -140,12 +185,20 @@ async function main() {
     }
     const call = await readBody(request)
     if (!call.stream) {
-      // chats/new from inside the page.
-      return json(200, {
-        status: 200, headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ success: true, data: { id: 'client-gone-smoke-chat' } }),
+      // A whole-answer call from inside the page (browser-egress.js#egressJson): qwen.ai's
+      // status and body as the worker hands them over.
+      const pageAnswer = payload => json(200, {
+        status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
         url: call.url, redirected: false, cookies: []
       })
+      const pathname = new URL(call.url, 'http://127.0.0.1').pathname
+      if (pathname === '/api/v2/chats/new') return pageAnswer({ success: true, data: { id: 'client-gone-smoke-chat' } })
+      // The status of the video task, polled for as long as the request lives.
+      if (pathname === `/api/v1/tasks/status/${TASK_ID}`) {
+        polls.push(Date.now())
+        return pageAnswer(taskStatus)
+      }
+      return json(404, { error: `Unexpected page call: ${pathname}` })
     }
     // The relay of a completions call, as the worker streams it (signin-worker/server.js#relayEgress):
     // one JSON event a line.
@@ -157,6 +210,9 @@ async function main() {
     const since = () => `${Date.now() - record.started} ms`
     record.socketState = () => `destroyed=${request.socket.destroyed} readableEnded=${request.socket.readableEnded} ` +
       `writableEnded=${response.writableEnded} bytesWritten=${request.socket.bytesWritten}`
+    // The application keeps one connection to the worker for all its calls: every relay
+    // puts its own listeners on that one socket, which is no leak — and no warning either.
+    request.socket.setMaxListeners(0)
     // The socket: the application closing the relay arrives as its socket closing. (The
     // worker listens to the same, signin-worker/server.js#relayEgress.)
     for (const event of ['close', 'end', 'error']) {
@@ -180,7 +236,10 @@ async function main() {
       'content-type': 'application/x-ndjson', 'cache-control': 'no-cache', 'x-accel-buffering': 'no'
     })
     response.flushHeaders()
-    write({ type: 'head', status: 200, headers: { 'content-type': 'text/event-stream' }, cookies: [] })
+    write({
+      type: 'head', status: 200,
+      headers: { 'content-type': ANSWERS_JSON.has(record.plan) ? 'application/json' : 'text/event-stream' }, cookies: []
+    })
     for (const step of PLANS[record.plan](record)) {
       await delay(step.ms)
       if (!write({ type: 'chunk', data: Buffer.from(step.frame).toString('base64') })) return
@@ -210,7 +269,7 @@ async function main() {
       await writeFile(path.join(temporaryDirectory, 'data/data.json'), JSON.stringify({
         accounts: [{ email: 'smoke@example.invalid', password: 'local-test-password', expires, token: tokenFor('data') }]
       }))
-      await writeFile(path.join(temporaryDirectory, '.env'), `API_KEY=${API_KEY}\n`)
+      await writeFile(path.join(temporaryDirectory, '.env'), `API_KEY=${API_KEY},${MEDIA_KEY}\n`)
     }
     const portReservation = createServer()
     const servicePort = await startListener(portReservation)
@@ -225,7 +284,7 @@ async function main() {
       env: {
         ...environment,
         NODE_ENV: 'production',
-        ...(binaryPath ? {} : { API_KEY }),
+        ...(binaryPath ? {} : { API_KEY: `${API_KEY},${MEDIA_KEY}` }),
         SERVICE_PORT: String(servicePort),
         LISTEN_ADDRESS: '127.0.0.1',
         DATA_SAVE_MODE: binaryPath ? 'file' : 'none',
@@ -320,6 +379,79 @@ async function main() {
       }
     }
 
+    // Images and video (Qwen2API-3ue.10): the routes of the two paths, each answered by
+    // the plan of its kind. Nothing reaches a media client before its answer is whole —
+    // a picture's or a video's is written at once, at the end.
+    const MEDIA = [
+      {
+        kind: 'an image', route: '/v1/images/generations',
+        body: () => ({ model: MODEL, prompt: 'a cat' }),
+        carries: text => JSON.parse(text).data[0].url === IMAGE_URL
+      },
+      {
+        kind: 'an image', route: '/v1/chat/completions',
+        body: () => ({ model: IMAGE_MODEL, messages: [{ role: 'user', content: 'a cat' }] }),
+        carries: text => JSON.parse(text).choices[0].message.content === `![image](${IMAGE_URL})`
+      },
+      {
+        kind: 'an image', route: '/v1/chat/completions', streamed: true,
+        body: () => ({ model: IMAGE_MODEL, stream: true, messages: [{ role: 'user', content: 'a cat' }] }),
+        carries: text => text.includes(IMAGE_URL) && text.includes('[DONE]')
+      },
+      {
+        kind: 'a video', route: '/v1/videos',
+        body: () => ({ model: MODEL, prompt: 'a cat' }),
+        carries: text => JSON.parse(text).data[0].url === VIDEO_URL
+      },
+      {
+        kind: 'a video', route: '/v1/chat/completions',
+        body: () => ({ model: VIDEO_MODEL, messages: [{ role: 'user', content: 'a cat' }] }),
+        carries: text => JSON.parse(text).choices[0].message.content.includes(VIDEO_URL)
+      },
+      {
+        kind: 'a video', route: '/v1/chat/completions', streamed: true,
+        body: () => ({ model: VIDEO_MODEL, stream: true, messages: [{ role: 'user', content: 'a cat' }] }),
+        carries: text => text.includes(VIDEO_URL) && text.includes('[DONE]')
+      }
+    ]
+    const mediaLabel = media => `${media.route}, ${media.kind}${media.streamed ? ', stream' : ''}`
+    const thing = media => (media.kind === 'a video' ? 'video' : 'picture')
+    // The request sent, and whether it was answered already — with what — or failed
+    // to go at all: what a wait for a relay that never opens wants to know.
+    const sendMedia = (media, signal) => {
+      const sent = { answered: null, failed: null }
+      const request = fetch(`${baseUrl}${media.route}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': MEDIA_KEY },
+        body: JSON.stringify(media.body()),
+        signal
+      })
+      sent.pending = request.then(response => { sent.answered = response.status; return response },
+        error => { sent.failed = String(error?.cause?.message || error); return null })
+      // What became of the request, for a wait that ran out of time.
+      sent.said = () => `the request was ${sent.failed ? `not sent: ${sent.failed}`
+        : sent.answered === null ? 'not answered yet' : `answered with ${sent.answered}`}`
+      return sent
+    }
+
+    taskStatus = TASK_DONE
+    for (const media of MEDIA) {
+      plan = { name: media.kind === 'a video' ? 'videoTask' : 'pictureShort' }
+      polls.length = 0
+      const before = relays.length
+      const response = await sendMedia(media, AbortSignal.timeout(30000)).pending
+      const text = response === null ? '' : await response.text()
+      assert.equal(response?.status, 200, `${mediaLabel(media)}: ${text}`)
+      assert.ok(media.carries(text), `${mediaLabel(media)}: the answer does not carry its ${thing(media)}`)
+      const relay = relays[before]
+      assert.ok(relay, `${mediaLabel(media)}: the answer never came through the relay`)
+      assert.equal(relay.endedAt !== null, true, `${mediaLabel(media)}: the relay ended by itself`)
+      if (media.kind === 'a video') {
+        assert.equal(polls.length, 1, `${mediaLabel(media)}: the task is polled once, and is done`)
+      }
+      console.log(`PASS: ${mediaLabel(media)} — a client that stays gets its ${thing(media)}`)
+    }
+
     const logsBeforeLeaving = applicationLogs.length
     const linesSince = () => applicationLogs.slice(logsBeforeLeaving).split('\n').filter(Boolean)
 
@@ -365,6 +497,61 @@ async function main() {
       }
     }
 
+    // An image being generated for a client that leaves: the stand-in has put a few
+    // frames on the relay — the picture is still being drawn — when the client breaks
+    // off; from then on the relay must close at once, and not when the generation runs out.
+    const leaveWhileDrawing = async (media) => {
+      plan = { name: 'picture' }
+      const before = relays.length
+      const controller = new AbortController()
+      const { pending, said } = sendMedia(media, controller.signal)
+      await until(() => relays.length > before, 10000, `the relay of ${mediaLabel(media)}`, said)
+      const relay = relays[before]
+      await until(() => relay.sent >= 2, 5000, `the answer of ${mediaLabel(media)}`)
+      await delay(100)
+      const leftAt = Date.now()
+      controller.abort()
+      await until(() => relay.closedAt !== null, CLOSE_WITHIN_MS * 4,
+        `the relay of ${mediaLabel(media)} to close`,
+        () => `the stand-in saw ${relay.seen.join('; ') || 'nothing'}; ${relay.sent} frames sent; ` +
+          `socket.destroyed=${relay.socketState?.()}`)
+      await pending
+      const lag = relay.closedAt - leftAt
+      assert.equal(relay.endedAt, null, `${mediaLabel(media)}: the generation ran to its end — nobody closed it`)
+      assert.ok(lag < CLOSE_WITHIN_MS, `${mediaLabel(media)}: the relay closed ${lag} ms after the client left`)
+      assert.ok(relay.sent < 20, `${mediaLabel(media)}: ${relay.sent} frames were generated for nobody`)
+      console.log(`PASS: ${mediaLabel(media)} — the client left, the relay closed ${lag} ms later ` +
+        `(${relay.sent} frames generated)`)
+    }
+    for (const media of MEDIA.filter(item => item.kind === 'an image')) await leaveWhileDrawing(media)
+
+    // A video task polled for a client that leaves: the task is in and its first poll
+    // said "not done" — the request is asleep in the task's twenty seconds — when the
+    // client breaks off. A request still asleep polls again on the far side of that
+    // pause; one that ended with its client does not. Waited out once, in full: all
+    // three routes go through the same pause.
+    const leaveWhilePolling = async (media, waitForTheNextPoll) => {
+      plan = { name: 'videoTask' }
+      taskStatus = TASK_RUNNING
+      polls.length = 0
+      const controller = new AbortController()
+      const { pending, said } = sendMedia(media, controller.signal)
+      await until(() => polls.length === 1, 10000, `the first poll of ${mediaLabel(media)}`, said)
+      assert.equal(relays.at(-1).endedAt !== null, true, `${mediaLabel(media)}: the task's answer was read whole`)
+      await delay(100)
+      controller.abort()
+      await pending
+      // The application asks its socket every quarter of a second (CLOSE_WITHIN_MS).
+      const wait = waitForTheNextPoll ? POLL_PAUSE_MS + 3000 : 1500
+      await delay(wait)
+      assert.equal(polls.length, 1, `${mediaLabel(media)}: the task was polled again for a client that is gone`)
+      console.log(`PASS: ${mediaLabel(media)} — the client left, the task is polled no more ` +
+        `(waited ${Math.round(wait / 1000)} s)`)
+    }
+    for (const [index, media] of MEDIA.filter(item => item.kind === 'a video').entries()) {
+      await leaveWhilePolling(media, index === 0)
+    }
+
     // What the leaving must not cost: not one error line, and not one interruption of the
     // egress counted.
     const lines = linesSince()
@@ -383,6 +570,8 @@ async function main() {
     console.log(`PASS: a client that goes away takes its upstream with it, through the application on Bun`)
   } catch (error) {
     if (applicationLogs) console.error(applicationLogs)
+    // Whether there was an application to answer at all.
+    console.error(`application: exitCode=${application?.exitCode} signalCode=${application?.signalCode}`)
     throw error
   } finally {
     if (application && application.exitCode === null && application.signalCode === null) application.kill('SIGKILL')
