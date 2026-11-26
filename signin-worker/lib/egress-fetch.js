@@ -600,6 +600,8 @@ function pageRefreshToken({ url, timeoutMs, sourceId }) {
                     return end({ ok: false, status, code, reason: 'refused', message: 'the token is already spent' })
                 }
                 try {
+                    // Written as the front end's own writer does (IC, main.js 0.3.50), in its
+                    // order: the state first — it is what the front end reads the token from.
                     localStorage.setItem('qwen_access_token_state', JSON.stringify({
                         version: 1, stateId: uuid(), token, expiresAt, updatedAt: Date.now(), sourceId
                     }))
@@ -680,14 +682,29 @@ function isChallengePage(headers, body) {
 const PRIVATE_HEADER = /cookie|token|key|secret|authorization|session/i
 // What looks like a credential inside a body: a Bearer, a JWT.
 const CREDENTIAL = /\bBearer\s+\S+|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}/g
+// What is named one: the value of a field ("AccessKeySecret":"…") or of a pair
+// of a form (securityToken=…). A name is not read for what it means: anything
+// with secret, token, key… in it loses its value.
+const NAMED_SECRET = /("[^"]*(?:secret|token|key|password|passwd|credential|signature|authorization)[^"]*"\s*:\s*)"(?:[^"\\]|\\.)*"/gi
+const PAIRED_SECRET = /(\b[\w.-]*(?:secret|token|key|password|passwd|credential|signature|authorization)[\w.-]*=)[^&\s"'<>]+/gi
 // A refusal is short: a longer body than this is not looked into.
 const REFUSAL_BODY_CHARS = 256 * 1024
+// Of what is quoted of a body, only this start is looked through for credentials: far more than is ever quoted.
+const MASKED_BODY_CHARS = 64 * 1024
 const QUOTED_BODY_CHARS = 300
 const QUOTED_HEADERS = 12
 
-/** The value on one line of log, control characters and all: nothing longer than `max`. */
-// eslint-disable-next-line no-control-regex
-const quoted = (value, max) => String(value ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, max)
+/** The value on one line of log: control characters, line separators and direction marks become spaces; nothing longer than `max`. */
+const quoted = (value, max) => String(value ?? '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]+/g, ' ')
+    .trim().slice(0, max)
+
+/** The start of a body as a log line may show it: a credential, or what is named one, is not qwen.ai's message. */
+const masked = text => text.slice(0, MASKED_BODY_CHARS)
+    .replace(NAMED_SECRET, '$1"<credential>"')
+    .replace(PAIRED_SECRET, '$1<credential>')
+    .replace(CREDENTIAL, '<credential>')
 
 /**
  * The code qwen.ai refused an answer in the body with, where the app reads it
@@ -722,10 +739,11 @@ function isRefusal(payload) {
 /**
  * What the log says of qwen.ai's whole answer beyond its status (Qwen2API-0c6).
  * A refusal that travels in the body of a 2xx is said by its code — that is
- * what told an accepted call from a refused one on 2026-11-26. An answer that
- * is no 2xx is said by its code, its headers (none that could hold a
- * credential) and the start of its body. Whether an answer is a WAF challenge
- * page is said beside this (server.js, CHALLENGE_NOTE), not here.
+ * what told an accepted call from a refused one on 2026-11-26 — or, a refusal
+ * that names none, by being one. An answer that is no 2xx is said by its code,
+ * its headers (none that could hold a credential) and the start of its body.
+ * Whether an answer is a WAF challenge page is said beside this (server.js,
+ * CHALLENGE_NOTE), not here.
  *
  * @param {{status: number, headers: Object<string,string>, body: string}} answer - As fetch() returns it
  * @returns {string} '' for an answer its status says enough of; else ' — …'
@@ -738,16 +756,18 @@ function answerNote({ status, headers, body }) {
             payload = JSON.parse(text)
         } catch { /* not JSON: a page, or text */ }
     }
+    const accepted = status >= 200 && status < 300
     const code = refusalCode(payload)
     const notes = []
-    if (code && isRefusal(payload)) notes.push(`code ${quoted(code, 80)}`)
-    if (!(status >= 200 && status < 300)) {
+    if (code && (isRefusal(payload) || !accepted)) notes.push(`code ${quoted(code, 80)}`)
+    else if (isRefusal(payload) && accepted) notes.push('refused, no code')
+    if (!accepted) {
         const shown = Object.entries(headers || {})
             .filter(([name]) => !PRIVATE_HEADER.test(name))
             .slice(0, QUOTED_HEADERS)
-            .map(([name, value]) => `${quoted(name, 64)}=${quoted(value, 120)}`)
+            .map(([name, value]) => `${quoted(name, 64)}=${quoted(masked(value), 120)}`)
         notes.push(`headers: ${shown.length ? shown.join(', ') : 'none'}`)
-        notes.push(`body: ${quoted(text.replace(CREDENTIAL, '<credential>'), QUOTED_BODY_CHARS)}`)
+        notes.push(`body: ${quoted(masked(text), QUOTED_BODY_CHARS)}`)
     }
     return notes.length ? ` — ${notes.join('; ')}` : ''
 }

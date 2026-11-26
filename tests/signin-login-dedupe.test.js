@@ -166,7 +166,8 @@ test('both compose stacks forward the page settings of 2026-11-26 to the worker,
       'SIGNIN_PAGE_TOKEN_REFRESH=${SIGNIN_PAGE_TOKEN_REFRESH:-true}',
       'SIGNIN_TOKEN_REFRESH_MIN_INTERVAL_MS=${SIGNIN_TOKEN_REFRESH_MIN_INTERVAL_MS:-2000}',
       'RESIDENT_STREAM_WAIT_MS=${RESIDENT_STREAM_WAIT_MS:-20000}',
-      'RESIDENT_LOAD_MIN_INTERVAL_MS=${RESIDENT_LOAD_MIN_INTERVAL_MS:-10000}'
+      'RESIDENT_LOAD_MIN_INTERVAL_MS=${RESIDENT_LOAD_MIN_INTERVAL_MS:-10000}',
+      'RESIDENT_LOAD_MAX_WAIT_MS=${RESIDENT_LOAD_MAX_WAIT_MS:-120000}'
     ]) {
       assert.ok(environment.includes(entry), `${file}: the worker does not get ${entry}`)
     }

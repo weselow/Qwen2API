@@ -715,7 +715,8 @@ test('a streaming /egress relays the answer as it arrives: the head, every chunk
   assert.deepEqual(await health(), {
     ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell',
     // Reported where a flip is verified, as the headless mode is (Qwen2API-xun, Qwen2API-nch); the queue of page loads is off in these tests.
-    pageTokenRefresh: true, streamWaitMs: 20000, loadMinIntervalMs: 1
+    pageTokenRefresh: true, streamWaitMs: 20000, loadMinIntervalMs: 1, loadMaxWaitMs: 120000,
+    pageLoadQueue: { waiting: 0, nextInMs: 0 }
   })
 })
 
@@ -1080,6 +1081,8 @@ test('at the cap the page evicted is one without a stream, whatever was used las
   upstream.push('data: {"n":1}\n\n')
   assert.equal((await opened.next()).type, 'chunk')
   // ...and x's page was used since the stream began: by use alone, y's is the one to go.
+  // A moment first, so that "since" is a different millisecond on a clock that ticks coarsely too.
+  await new Promise(resolve => setTimeout(resolve, 40))
   signer.script.fetch = quiet
   assert.equal((await post('/egress', { email: 'x@example.invalid', ...streamCall, stream: false })).status, 200)
   // z arrives at the cap.

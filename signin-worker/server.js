@@ -7,7 +7,8 @@
  *   POST /session {email, password, proxy?, force?} -> {token, expiresAt, cookies[]}
  *   POST /renew   {email, proxy?, force?}   -> {token, expiresAt, cookies[]}
  *   GET  /health                             -> {ok, sessions, residentPages, headlessMode,
- *                                                pageTokenRefresh, streamWaitMs, loadMinIntervalMs}
+ *                                                pageTokenRefresh, streamWaitMs, loadMinIntervalMs,
+ *                                                loadMaxWaitMs, pageLoadQueue}
  *
  * One persistent context (userDataDir) per account on the SIGNIN_DATA_DIR
  * volume: auth cookies survive restarts and renewal is a silent reload.
@@ -179,6 +180,9 @@ function createServer(overrides = {}) {
         tokenRetryMs: overrides.tokenRetryMs ?? 30000,
         // What was read of a page's token stands this long at most before it is read again.
         tokenReadAgainMs: overrides.tokenReadAgainMs ?? 60000,
+        // After a refresh that did not get through (the auth host not
+        // answering), no other page tries its own for this long.
+        tokenRefreshCircuitMs: overrides.tokenRefreshCircuitMs ?? 60000,
         // Token refreshes of every page together are kept this far apart; 1 turns that off.
         tokenRefreshMinIntervalMs: overrides.tokenRefreshMinIntervalMs ?? envInt('SIGNIN_TOKEN_REFRESH_MIN_INTERVAL_MS', 2000),
         // A navigation on a live page waits this long for the streams running
@@ -186,8 +190,15 @@ function createServer(overrides = {}) {
         streamWaitMs: overrides.streamWaitMs ?? envCount('RESIDENT_STREAM_WAIT_MS', 20000),
         // Every page load of every account starts at least this far from the
         // previous one, plus up to the same again as jitter (Qwen2API-nch,
-        // Qwen2API-ops); 1 turns the queue off.
-        loadMinIntervalMs: overrides.loadMinIntervalMs ?? envInt('RESIDENT_LOAD_MIN_INTERVAL_MS', 10000)
+        // Qwen2API-ops); 1 turns the queue off. Sign-ins are not in that line:
+        // the login pacer spaces them.
+        loadMinIntervalMs: overrides.loadMinIntervalMs ?? envInt('RESIDENT_LOAD_MIN_INTERVAL_MS', 10000),
+        // No page load waits longer than this for its turn; a longer line is
+        // packed closer instead. A renewal waits for the streams on its page
+        // (streamWaitMs) and then here, inside the application's budget for
+        // /renew (SIGNIN_WORKER_TIMEOUT_MS); this must leave both room.
+        // 0 = no limit.
+        loadMaxWaitMs: overrides.loadMaxWaitMs ?? envCount('RESIDENT_LOAD_MAX_WAIT_MS', 120000)
     }
 
     fs.mkdirSync(config.dataDir, { recursive: true })
@@ -213,9 +224,12 @@ function createServer(overrides = {}) {
     // Every page qwen.ai is asked to serve the worker, from whatever account,
     // takes a turn (lib/page-load-queue.js): a burst of openings after a
     // restart, or of renewals in one tick of the app's timer, would be a burst
-    // of page loads from one address. The pages' token refreshes take turns of
-    // their own, closer together — they are no page loads.
-    const pageLoads = createPageLoadQueue({ minIntervalMs: config.loadMinIntervalMs, log })
+    // of page loads from one address. A sign-in does not wait in that line —
+    // the login pacer spaces sign-ins, and the application's budget for one
+    // accounts for that pacer alone — it only tells the queue when it begins.
+    // The pages' token refreshes take turns of their own, closer together —
+    // they are no page loads.
+    const pageLoads = createPageLoadQueue({ minIntervalMs: config.loadMinIntervalMs, maxWaitMs: config.loadMaxWaitMs, log })
     const tokenRefreshes = createPageLoadQueue({ minIntervalMs: config.tokenRefreshMinIntervalMs })
     const profileDir = email => path.join(config.dataDir,
         'account-' + crypto.createHash('sha256').update(email).digest('hex').slice(0, 32))
@@ -312,9 +326,11 @@ function createServer(overrides = {}) {
         tokenRefreshTimeoutMs: config.tokenRefreshTimeoutMs,
         tokenRetryMs: config.tokenRetryMs,
         tokenReadAgainMs: config.tokenReadAgainMs,
+        tokenRefreshCircuitMs: config.tokenRefreshCircuitMs,
         streamWaitMs: config.streamWaitMs,
         beforeTokenRefresh: tokenRefreshes.wait,
-        beforeLoad: pageLoads.wait
+        // A sign-in on a resident page tells the queue itself, when it begins (fullLogin).
+        beforeLoad: ({ turn } = {}) => (turn === false ? undefined : pageLoads.wait())
     })
 
     async function silentRenew(email) {
@@ -342,21 +358,26 @@ function createServer(overrides = {}) {
             context => signer.renew(context, { chatOrigin: config.chatOrigin, timeoutMs: config.timeoutMs }))
     }
 
-    async function withBrowserContext(email, proxy, operation) {
+    /**
+     * `turn` false: the operation is a sign-in, which does not wait in the
+     * line of page loads (lib/page-load-queue.js) — the login pacer spaces
+     * sign-ins — and tells the queue itself when it begins.
+     */
+    async function withBrowserContext(email, proxy, operation, { turn = true } = {}) {
         return serialized(email, async () => {
             // A resident page owns the profile directory (Chromium locks it):
             // sign-in and renewal run on that page instead of a second launch.
             // A null proxy means "whatever the account already uses".
             const resident = residents.get(email)
             const wanted = proxy ?? resident?.proxy ?? null
-            if (resident && resident.proxy === wanted) return residents.exclusive(resident, operation)
+            if (resident && resident.proxy === wanted) return residents.exclusive(resident, operation, { turn })
             if (resident) await residents.close(resident, 'proxy_changed')
             // The page may still be closing (crash, eviction): its browser
             // holds the profile lock until it is gone.
             await residents.whenClosed(email)
             // No page to run on: one is opened for the operation. That is a
             // page load, and waits for the worker's turn like every other.
-            await pageLoads.wait()
+            if (turn) await pageLoads.wait()
             return withBrowser(email, proxy, operation)
         })
     }
@@ -394,8 +415,13 @@ function createServer(overrides = {}) {
             // renewal to have produced the session asked for here.
             if (!force && fresh(email)) return null
             await pacer.enter(slot)
+            // A sign-in is a page load too, but not one in line for a turn:
+            // the login pacer spaces sign-ins, and the app's budget for one
+            // accounts for it alone. The queue is told right here, as late as
+            // may be, so that what follows keeps a gap away from this load.
+            pageLoads.note()
             return signer.signin(context, { email, password, chatOrigin: config.chatOrigin, timeoutMs: config.timeoutMs })
-        })
+        }, { turn: false })
         if (!harvested) {
             log('session', 'cached')
             return shape(sessions.get(email))
@@ -634,12 +660,15 @@ function createServer(overrides = {}) {
     async function handle(req, res) {
         if (req.method === 'GET' && req.url === '/health') {
             // The headless mode is here to be checked after a flip, before the
-            // first request that depends on it. So are the three settings of
-            // 2026-11-26 (Qwen2API-xun, Qwen2API-nch, Qwen2API-ops).
+            // first request that depends on it. So are the settings of
+            // 2026-11-26 (Qwen2API-xun, Qwen2API-nch, Qwen2API-ops), and how
+            // long the line of page loads is.
             return send(res, 200, {
                 ok: true, sessions: sessions.size, ...residents.stats(),
                 headless: config.headless, headlessMode: config.headless ? config.headlessMode : null,
-                pageTokenRefresh: config.pageTokenRefresh, streamWaitMs: config.streamWaitMs, loadMinIntervalMs: config.loadMinIntervalMs
+                pageTokenRefresh: config.pageTokenRefresh, streamWaitMs: config.streamWaitMs,
+                loadMinIntervalMs: config.loadMinIntervalMs, loadMaxWaitMs: config.loadMaxWaitMs,
+                pageLoadQueue: pageLoads.stats()
             })
         }
         if ((req.method === 'POST' && req.url === '/session') || (req.method === 'POST' && req.url === '/renew')) {

@@ -25,7 +25,8 @@
  * on 2026-11-26 two refused chats/new read as accepted calls here. Since
  * Qwen2API-xun and Qwen2API-nch the worker also says when it renewed a page's
  * token in place, when a navigation waited for the page's streams, and when a
- * page load waited for its turn; and three of the app's own lines — an answer
+ * page load waited for its turn (and when a long line of them was packed
+ * closer than planned); and three of the app's own lines — an answer
  * that failed while the app handled it, and a call the app made again after
  * the relay broke — are counted as what they are, not listed as unknown.
  */
@@ -49,6 +50,8 @@ const REFUSED_PREFIX = 'app.chatsNewRefused.'
 // Why a resident page closes other than on purpose (evicted, shut down, proxy changed).
 const PAGE_DEATHS = ['unresponsive', 'page_crashed', 'context_closed', 'keepalive_failed', 'open_failed', 'operation_failed']
 const REFUSALS = ['upstream_session_unauthorized', 'upstream_waf_challenge']
+// How a refusal in the body of a 2xx that names no code is counted.
+const NO_CODE = 'no_code'
 
 /** One log line, stripped of terminal colors. */
 const plain = line => line.replace(ANSI, '')
@@ -82,18 +85,21 @@ const challengeName = said => {
 }
 
 /**
- * The code qwen.ai refused a whole answer in the body with, as the worker's
- * line says of it (Qwen2API-0c6: "code …", the first note after the status).
- * Null when it names none. What the line quotes of a body comes last, and is
- * not looked into: a body may say "code" itself.
+ * A refusal qwen.ai put in the body of a whole answer, as the worker's line
+ * says of it (Qwen2API-0c6): by its code ("code …", the first note after the
+ * status), or, one that names none, by being one ("refused, no code"). Null
+ * when the line says neither. What the line quotes of a body comes last, and
+ * is not looked into: a body may say "code" itself.
  * @param {string} [said] - What the worker wrote after " — "
- * @returns {string|null}
+ * @returns {{code: string}|null}
  */
-function refusalCode(said) {
+function bodyRefusal(said) {
     if (!said) return null
     const body = said.indexOf('; body: ')
-    const found = /(?:^|; )code (.+?)(?:; |$)/.exec(body < 0 ? said : said.slice(0, body))
-    return found ? found[1].trim().slice(0, 80) : null
+    const notes = body < 0 ? said : said.slice(0, body)
+    const found = /(?:^|; )code (.+?)(?:; |$)/.exec(notes)
+    if (found) return { code: found[1].trim().slice(0, 80) }
+    return /(?:^|; )refused, no code(?:; |$)/.test(notes) ? { code: NO_CODE } : null
 }
 
 function readWorkerLine(report, event, detail) {
@@ -104,10 +110,10 @@ function readWorkerLine(report, event, detail) {
             if ((found = /^(\S+) -> (\d{3}) \((\d+)\/(\d+) pages\)( — (.+))?$/.exec(detail))) {
                 const name = found[1] === CHATS_NEW ? 'chatsNew' : found[1]
                 const challenge = challengeName(found[5])
-                const code = challenge ? null : refusalCode(found[6])
+                const refusal = challenge ? null : bodyRefusal(found[6])
                 // A refusal in the body of a 2xx is counted as the refusal it is, and not as a 200 (Qwen2API-0c6).
                 if (challenge) bump(report, `egress.${name}.${challenge}`)
-                else if (code && found[2][0] === '2') bump(report, `egress.${name}.refused.${code}`)
+                else if (refusal && found[2][0] === '2') bump(report, `egress.${name}.refused.${refusal.code}`)
                 else bump(report, `egress.${name}.${found[2]}`)
                 report.pages.peak = Math.max(report.pages.peak, Number(found[3]))
                 report.pages.cap = Number(found[4])
@@ -161,9 +167,11 @@ function readWorkerLine(report, event, detail) {
             return
         }
         case 'page-load': {
-            // A page load waited for the worker's turn (Qwen2API-nch, Qwen2API-ops).
-            if ((found = /^waited \((\d+) ms\)$/.exec(detail))) {
+            // A page load waited for the worker's turn (Qwen2API-nch, Qwen2API-ops). A
+            // line longer than its limit is packed closer, and the line says so.
+            if ((found = /^waited \((\d+) ms(, a long line packed)?\)$/.exec(detail))) {
                 bump(report, 'pageLoad.waits')
+                if (found[2]) bump(report, 'pageLoad.packed')
                 report.waits.load++
                 report.waits.loadLongest = Math.max(report.waits.loadLongest, Number(found[1]))
             } else bump(report, 'unparsed.worker')
@@ -287,12 +295,17 @@ function complaints(report) {
             otherwise.map(name => `${name.slice(REFUSED_PREFIX.length)} ${count(name)}`).join(', ')}`)
     }
     // A refusal qwen.ai put in the body of a 2xx (Qwen2API-0c6): invisible until the worker said it.
-    const inBody = [...report.counts].filter(([name]) => /^egress\.[^.]+\.refused\./.test(name))
+    // The name is egress.<path>.refused.<code>, and neither a path nor a code is without dots.
+    const inBody = []
+    for (const [name, hits] of report.counts) {
+        const at = name.indexOf('.refused.')
+        if (name.startsWith('egress.') && at > 'egress.'.length) inBody.push([name.slice('egress.'.length, at), name.slice(at + '.refused.'.length), hits])
+    }
     if (inBody.length) {
         // Said by the path, as the other complaints say chats/new.
-        const said = name => (name === 'chatsNew' ? 'chats/new' : name)
-        why.push(`qwen.ai refused ${inBody.reduce((sum, [, hits]) => sum + hits, 0)} call(s) in the body of a 2xx: ${
-            inBody.map(([name, hits]) => `${said(name.split('.')[1])} ${name.split('.').slice(3).join('.')} ${hits}`).join(', ')}`)
+        const said = path => (path === 'chatsNew' ? 'chats/new' : path)
+        why.push(`qwen.ai refused ${inBody.reduce((sum, [, , hits]) => sum + hits, 0)} call(s) in the body of a 2xx: ${
+            inBody.map(([path, code, hits]) => `${said(path)} ${code} ${hits}`).join(', ')}`)
     }
     if (total(report, 'app.workerRefused.')) why.push(`the worker could not serve ${total(report, 'app.workerRefused.')} call(s)`)
     // What the app answers its client with when a page was reloaded under its answer, and the relay broke (Qwen2API-nch).
@@ -345,6 +358,9 @@ function complaints(report) {
     if (total(report, 'tokenRefresh.failed.')) {
         why.push(`a page's token was not renewed ${total(report, 'tokenRefresh.failed.')} time(s)`)
     }
+    // A line of page loads longer than its limit (lib/page-load-queue.js): more loads at once than
+    // the spacing fits in it, so they began closer to each other than planned.
+    if (count('pageLoad.packed')) why.push(`${count('pageLoad.packed')} page load(s) began closer than planned: the line was longer than its limit`)
     const died = PAGE_DEATHS.reduce((sum, reason) => sum + count(`pages.closed.${reason}`), 0)
     if (died) why.push(`${died} resident page(s) died (not evicted or shut down)`)
     // Per account the limits are one reload in 30 s and one sign-in in 60 s; logs

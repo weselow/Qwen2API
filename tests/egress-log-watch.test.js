@@ -425,6 +425,7 @@ test('the shapes it reads are the shapes the code prints', () => {
         // Since Qwen2API-0c6: what the line says of an answer beyond its status.
         [worker, ' + answerNote(result))'],
         [read('signin-worker/lib/egress-fetch.js'), "notes.push(`code ${quoted(code, 80)}`)"],
+        [read('signin-worker/lib/egress-fetch.js'), "notes.push('refused, no code')"],
         [read('signin-worker/lib/egress-fetch.js'), "notes.push(`headers: ${shown.length ? shown.join(', ') : 'none'}`)"],
         [read('signin-worker/lib/egress-fetch.js'), "return notes.length ? ` — ${notes.join('; ')}` : ''"],
         // Since Qwen2API-xun, Qwen2API-nch and Qwen2API-ops: the page's token, a navigation's wait, a load's turn.
@@ -433,6 +434,7 @@ test('the shapes it reads are the shapes the code prints', () => {
         [residents, "(waited ${waited} ms for the page's streams)"],
         [residents, "`${left ? `${left} still running` : 'ended'} ("],
         [read('signin-worker/lib/page-load-queue.js'), "log('page-load', `waited ("],
+        [read('signin-worker/lib/page-load-queue.js'), "ms${entry.packed ? ', a long line packed' : ''})`)"],
         // And three of the app's own lines.
         [read('src/controllers/chat.js'), "logger.error('聊天处理错误', 'CHAT', '', error)"],
         [read('src/controllers/chat.js'), "logger.error('非流式聊天处理错误'"],
@@ -480,6 +482,9 @@ test('a refusal qwen.ai put in the body of a 2xx is counted as the refusal it is
         `${at(11)} egress-stream ${COMPLETIONS} end (5200 ms)`,
         `${at(12)} egress /api/v2/files/parse/status -> 200 (1/16 pages) — code ParseFailed`,
         `${at(12)} egress /api/v1/tasks/status/x -> 200 (1/16 pages) — code FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::x`,
+        // A refusal that names no code is a refusal all the same; and a path is a path, dots or no dots.
+        `${at(13)} egress /api/v2/chats/new -> 200 (1/16 pages) — refused, no code`,
+        `${at(13)} egress /api/v2.1/tasks/status/x -> 200 (1/16 pages) — code RGV587_ERROR::SM::x`,
         // Not a 2xx: said by its status, as before. What it quotes of a body is not looked into for a code.
         `${at(12)} egress /api/v2/files/getstsToken -> 405 (1/16 pages) — headers: content-type=text/html, x-region-restriction=true; body: <!doctype html><p>405; code in a body</p>`,
         `${at(13)} egress /api/v2/files/getstsToken -> 405 (1/16 pages) — code Method Not Allowed; headers: none; body: {"code":"Method Not Allowed"}`
@@ -488,14 +493,17 @@ test('a refusal qwen.ai put in the body of a 2xx is counted as the refusal it is
     // The accepted ones only.
     assert.equal(report.counts.get('egress.chatsNew.200'), 2)
     assert.equal(report.counts.get('egress.chatsNew.refused.unauthorized'), 1)
+    assert.equal(report.counts.get('egress.chatsNew.refused.no_code'), 1)
     assert.equal(report.counts.get('egress./api/v2/files/parse/status.refused.ParseFailed'), 1)
     assert.equal(report.counts.get('egress./api/v1/tasks/status/x.refused.FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::x'), 1)
+    assert.equal(report.counts.get('egress./api/v2.1/tasks/status/x.refused.RGV587_ERROR::SM::x'), 1)
     assert.equal(report.counts.get('egress./api/v2/files/getstsToken.405'), 2)
     assert.equal([...report.counts].filter(([name]) => name.startsWith('unparsed.')).length, 0)
     const { verdict, why, text } = watch.render(report)
     assert.equal(verdict, 'LOOK')
-    assert.ok(why.includes('qwen.ai refused 3 call(s) in the body of a 2xx: chats/new unauthorized 1, ' +
-        '/api/v2/files/parse/status ParseFailed 1, /api/v1/tasks/status/x FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::x 1'), why.join('\n'))
+    assert.ok(why.includes('qwen.ai refused 5 call(s) in the body of a 2xx: chats/new unauthorized 1, ' +
+        '/api/v2/files/parse/status ParseFailed 1, /api/v1/tasks/status/x FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::x 1, ' +
+        'chats/new no_code 1, /api/v2.1/tasks/status/x RGV587_ERROR::SM::x 1'), why.join('\n'))
     assert.ok(why.includes('egress./api/v2/files/getstsToken.405: 2'), why.join('\n'))
     assert.match(text, /refused\.unauthorized {2}1/)
 })
@@ -513,6 +521,8 @@ test('the worker’s new lines are counted: a page’s token renewed in place, a
     const lines = [
         `${at(0)} resident-open ok (1/16 pages, front-end 0.3.50)`,
         `${at(0)} page-load waited (12340 ms)`,
+        // A line longer than its limit, packed closer: said so.
+        `${at(15)} page-load waited (119300 ms, a long line packed)`,
         `${at(10)} token-refresh ok (412 ms, 15 min left)`,
         `${at(20)} token-refresh ok (380 ms, 15 min left, after a wait of 2130 ms)`,
         `${at(25)} resident-wait ended (waited 4312 ms for the page's streams)`,
@@ -527,14 +537,20 @@ test('the worker’s new lines are counted: a page’s token renewed in place, a
     // Two of one and one of the other: told apart, come what may.
     assert.equal(report.counts.get('pageWait.ended'), 2)
     assert.equal(report.counts.get('pageWait.timedOut'), 1)
-    assert.equal(report.counts.get('pageLoad.waits'), 1)
+    assert.equal(report.counts.get('pageLoad.waits'), 2)
+    // One of them was made to begin closer than planned: there was more to load than the spacing fits in the limit.
+    assert.equal(report.counts.get('pageLoad.packed'), 1)
     assert.equal([...report.counts].filter(([name]) => name.startsWith('unparsed.')).length, 0)
     const { text } = watch.render(report)
     assert.match(text, /ok {2}2/)
-    assert.match(text, /longest wait for a turn to load a page: 12340 ms/)
+    assert.match(text, /packed {2}1/)
+    assert.match(text, /longest wait for a turn to load a page: 119300 ms/)
     assert.match(text, /longest a navigation waited for the page's streams: 20000 ms/)
     // A wait that ran out cut a stream: that is what is said, not the wait.
-    assert.deepEqual(watch.complaints(report), ['1 stream(s) ended with an error'])
+    assert.deepEqual(watch.complaints(report), [
+        '1 stream(s) ended with an error',
+        '1 page load(s) began closer than planned: the line was longer than its limit'
+    ])
 })
 
 test('a refresh of a page’s token that failed is said, by why', () => {

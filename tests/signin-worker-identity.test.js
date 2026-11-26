@@ -402,7 +402,8 @@ test('the worker hands the headless mode to every launch it makes', async t => {
   assert.deepEqual(await shell.health(), {
     ok: true, sessions: 1, residentPages: 0, maxResidentPages: 16, headless: true, headlessMode: 'shell',
     // Reported where a flip is verified, as the mode is (Qwen2API-xun, Qwen2API-nch); the queue of page loads is off in these tests.
-    pageTokenRefresh: true, streamWaitMs: 20000, loadMinIntervalMs: 1
+    pageTokenRefresh: true, streamWaitMs: 20000, loadMinIntervalMs: 1, loadMaxWaitMs: 120000,
+    pageLoadQueue: { waiting: 0, nextInMs: 0 }
   })
 
   // Chrome by override, and reported where a flip is verified.
@@ -430,7 +431,8 @@ test('a browser with a window has no headless mode to report', async t => {
   assert.equal(headed.opens[0].headless, false)
   assert.deepEqual(await headed.health(), {
     ok: true, sessions: 1, residentPages: 0, maxResidentPages: 16, headless: false, headlessMode: null,
-    pageTokenRefresh: true, streamWaitMs: 20000, loadMinIntervalMs: 1
+    pageTokenRefresh: true, streamWaitMs: 20000, loadMinIntervalMs: 1, loadMaxWaitMs: 120000,
+    pageLoadQueue: { waiting: 0, nextInMs: 0 }
   })
 })
 

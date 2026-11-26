@@ -32,11 +32,20 @@
  * so do the account's new calls, which then run on the reloaded page. An
  * eviction, which closes a page, picks one without a stream when it can.
  *
+ * Also a page load takes a turn (beforeLoad; Qwen2API-nch, Qwen2API-ops): a
+ * renewal and a lazy open wait for the worker's turn, so that the pages of
+ * every account do not load at once. A sign-in does not wait — the login
+ * pacer spaces sign-ins, and the app's budget for one accounts for that pacer
+ * alone — it only tells the queue that it began.
+ *
  * Since Qwen2API-xun (2026-11-26) the page's token is renewed in place before
  * a call that finds it nearly spent (freshen()): by the front end's own
  * refresh call (egress-fetch.js#pageRefreshToken), not by a reload. A reload
  * was what the app's recovery made of every call that came after fifteen
- * minutes without one — and it cut every stream on the page.
+ * minutes without one — and it cut every stream on the page. A refresh that
+ * does not get through (the auth host not answering) opens a circuit: for a
+ * while no other page tries its own, and each call goes out at once on the
+ * token it has, to the app's recovery as before.
  *
  * Since Qwen2API-3ue.6 a WAF challenge page is recognised as what it is, at
  * once. The page's own request hooks keep an answer they take for a block away
@@ -96,10 +105,14 @@ const TOKEN_STATE_MS = 2000
  *   Default 30000
  * @param {number} [options.tokenReadAgainMs] - What was read of the page's token stands this long at most
  *   before it is read again. Default 60000
+ * @param {number} [options.tokenRefreshCircuitMs] - After a refresh that did not get through (the auth
+ *   host not answering), no other page tries its own for this long. Default 60000
  * @param {number} [options.streamWaitMs] - How long a navigation on a live page waits for the streams
  *   running on it (Qwen2API-nch). Default 20000; 0 = it does not wait
- * @param {() => Promise<void>} [options.beforeLoad] - Waits for the worker's turn before a page is
- *   loaded (Qwen2API-nch, Qwen2API-ops): every load of every account is kept apart
+ * @param {(options: {turn: boolean}) => Promise<void>} [options.beforeLoad] - Before a page is loaded
+ *   (Qwen2API-nch, Qwen2API-ops): with `turn` it waits for the worker's turn, so that the loads of
+ *   every account are kept apart; without it — a sign-in, which the login pacer spaces — it only
+ *   tells the queue that a load begins
  */
 function createResidents({
     signer,
@@ -127,6 +140,7 @@ function createResidents({
     beforeTokenRefresh = async () => {},
     tokenRetryMs = 30000,
     tokenReadAgainMs = 60000,
+    tokenRefreshCircuitMs = 60000,
     streamWaitMs = 20000,
     beforeLoad = async () => {},
     log = () => {},
@@ -135,6 +149,7 @@ function createResidents({
 }) {
     // Same scope browser-signin.finish harvests.
     const cookieUrls = [new URL(chatOrigin).origin, 'https://auth.qwen.ai']
+    const authRoot = String(authOrigin).replace(/\/+$/, '')
     // email -> { context, page, proxy, state: 'opening'|'ready', lastUsed, inflight, exclusive, ... }
     const pages = new Map()
     // email -> the close still in progress. Chromium holds the profile lock
@@ -143,6 +158,9 @@ function createResidents({
     // id -> the stream now running on a page, as stream() registered it. The
     // page reports by id through the channel every page is given on opening.
     const streams = new Map()
+    // The front end's refresh does not get through from one page — the auth
+    // host is not answering: until this moment no other page tries its own.
+    let tokenRefreshDownUntil = 0
     let stopped = false
 
     // What the page calls (page -> Node) for every event of a stream. Resolves
@@ -407,14 +425,24 @@ function createResidents({
      * not followed by another for `tokenRetryMs`, whatever calls arrive.
      *
      * Caller holds the account lock: the calls of one page wait here for one
-     * refresh, and find a young token after it. Never throws but when the
-     * worker stops while it waits for its turn.
+     * refresh, and find a young token after it. Throws only `page_closed`, when
+     * the worker stops while the page is waited or asked for its token.
+     *
+     * A refresh that does not get through — the auth host not answering, a
+     * preflight refused — is no page's own trouble: it opens a circuit, and for
+     * `tokenRefreshCircuitMs` no other page tries its own. Without it a host
+     * that hangs would cost every page its first call a wait, one after another.
      *
      * @param {object} entry
      */
     async function freshen(entry) {
         const now = Date.now()
         if (now < entry.tokenCheckedUntil || now < entry.tokenRetryAt) return
+        if (now < tokenRefreshDownUntil) {
+            // Read again when the circuit closes, or in a minute: not counted against this page.
+            entry.tokenCheckedUntil = now + Math.min(tokenRefreshDownUntil - now, tokenReadAgainMs)
+            return
+        }
         const state = await asked(entry, pageTokenState, TOKEN_STATE_MS)
         const left = Number.isFinite(state?.msLeft) ? state.msLeft : null
         // How long this reading stands: a minute, or exactly as long as it leaves the margin.
@@ -426,8 +454,10 @@ function createResidents({
         const wait = queued ? `, after a wait of ${queued} ms` : ''
         const started = Date.now()
         const answer = await asked(entry, pageRefreshToken, tokenRefreshTimeoutMs + backstopMs, {
-            url: `${authOrigin}/api/v2/auths/refresh`, timeoutMs: tokenRefreshTimeoutMs, sourceId: 'signin-worker'
+            url: `${authRoot}/api/v2/auths/refresh`, timeoutMs: tokenRefreshTimeoutMs, sourceId: 'signin-worker'
         })
+        // The worker stopped while the page was asked: its closing the page is no failure of the refresh, and is not said as one.
+        if (stopped) throw new WorkerError('page_closed', 'The worker is shutting down.')
         const took = Date.now() - started
         if (answer?.ok && Number.isFinite(answer.msLeft) && answer.msLeft > 0) {
             entry.tokenCheckedUntil = Date.now() + Math.max(0, Math.min(answer.msLeft - tokenRefreshMarginMs, tokenReadAgainMs))
@@ -435,10 +465,14 @@ function createResidents({
             return
         }
         // Said without what qwen.ai may have put in its message beyond its code: the message is for the app's log, when the app gets the refusal itself.
+        // The code is qwen.ai's, on one line of the worker's log: nothing but a word of it.
+        // eslint-disable-next-line no-control-regex
+        const code = answer?.code ? `, code ${String(answer.code).replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 80)}` : ''
         const why = !answer ? 'the page did not answer'
-            : answer.reason === 'refused' ? `refused, status ${answer.status}${answer.code ? `, code ${String(answer.code).slice(0, 80)}` : ''}`
-                : answer.reason
+            : answer.reason === 'refused' ? `refused, status ${answer.status}${code}`
+                : String(answer.reason)
         entry.tokenRetryAt = Date.now() + tokenRetryMs
+        if (answer?.reason === 'network_error' || answer?.reason === 'timeout') tokenRefreshDownUntil = Date.now() + tokenRefreshCircuitMs
         log('token-refresh', `failed (${why}, ${took} ms${wait})`)
     }
 
@@ -477,25 +511,21 @@ function createResidents({
                 current.inflight--
                 throw error
             }
-            // Dropped while its token was seen to — a crash, a stop: opened anew below.
             if (pages.get(email) === current && current.state === 'ready') return current
+            // Dropped while its token was seen to — a crash, a stop: whatever dropped it closed it.
             current.inflight--
+            if (stopped) throw new WorkerError('page_closed', 'The worker is shutting down.')
         }
-        if (current) await retire(current, current.proxy === proxy ? 'unready' : 'proxy_changed')
+        // A page still registered is retired, letting what runs on it finish; one already dropped was closed by whatever dropped it.
+        if (current && pages.get(email) === current) await retire(current, current.proxy === proxy ? 'unready' : 'proxy_changed')
         if (!fs.existsSync(profileDir(email))) {
             throw new WorkerError('no_profile', 'No persisted profile for this account.')
         }
         await whenClosed(email)
         await evictForSlot()
-        // After the waits above and right before the browser starts: a stop
-        // that landed meanwhile (shutdown drops every page it can see) must
-        // not be followed by a launch it cannot see.
-        if (stopped) throw new WorkerError('page_closed', 'The worker is shutting down.')
-        // The page this opens is a page load like any other: it waits for the
-        // worker's turn (Qwen2API-nch, Qwen2API-ops) — here, before a browser
-        // is launched for it, so that a line of openings is not a line of
-        // browsers waiting.
-        await beforeLoad()
+        // After the waits above and right before the page is registered: a
+        // stop that landed meanwhile (shutdown drops every page it can see)
+        // must not be followed by a launch it cannot see.
         if (stopped) throw new WorkerError('page_closed', 'The worker is shutting down.')
         const entry = {
             email, proxy, context: null, page: null, state: 'opening',
@@ -503,8 +533,17 @@ function createResidents({
             // The streams now running on it, by id; what was read of its token (freshen).
             streams: new Set(), tokenCheckedUntil: 0, tokenRetryAt: 0
         }
+        // Registered before it waits for its turn, so that it counts against
+        // the cap meanwhile: whoever else comes while it waits sees it.
         pages.set(email, entry)
         try {
+            // The page this opens is a page load like any other: it waits for
+            // the worker's turn (Qwen2API-nch, Qwen2API-ops) — before a browser
+            // is launched for it, so that a line of openings is not a line of
+            // browsers waiting.
+            await beforeLoad({ turn: true })
+            // Stopping, or dropped while it waited: no browser is launched for it.
+            if (stopped || pages.get(email) !== entry) throw new WorkerError('page_closed', 'The worker is shutting down.')
             entry.context = await signer.openContext({ dataDir: profileDir(email), proxy, headless, headlessMode })
             // Dropped while the browser was launching: never bring the page
             // back from under that.
@@ -530,14 +569,26 @@ function createResidents({
             // Claimed for the caller from here — not idle, so not to be
             // evicted — while its token is made young enough (Qwen2API-xun).
             entry.inflight++
-            if (pageTokenRefresh) await freshen(entry)
+            try {
+                if (pageTokenRefresh) await freshen(entry)
+            } catch (error) {
+                entry.inflight--
+                throw error
+            }
+            // Dropped while its token was renewed — a crash: closed already, and no page to call on.
+            if (pages.get(email) !== entry) {
+                entry.inflight--
+                throw new WorkerError('page_closed', 'The resident page was closed while opening.')
+            }
             log('resident-open', `ok (${pages.size}/${maxPages} pages, front-end ${await frontEnd(entry)})`)
             return entry
         } catch (error) {
             // Stopping: the shutdown under way is what closes this page, and
             // a line about a page that died would say what did not happen.
             if (stopped) throw new WorkerError('page_closed', 'The worker is shutting down.')
-            await close(entry, 'open_failed')
+            // Dropped by whatever closed it — a crash: its close ran, and said
+            // why. It is not said to have died a second time.
+            if (pages.get(email) === entry) await close(entry, 'open_failed')
             throw error
         }
     }
@@ -763,20 +814,24 @@ function createResidents({
      * next fetch reopens it from the profile.
      *
      * Since Qwen2API-nch (2026-11-26) the streams running on the page are
-     * waited for first (up to streamWaitMs): a navigation ends them. And the
-     * navigation itself, a page load, waits for the worker's turn like every
-     * other. The account's calls that arrive meanwhile wait on the lock, and
-     * run on the page as it is afterwards.
+     * waited for first (up to streamWaitMs): a navigation ends them. And a
+     * renewal, a page load, waits for the worker's turn like every other. The
+     * account's calls that arrive meanwhile wait on the lock, and run on the
+     * page as it is afterwards. A sign-in does not wait for the turn (the
+     * login pacer spaces sign-ins); it only tells the queue that it begins.
      *
      * @param {object} entry
      * @param {(context: object) => Promise<object>} operation
+     * @param {{turn?: boolean}} [options] - `turn` false: the operation is a sign-in
      */
-    async function exclusive(entry, operation) {
+    async function exclusive(entry, operation, { turn = true } = {}) {
         entry.exclusive = true
         try {
             await waitForStreams(entry)
             await drain(entry)
-            await beforeLoad()
+            await beforeLoad({ turn })
+            // Dropped while it waited — a crash, a keep-alive that found the context gone: closed already, and no page to run on.
+            if (pages.get(entry.email) !== entry) throw new WorkerError('page_closed', 'The resident page was closed while waiting for its turn.')
             const result = await operation(entry.context)
             // The operation reloaded the page (or signed in on it): no call
             // goes out into it before its token has settled.
@@ -786,9 +841,9 @@ function createResidents({
             entry.tokenRetryAt = 0
             return result
         } catch (error) {
-            // Stopping: the shutdown under way is what closes this page, and
-            // a line about a page that died would say what did not happen.
-            if (!stopped) await close(entry, 'operation_failed')
+            // Stopping, or dropped by whatever closed it: the page is not said
+            // to have died here — a line about it would say what did not happen.
+            if (!stopped && pages.get(entry.email) === entry) await close(entry, 'operation_failed')
             throw error
         } finally {
             entry.exclusive = false
