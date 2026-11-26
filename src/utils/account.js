@@ -99,6 +99,14 @@ const _hasNonZeroStats = (stats) => {
 // deleted or not deletable are worth a word, kept and never-there are not.
 const FORGET_PROFILE_NOTE = { deleted: '，浏览器配置已删除', left: '，浏览器配置没能删除', absent: '', kept: '' }
 
+// The timer's cycle of token refreshes (Qwen2API-ops). In browser mode one
+// refresh is a reload of the account's page in the signin-worker, so two
+// accounts of one cycle are kept this far apart, plus up to the same again as
+// jitter — as the worker keeps its full sign-ins. Shorter, and the next
+// account's renewal would stand in the worker's line of page loads, holding
+// that account's lock until its turn (Qwen2API-m47).
+const AUTO_REFRESH_MIN_INTERVAL_MS = 30000
+
 const STATS_HISTORY_RETENTION_DAYS = 90
 /**
  * 账户管理器
@@ -124,6 +132,8 @@ class Account {
         // cli请求次数定时刷新器
         this.cliRequestNumberInterval = null
         this.cliDailyResetInterval = null
+        // Whether the timer's cycle of token refreshes is running (autoRefreshTokens)
+        this.autoRefreshCycleRunning = false
 
         // Keep the init promise so debug methods can await readiness
         this._initPromise = this._initialize()
@@ -149,7 +159,7 @@ class Account {
             // 设置定期刷新令牌
             if (config.autoRefresh) {
                 this.refreshInterval = setInterval(
-                    () => this.autoRefreshTokens(),
+                    () => this.autoRefreshTokens(24, { paced: true }),
                     (config.autoRefreshInterval || 21600) * 1000 // 默认6小时
                 )
             }
@@ -513,14 +523,41 @@ class Account {
     /**
      * 自动刷新即将过期的令牌
      * @param {number} thresholdHours - 过期阈值（小时）
+     * @param {Object} [options]
+     * @param {boolean} [options.paced] - 调用方是定时器（Qwen2API-ops）：browser 模式下同一次循环里的
+     *   账户彼此隔开（_refreshPauseMs），上一轮还没结束时这一轮不开始。面板的按钮不传它——
+     *   它们在自己的 HTTP 请求里等结果，间隔照旧。
      * @returns {Promise<number>} 成功刷新的令牌数量
      */
-    async autoRefreshTokens(thresholdHours = 24) {
+    async autoRefreshTokens(thresholdHours = 24, { paced = false } = {}) {
         if (!this.isInitialized) {
             logger.warn('账户管理器尚未初始化，跳过自动刷新', 'TOKEN')
             return 0
         }
+        // 一次只有一轮：账户之间的停顿能让一轮持续得比定时器的间隔还久（16 个账户——
+        // 间隔 15 分钟时最多约 18 分钟），而同时跑着的第二轮会一次更新两个账户。
+        if (paced && this.autoRefreshCycleRunning) {
+            logger.info('上一轮自动刷新还没结束，跳过这一轮', 'TOKEN')
+            return 0
+        }
+        if (paced) this.autoRefreshCycleRunning = true
+        try {
+            return await this._refreshDueTokens(thresholdHours, paced)
+        } finally {
+            if (paced) this.autoRefreshCycleRunning = false
+        }
+    }
 
+    /**
+     * 一轮：刷新令牌将在阈值内过期的账户。循环可能持续几分钟，所以期间被删除的账户、
+     * 或令牌已经被别的路径更新过的账户，都跳过（Qwen2API-ops；刷新被删除的账户还会在
+     * signin-worker 里重新打开它的页面——Qwen2API-2l0）。
+     * @param {number} thresholdHours - 过期阈值（小时）
+     * @param {boolean} paced - 是否是定时器的那一轮（autoRefreshTokens）
+     * @returns {Promise<number>} 成功刷新的令牌数量
+     * @private
+     */
+    async _refreshDueTokens(thresholdHours, paced) {
         logger.info('开始自动刷新令牌...', 'TOKEN', '🔄')
 
         // 获取需要刷新的账户
@@ -537,7 +574,18 @@ class Account {
         let failedCount = 0
 
         // 逐个刷新账户，每次成功后立即保存
-        for (const account of needsRefresh) {
+        for (const [index, account] of needsRefresh.entries()) {
+            // Judged by the record as it is now, not by the one the cycle began with: a
+            // refresh replaces the record, a recovered session rewrites its token in place.
+            const current = this.accountTokens.find(acc => acc.email === account.email)
+            if (!current) {
+                logger.info(`账户 ${account.email} 已被删除，跳过刷新`, 'TOKEN')
+                continue
+            }
+            if (!this.tokenManager.isTokenExpiringSoon(current.token, thresholdHours)) {
+                logger.info(`账户 ${account.email} 的令牌已是新的，跳过刷新`, 'TOKEN')
+                continue
+            }
             try {
                 const refreshed = await this.refreshAccountToken(account.email)
                 if (refreshed) {
@@ -557,7 +605,16 @@ class Account {
             }
 
             // 添加延迟避免请求过于频繁
-            await this._delay(1000)
+            if (paced && v2sessions.browser) {
+                // 最后一个账户之后不停：后面已经没有要隔开的了
+                if (index < needsRefresh.length - 1) {
+                    const pauseMs = this._refreshPauseMs()
+                    logger.info(`${Math.round(pauseMs / 1000)} 秒后刷新下一个账户 (${index + 1}/${needsRefresh.length})`, 'TOKEN')
+                    await this._delay(pauseMs)
+                }
+            } else {
+                await this._delay(1000)
+            }
         }
 
         // 更新轮询器
@@ -565,6 +622,16 @@ class Account {
 
         logger.success(`令牌刷新完成: 成功 ${successCount} 个，失败 ${failedCount} 个`, 'TOKEN')
         return successCount
+    }
+
+    /**
+     * 定时器那一轮里两个账户之间等多久（Qwen2API-ops）：最小间隔，加上最多同样大小的随机添加卡
+     * @param {() => number} [random] - 添加卡的来源，[0, 1)
+     * @returns {number} 毫秒
+     * @private
+     */
+    _refreshPauseMs(random = Math.random) {
+        return Math.round(AUTO_REFRESH_MIN_INTERVAL_MS * (1 + random()))
     }
 
     /**
