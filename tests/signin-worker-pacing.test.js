@@ -590,3 +590,20 @@ test('Qwen2API-nch: the queue hands out turns one interval apart plus jitter, is
   stopping.stop()
   await assert.rejects(stopping.wait(), { code: 'page_closed' })
 })
+
+test('Qwen2API-nch: RESIDENT_STREAM_WAIT_MS is read from the environment, 0 included — no wait', async t => {
+  const previous = process.env.RESIDENT_STREAM_WAIT_MS
+  t.after(() => {
+    if (previous === undefined) delete process.env.RESIDENT_STREAM_WAIT_MS
+    else process.env.RESIDENT_STREAM_WAIT_MS = previous
+  })
+  const signer = fakeSigner()
+  const fromEnvironment = { streamWaitMs: undefined }
+  delete process.env.RESIDENT_STREAM_WAIT_MS
+  assert.equal((await (await start(t, { signer, ...fromEnvironment })).health()).streamWaitMs, 20000)
+  process.env.RESIDENT_STREAM_WAIT_MS = '0'
+  assert.equal((await (await start(t, { signer, ...fromEnvironment })).health()).streamWaitMs, 0)
+  // A value that is no number leaves the default.
+  process.env.RESIDENT_STREAM_WAIT_MS = 'soon'
+  assert.equal((await (await start(t, { signer, ...fromEnvironment })).health()).streamWaitMs, 20000)
+})

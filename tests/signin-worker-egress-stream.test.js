@@ -1586,3 +1586,33 @@ test('Qwen2API-xun: a stream on a page whose token is nearly spent is sent on th
   // No page was reloaded for any of it.
   assert.equal(signer.calls.filter(call => call.op === 'renew').length, 1)
 })
+
+test('a page that is closed for a proxy change waits for its streams first (Qwen2API-nch)', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  // minCacheSeconds forces the live path: the default cache would answer /renew without touching the page.
+  const { streaming, post, dataDir } = await start(t, { signer, streamWaitMs: 3000, minCacheSeconds: 7200 })
+  const email = 'proxy@example.invalid'
+  withProfile(dataDir, email)
+  const upstream = feedable()
+  signer.script.fetch = upstream.fetch
+  const opened = await streaming(email)
+  upstream.push('data: {"n":1}\n\n')
+  assert.equal((await opened.next()).type, 'chunk')
+  // When the page's browser is told to close.
+  const closes = []
+  const page = signer.contexts[0]
+  const close = page.close.bind(page)
+  page.close = async () => { closes.push(Date.now()); return close() }
+
+  // The account is asked for on another proxy: its page cannot serve that, and is closed for a new browser.
+  const switched = post('/renew', { email, proxy: 'http://proxy.example:8080' })
+  await new Promise(resolve => setTimeout(resolve, 150))
+  assert.deepEqual(closes, [], 'the page was closed under a running stream')
+  const finishedAt = Date.now()
+  upstream.finish()
+  assert.deepEqual(kinds(await readAll(opened)), ['end'])
+  assert.equal((await switched).status, 200)
+  assert.equal(closes.length, 1)
+  assert.ok(closes[0] >= finishedAt, `the page was closed at ${closes[0] - finishedAt} ms of the stream's end`)
+  assert.equal(signer.calls.filter(call => call.op === 'open').at(-1).proxy, 'http://proxy.example:8080')
+})

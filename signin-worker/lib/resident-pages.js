@@ -467,14 +467,19 @@ function createResidents({
     async function acquire(email, proxy = null) {
         const current = pages.get(email)
         if (current && current.state === 'ready' && current.proxy === proxy) {
-            // The page's token is made young enough for the call first (Qwen2API-xun).
-            if (pageTokenRefresh) await freshen(current)
-            // Dropped while its token was seen to — a crash, a stop: opened anew below.
-            if (pages.get(email) === current && current.state === 'ready') {
-                current.lastUsed = Date.now()
-                current.inflight++
-                return current
+            // Claimed from here — not idle, so not to be evicted — while the
+            // page's token is made young enough for the call (Qwen2API-xun).
+            current.lastUsed = Date.now()
+            current.inflight++
+            try {
+                if (pageTokenRefresh) await freshen(current)
+            } catch (error) {
+                current.inflight--
+                throw error
             }
+            // Dropped while its token was seen to — a crash, a stop: opened anew below.
+            if (pages.get(email) === current && current.state === 'ready') return current
+            current.inflight--
         }
         if (current) await retire(current, current.proxy === proxy ? 'unready' : 'proxy_changed')
         if (!fs.existsSync(profileDir(email))) {
@@ -522,9 +527,10 @@ function createResidents({
             entry.keepAlive = setInterval(() => { keepAlive(entry) }, keepAliveMs)
             entry.keepAlive.unref?.()
             entry.lastUsed = Date.now()
-            // Before the first call goes into it (Qwen2API-xun).
-            if (pageTokenRefresh) await freshen(entry)
+            // Claimed for the caller from here — not idle, so not to be
+            // evicted — while its token is made young enough (Qwen2API-xun).
             entry.inflight++
+            if (pageTokenRefresh) await freshen(entry)
             log('resident-open', `ok (${pages.size}/${maxPages} pages, front-end ${await frontEnd(entry)})`)
             return entry
         } catch (error) {

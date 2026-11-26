@@ -2065,3 +2065,139 @@ test('Qwen2API-0c6: answerNote quotes a refusal and a failure, and nothing else'
   const masked = answerNote({ status: 502, headers: {}, body: `Bearer abc.${jwt} and ${jwt} again` })
   assert.equal(masked, ' — headers: none; body: <credential> and <credential> again')
 })
+
+test('Qwen2API-xun: a page is not idle while its token is renewed on a call — at the cap it is not evicted for another account', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, maxPages: 2, tokenReadAgainMs: 40 })
+  for (const email of ['x@example.invalid', 'y@example.invalid', 'z@example.invalid']) withProfile(dataDir, email)
+  // Both pages are open, each on a token of its own.
+  for (const email of ['x@example.invalid', 'y@example.invalid']) assert.equal(await callOnce(post, email), 200)
+  const [x, y] = signer.contexts.map(context => context.page)
+  x.storage = keptToken({ leftMs: 60000 })
+  y.storage = keptToken({ leftMs: 3600000 })
+  await sleep(60)
+  // The refresh of x's page takes a while...
+  let release
+  const refreshing = new Promise(resolve => { release = resolve })
+  const asked = []
+  signer.script.fetch = async (url, init) => {
+    asked.push({ url, init, at: Date.now() })
+    if (isRefresh(url)) await refreshing
+    // ...and y's page is busy with a call of its own meanwhile.
+    if (init.headers['x-request-id'] === 'y-hold') await refreshing
+    return isRefresh(url)
+      ? jsonResponse({ success: true, data: { access_token: RENEWED, expires_at: Math.floor(Date.now() / 1000) + 900 } })
+      : jsonResponse({ success: true })
+  }
+  const busy = egress(post, 'y@example.invalid', { headers: { 'content-type': 'application/json', 'x-request-id': 'y-hold' } })
+  const renewed = egress(post, 'x@example.invalid', { headers: { 'content-type': 'application/json' } })
+  await until(() => asked.some(call => isRefresh(call.url)))
+
+  // z arrives at the cap: x's page is claimed for its call, y's is busy with one.
+  const refused = await egress(post, 'z@example.invalid')
+  assert.equal(refused.status, 503)
+  assert.equal((await refused.json()).code, 'resident_capacity')
+
+  release()
+  assert.equal((await renewed).status, 200)
+  assert.equal((await busy).status, 200)
+  // x's call went out on the renewed token, on the page it started with.
+  assert.equal(asked.at(-1).init.headers.authorization, `Bearer ${RENEWED}`)
+  assert.equal(signer.contexts[0].closed, false, "x's page was evicted while its token was being renewed")
+  assert.equal(signer.contexts.length, 2)
+})
+
+test('Qwen2API-xun: a page is claimed while its token is renewed as it opens — at the cap it is not evicted for another account', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, maxPages: 1 })
+  for (const email of ['x@example.invalid', 'z@example.invalid']) withProfile(dataDir, email)
+  // x's page opens on a token with a minute left, and the refresh takes a while.
+  signer.script.storage = keptToken({ leftMs: 60000 })
+  let release
+  const refreshing = new Promise(resolve => { release = resolve })
+  const asked = []
+  signer.script.fetch = async (url, init) => {
+    asked.push({ url, init, at: Date.now() })
+    if (isRefresh(url)) await refreshing
+    return isRefresh(url)
+      ? jsonResponse({ success: true, data: { access_token: RENEWED, expires_at: Math.floor(Date.now() / 1000) + 900 } })
+      : jsonResponse({ success: true })
+  }
+  const opening = egress(post, 'x@example.invalid', { headers: { 'content-type': 'application/json' } })
+  await until(() => asked.some(call => isRefresh(call.url)))
+
+  // z arrives at the cap while x's page is up for its caller, its token being renewed.
+  const refused = await egress(post, 'z@example.invalid')
+  assert.equal(refused.status, 503)
+  assert.equal((await refused.json()).code, 'resident_capacity')
+
+  release()
+  assert.equal((await opening).status, 200)
+  assert.equal(asked.at(-1).init.headers.authorization, `Bearer ${RENEWED}`)
+  assert.equal(signer.contexts[0].closed, false, "x's page was evicted while its token was being renewed")
+  assert.equal(signer.contexts.length, 1)
+})
+
+test('Qwen2API-nch: a renewal on a resident page takes its turn in the queue, like the page’s own opening', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, loadMinIntervalMs: 200, minCacheSeconds: 7200 })
+  const email = 'turn@example.invalid'
+  withProfile(dataDir, email)
+  // When the page was loaded: its opening, then its reload.
+  const loads = []
+  const renew = signer.renew
+  signer.renew = async context => { loads.push(Date.now()); return renew(context) }
+  assert.equal(await callOnce(post, email), 200)
+  const askedAt = Date.now()
+  assert.equal((await post('/renew', { email, force: true })).status, 200)
+  assert.equal(loads.length, 2)
+  // Timers never fire early: the reload waited for the worker's turn.
+  assert.ok(loads[1] - loads[0] >= 200, `the reload came ${loads[1] - loads[0]} ms after the opening`)
+  assert.ok(loads[1] >= askedAt)
+})
+
+test('Qwen2API-nch: two accounts opening their pages at once load them one after the other, and no browser is launched before its turn', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, loadMinIntervalMs: 150 })
+  const emails = ['first@example.invalid', 'second@example.invalid']
+  for (const email of emails) withProfile(dataDir, email)
+  // When each browser was launched, and when each page was loaded.
+  const launches = []
+  const loads = []
+  const open = signer.openContext
+  signer.openContext = async options => { launches.push(Date.now()); return open(options) }
+  const renew = signer.renew
+  signer.renew = async context => { loads.push(Date.now()); return renew(context) }
+
+  assert.deepEqual(await Promise.all(emails.map(email => callOnce(post, email))), [200, 200])
+  assert.equal(loads.length, 2)
+  // Timers never fire early.
+  assert.ok(loads[1] - loads[0] >= 150, `the pages were loaded ${loads[1] - loads[0]} ms apart`)
+  // The turn is waited for before the browser starts: a line of openings is not a line of browsers waiting.
+  assert.ok(launches[1] - launches[0] >= 150, `the browsers were launched ${launches[1] - launches[0]} ms apart`)
+})
+
+test('Qwen2API-xun: what was read of the page’s token stands exactly as long as the token leaves the margin — no longer', async t => {
+  const signer = fakeBrowser()
+  // A reading may stand for three seconds; this token leaves the margin for a second and a half.
+  const { post, dataDir } = await start(t, { signer, tokenReadAgainMs: 3000 })
+  const email = 'edge@example.invalid'
+  withProfile(dataDir, email)
+  signer.script.storage = keptToken({ leftMs: 180000 + 1500, token: 'edge-token' })
+  const asked = qwenAi(signer.script)
+
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(await callOnce(post, email), 200)
+  // More than the margin is left: no refresh, and no second question to the page.
+  assert.equal(refreshesOf(asked).length, 0)
+  assert.equal(asked.at(-1).init.headers.authorization, 'Bearer edge-token')
+  const reads = tokenReads(signer.contexts[0].page)
+  assert.equal(reads, 1)
+
+  // The token has run into the margin since — sooner than a reading may stand: it is read again, and renewed.
+  await sleep(1700)
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(tokenReads(signer.contexts[0].page), reads + 1)
+  assert.equal(refreshesOf(asked).length, 1)
+  assert.equal(asked.at(-1).init.headers.authorization, `Bearer ${RENEWED}`)
+})
