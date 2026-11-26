@@ -10,7 +10,8 @@ const { resolveProxyUrl } = require('./proxy-helper')
  * Chromium profiles; this module asks it to acquire or renew a chat.qwen.ai
  * session and hands the harvested token + cookies to the session store. Since
  * Qwen2API-3ue.2 it also carries qwen.ai API calls into the account's resident
- * page (/egress) — streamed since Qwen2API-3ue.3 (egressStream).
+ * page (/egress) — streamed since Qwen2API-3ue.3 (egressStream) — and it
+ * tells the worker when the app drops an account (Qwen2API-2l0, forgetAccount).
  *
  * Credentials travel only in request bodies over the internal network and
  * are never logged: error paths log worker status codes, never payloads.
@@ -125,6 +126,32 @@ async function renewSession(email, account, { force = false } = {}) {
     if (force) payload.force = true
     const harvested = await callWorker('/renew', payload)
     return { token: harvested.token, expiresAt: harvested.expiresAt, jar: store.jarFromCookies(harvested.cookies) }
+}
+
+// What /forget takes at the worker: the calls in flight on the page get a
+// moment to finish, then the page closes — both bounded at 5 s there. A
+// sign-in or renewal still running for the account is not waited for here:
+// the worker finishes the job without the app.
+const FORGET_TIMEOUT_MS = 15000
+
+/**
+ * The app dropped the account: the worker forgets it too (Qwen2API-2l0) — the
+ * session it cached, with its silent-renew timer, and the resident page. An
+ * account the worker never saw is forgotten all the same. Whether the browser
+ * profile goes with it is the worker's own setting.
+ * @param {string} email
+ * @param {number} [timeoutMs]
+ * @returns {Promise<{session: boolean, page: boolean, profile: 'kept'|'deleted'|'absent'|'left'}>}
+ *   what the worker dropped; `profile` says what became of the browser profile
+ * @throws {SigninError} the worker refused or did not answer
+ */
+async function forgetAccount(email, timeoutMs = FORGET_TIMEOUT_MS) {
+    const answer = (await postWorker('/forget', { email }, timeoutMs)).data
+    if (answer?.ok !== true || typeof answer.session !== 'boolean' || typeof answer.page !== 'boolean' ||
+        !['kept', 'deleted', 'absent', 'left'].includes(answer.profile)) {
+        throw new SigninError('signin_upstream_error', 502, 'Signin worker returned a malformed forget.')
+    }
+    return { session: answer.session, page: answer.page, profile: answer.profile }
 }
 
 // What the worker's own budget does not cover on /egress: opening the
@@ -309,4 +336,4 @@ async function egressStream(email, account, { url, method = 'POST', headers = {}
     }
 }
 
-module.exports = { acquireSession, renewSession, egress, egressStream, EGRESS_OPEN_MARGIN_MS }
+module.exports = { acquireSession, renewSession, forgetAccount, egress, egressStream, EGRESS_OPEN_MARGIN_MS, FORGET_TIMEOUT_MS }

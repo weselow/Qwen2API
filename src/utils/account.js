@@ -7,6 +7,7 @@ const sessionPersistence = require('./v2-session-persistence')
 const AccountRotator = require('./account-rotator')
 const { logger } = require('./logger')
 const { generateDeterministicFingerprint } = require('./fingerprint')
+const signinWorker = require('./signin-worker-client')
 
 /**
  * 默认 daily stats 结构。返回新对象，调用方安全修改
@@ -93,6 +94,10 @@ const _hasNonZeroStats = (stats) => {
         || (Number(l.input) || 0) > 0
         || (Number(l.output) || 0) > 0
 }
+
+// What the worker's /forget reports of the browser profile (Qwen2API-2l0):
+// deleted or not deletable are worth a word, kept and never-there are not.
+const FORGET_PROFILE_NOTE = { deleted: '，浏览器配置已删除', left: '，浏览器配置没能删除', absent: '', kept: '' }
 
 const STATS_HISTORY_RETENTION_DAYS = 90
 /**
@@ -998,12 +1003,38 @@ class Account {
                 if (account.cli_info?.refresh_token_interval) clearInterval(account.cli_info.refresh_token_interval)
                 this.accountRotator.setAccounts(this.accountTokens)
                 logger.success(`成功移除账户: ${email}`, 'ACCOUNT')
+                // In browser mode the signin-worker keeps a session, a renew
+                // timer and a page for every account it has seen (Qwen2API-2l0).
+                // Told here, inside the account's queue: the deletion is durable
+                // by now, and nothing done to this account later can overtake it.
+                await this._forgetWorkerSession(email)
                 return true
             } catch (error) {
                 logger.error(`移除账户失败 (${email})`, 'ACCOUNT', '', error)
                 return false
             }
         })
+    }
+
+    /**
+     * 账户已经从应用里删掉——让 signin-worker 也忘掉它（Qwen2API-2l0）：否则它为这个
+     * 账户留着的会话、悄悄续期的定时器和常驻页面会一直活着。删除已经落盘，这里只是
+     * 通知：signin-worker 拒绝或没有回答，账户照样是删除的，日志里留一条警告。
+     * 只有 browser 模式用得到 signin-worker。
+     * @param {string} email - 邮箱地址
+     * @returns {Promise<void>}
+     * @private
+     */
+    async _forgetWorkerSession(email) {
+        if (!v2sessions.browser) return
+        try {
+            const forgotten = await signinWorker.forgetAccount(email)
+            logger.info(`signin-worker 已忘掉账户 ${email}（会话${forgotten.session ? '已清除' : '本无'}，` +
+                `页面${forgotten.page ? '已关闭' : '本无'}${FORGET_PROFILE_NOTE[forgotten.profile] || ''}）`, 'ACCOUNT')
+        } catch (error) {
+            logger.warn(`账户 ${email} 已删除，但 signin-worker 没能忘掉它 (${error.workerCode || error.code})：` +
+                '它的会话、续期定时器和页面会留在 signin-worker 里，直到 signin-worker 重启', 'ACCOUNT')
+        }
     }
 
     /**
