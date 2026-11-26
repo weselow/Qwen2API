@@ -1032,7 +1032,7 @@ test('a stream does not hold its page: with the wait at 0 a renewal does not wai
   assert.equal(status, 200, lines.join('\n'))
   assert.ok(Date.now() - since < 2000, `the renewal waited ${Date.now() - since} ms for the stream`)
   assert.deepEqual((await readAll(opened)).map(event => [event.type, event.code]), [['error', 'browser_error']])
-  assert.equal(lines.some(line => /^resident-wait /.test(line)), false, `nothing was waited for:\n${lines.join('\n')}`)
+  assert.equal(lines.some(line => / resident-wait /.test(line)), false, `nothing was waited for:\n${lines.join('\n')}`)
   assert.equal((await health()).residentPages, 1)
 })
 
@@ -1106,7 +1106,7 @@ test('a stop ends a renewal that waits for its turn to load with page_closed, an
     return { answer: { status: response.status, body: await response.json() }, lines }
   })
   assert.deepEqual(answer, { status: 502, body: { code: 'page_closed', message: 'The worker is shutting down.' } })
-  assert.equal(lines.some(line => /^resident-close (operation_failed|open_failed) /.test(line)), false,
+  assert.equal(lines.some(line => /^resident-close (operation_failed|open_failed) /.test(line.replace(/^\S+ /, ''))), false,
     `a page was said to have died while the worker was stopping:\n${lines.join('\n')}`)
 })
 

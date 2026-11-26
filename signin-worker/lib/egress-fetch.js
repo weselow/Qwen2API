@@ -613,7 +613,7 @@ function pageRefreshToken({ url, timeoutMs, sourceId }) {
             }
             const said = data && typeof data === 'object' ? (data.details || data.message) : null
             end({
-                ok: false, status, code, reason: status ? 'refused' : 'network_error',
+                ok: false, status, code, reason: 'refused',
                 ...(said || payload?.message ? { message: String(said || payload.message).slice(0, 200) } : {})
             })
         })

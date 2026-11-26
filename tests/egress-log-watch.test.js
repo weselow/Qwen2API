@@ -517,13 +517,15 @@ test('the worker’s new lines are counted: a page’s token renewed in place, a
         `${at(20)} token-refresh ok (380 ms, 15 min left, after a wait of 2130 ms)`,
         `${at(25)} resident-wait ended (waited 4312 ms for the page's streams)`,
         ...generation(25),
+        `${at(27)} resident-wait ended (waited 900 ms for the page's streams)`,
         `${at(30)} resident-wait 1 still running (waited 20000 ms for the page's streams)`,
         `${at(30)} egress-stream ${COMPLETIONS} -> 200 (900 ms, 1/16 pages)`,
         `${at(30)} egress-stream ${COMPLETIONS} browser_error (20010 ms)`
     ]
     const report = watch.summarize(lines)
     assert.equal(report.counts.get('tokenRefresh.ok'), 2)
-    assert.equal(report.counts.get('pageWait.ended'), 1)
+    // Two of one and one of the other: told apart, come what may.
+    assert.equal(report.counts.get('pageWait.ended'), 2)
     assert.equal(report.counts.get('pageWait.timedOut'), 1)
     assert.equal(report.counts.get('pageLoad.waits'), 1)
     assert.equal([...report.counts].filter(([name]) => name.startsWith('unparsed.')).length, 0)

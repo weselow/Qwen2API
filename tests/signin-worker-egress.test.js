@@ -1869,6 +1869,13 @@ test('Qwen2API-xun: pageTokenState reads the token the way the front end does �
   assert.equal(keys.source, 'keys')
   assert.ok(keys.msLeft > 0 && keys.msLeft <= left)
 
+  // A state that does not say when its token ends is no state: the two keys decide.
+  const blind = await inPageAsk(pageTokenState, { storage: {
+    qwen_access_token_state: JSON.stringify({ version: 1, stateId: 's', token: 'opaque' }), token: 'opaque', at_expire_time: String(Date.now() + left)
+  } })
+  assert.equal(blind.source, 'keys')
+  assert.ok(blind.msLeft > 0 && blind.msLeft <= left)
+
   // A token that is a JWT says its own end.
   const own = await inPageAsk(pageTokenState, { pageToken: jwt })
   assert.equal(own.present, true)
@@ -1934,6 +1941,12 @@ test('Qwen2API-xun: a refresh qwen.ai refuses, or one that does not get through,
       { ok: false, status: 200, code: null, reason: 'refused' }],
     ['a token that is already spent', () => jsonResponse({ success: true, data: { access_token: 'late', expires_at: 1 } }),
       { ok: false, status: 200, code: null, reason: 'refused', message: 'the token is already spent' }],
+    ['an answer with a token and no success', () => jsonResponse({ data: { access_token: 'not-issued', expires_at: Math.floor(Date.now() / 1000) + 900 } }),
+      { ok: false, status: 200, code: null, reason: 'refused' }],
+    ['success false, a token all the same', () => jsonResponse({ success: false, data: { access_token: 'not-issued' } }),
+      { ok: false, status: 200, code: null, reason: 'refused' }],
+    ['a token under a 500', () => jsonResponse({ success: true, data: { access_token: 'not-issued' } }, 500),
+      { ok: false, status: 500, code: null, reason: 'refused' }],
     ['a dead connection', () => Promise.reject(new TypeError('Failed to fetch')),
       { ok: false, status: 0, code: null, reason: 'network_error' }]
   ]
@@ -2020,6 +2033,9 @@ test('Qwen2API-0c6: answerNote quotes a refusal and a failure, and nothing else'
   // ...nor does a body that is no refusal, or no JSON at all (a challenge page is named beside this, by the worker).
   assert.equal(answerNote({ status: 200, headers: {}, body: '{"ret":[]}' }), '')
   assert.equal(answerNote({ status: 201, headers: {}, body: '[1,2]' }), '')
+  // A code on an answer that is no refusal (an accepted call may carry one) is not quoted as one.
+  assert.equal(answerNote({ status: 200, headers: {}, body: '{"success":true,"code":"OK","data":{}}' }), '')
+  assert.equal(answerNote({ status: 200, headers: {}, body: '{"code":"0"}' }), '')
   assert.equal(answerNote({ status: 200, headers: { 'content-type': 'text/html' }, body: '<!doctype html>' }), '')
 
   // A refusal in the body of a 2xx: its code, wherever the app reads it from.
@@ -2200,4 +2216,58 @@ test('Qwen2API-xun: what was read of the page’s token stands exactly as long a
   assert.equal(tokenReads(signer.contexts[0].page), reads + 1)
   assert.equal(refreshesOf(asked).length, 1)
   assert.equal(asked.at(-1).init.headers.authorization, `Bearer ${RENEWED}`)
+})
+
+test('Qwen2API-xun: a refresh the page reports as renewing to a token that is already spent is a failure, and the call goes out', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer })
+  const email = 'late@example.invalid'
+  withProfile(dataDir, email)
+  signer.script.storage = keptToken({ leftMs: 60000 })
+  const asked = qwenAi(signer.script)
+  // The page answers the question, but not with a token that has time left.
+  signer.script.evaluate = (fn, arg, inSandbox) => (fn.name === 'pageRefreshToken'
+    ? Promise.resolve({ ok: true, status: 200, expiresAt: 1000, msLeft: 0, tookMs: 1 })
+    : inSandbox(fn, arg))
+
+  const { status, lines } = await logged(async lines => ({ status: await callOnce(post, email), lines }))
+  assert.equal(status, 200)
+  assert.equal(asked.at(-1).init.headers.authorization, 'Bearer page-access-token')
+  assert.equal(lines.some(line => / token-refresh ok /.test(line)), false, `a spent token was said to be a renewal:\n${lines.join('\n')}`)
+  assert.ok(lines.some(line => / token-refresh failed \(.+, \d+ ms\)$/.test(line)), lines.join('\n'))
+})
+
+test('Qwen2API-nch: a stop that lands while a page waits for its turn to open ends the call with page_closed, and no page is said to have died', async t => {
+  const signer = fakeBrowser()
+  // Another account's page took the worker's only turn for a long time.
+  const { post, dataDir, server } = await start(t, { signer, loadMinIntervalMs: 60000 })
+  const first = 'first@example.invalid'
+  const email = 'waiting@example.invalid'
+  withProfile(dataDir, first)
+  withProfile(dataDir, email)
+  assert.equal(await callOnce(post, first), 200)
+
+  const waiting = callOnce(post, email)
+  await sleep(80)
+  const { status, lines } = await logged(async lines => {
+    await server.workerShutdown()
+    return { status: await waiting, lines }
+  })
+  assert.equal(status, 502)
+  assert.equal(signer.calls.filter(call => call.op === 'open').length, 1, 'a browser was launched for the waiting page')
+  assert.equal(lines.some(line => /^resident-close (open_failed|operation_failed) /.test(line.replace(/^\S+ /, ''))), false,
+    `a page was said to have died while the worker was stopping:\n${lines.join('\n')}`)
+})
+
+test('Qwen2API-xun: by default what was read of the page’s token stands a minute — a call soon after does not ask the page again', async t => {
+  const signer = fakeBrowser()
+  // No tokenReadAgainMs here: the default is what is measured.
+  const { post, dataDir } = await start(t, { signer })
+  const email = 'default@example.invalid'
+  withProfile(dataDir, email)
+  const asked = qwenAi(signer.script)
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(tokenReads(signer.contexts[0].page), 1)
+  assert.equal(refreshesOf(asked).length, 0)
 })
