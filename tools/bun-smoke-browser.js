@@ -31,22 +31,41 @@
  *      application makes the call once more, and the client gets the answer;
  *   5. after a restart the session is back from disk: no sign-in, no reload;
  *   6. a WAF challenge page is a real 503: one reload, one retry, no password;
- *   7. what left for qwen.ai, and how — no Bearer of the app's on any /egress
- *      (Qwen2API-jr9), the worker's token on every worker call, chats/new and
- *      completions never asked for directly.
+ *   7. the application starts once more, the session back from disk again — each
+ *      of the steps below needs a recovery of its own, and prod allows an
+ *      account's page one reload in 30 seconds;
+ *   8. a file in the prompt (Qwen2API-3ue.11): the token is asked of the page,
+ *      the bytes go to the storage the answer names, the page parses the file
+ *      and tells its status — and a challenge page on the parse is one reload
+ *      and one retry; a token call qwen.ai refuses is the client's 503, with
+ *      nothing uploaded;
+ *   9. an image is generated through the relay, its link taken from the answer,
+ *      the picture fetched directly;
+ *  10. an image whose link is not in the answer is looked up in the chat —
+ *      through the page;
+ *  11. a video is generated through the relay, its answer read whole, its task
+ *      polled through the page;
+ *  12. what left for qwen.ai, and how — no Bearer of the app's on any /egress
+ *      (Qwen2API-jr9), the worker's token on every worker call, and straight
+ *      from the application only the model list, the file's bytes and the picture.
  *
  * The answers of the stand-in have the shapes of
  * tests/browser-egress.test.js (standInWorker) and
  * tests/signin-worker-egress-stream.test.js.
+ *
+ * Not here: a task that is not done at its first poll (the next one is twenty
+ * seconds away — tests/browser-egress.test.js holds that), and a client that
+ * goes away (this stand-in cannot see one: tools/client-gone-smoke.js).
  */
 
 const assert = require('node:assert/strict')
 const { randomUUID } = require('node:crypto')
 const { createServer } = require('node:http')
-const { mkdir, mkdtemp, readFile, rm, writeFile } = require('node:fs/promises')
+const { mkdir, mkdtemp, readFile, writeFile } = require('node:fs/promises')
 const { tmpdir } = require('node:os')
 const path = require('node:path')
 const { setTimeout: delay } = require('node:timers/promises')
+const { discardTemporaryDirectory } = require('./remove-directory')
 
 const API_KEY = 'bun-smoke-browser-key'
 const WORKER_TOKEN = 'bun-smoke-browser-worker-token'
@@ -74,20 +93,88 @@ const FIRST_FRAME = frame({ phase: 'answer', content: ANSWER })
 const REST = `data: ${JSON.stringify({
     choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 4, completion_tokens: 1, total_tokens: 5 }
 })}\n\ndata: [DONE]\n\n`
+// What a relay sends for a generation (steps 8–11): its head's content type and
+// its body, in the pieces it arrives in. The text answer unless the scenario says otherwise.
+const TEXT_ANSWER = { type: 'text/event-stream', pieces: [FIRST_FRAME, REST] }
+// An image's answer is SSE, one frame carrying the picture's link
+// (tests/browser-egress.test.js, picture()).
+const pictureAnswer = url => ({ type: 'text/event-stream', pieces: [frame({ phase: 'image_gen', content: `![image](${url})` })] })
+// One with no link in it: the picture is in the chat's history, for the lookup to find.
+const NO_LINK_ANSWER = {
+    type: 'text/event-stream',
+    pieces: [
+        frame({ phase: 'answer', content: 'The picture is in this chat.' }),
+        `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`
+    ]
+}
+
+// A WAF challenge page as qwen.ai serves it under status 200 (2026-11-24).
+const CHALLENGE_PAGE = '<!doctype html><meta name="aliyun_waf_aa" content="x"></meta><title>Verification</title>'
+// The error page qwen.ai gave the page's token call on 2026-11-25: 405, and HTML.
+// No marker of a challenge page in it — a refusal, not a challenge.
+const REFUSED_PAGE = '<!doctypehtml><html lang="zh-cn"><meta charset="utf-8"><meta name="data-spm" content="a3c0e"><title>405</title><body>405</body></html>'
+
+// The storage, as the stand-in's STS answer names it (Qwen2API-3ue.11). The
+// application sends a file's bytes there straight from Node, as it does to OSS
+// on prod, to the address it takes off the answer — and ali-oss keeps an
+// explicit http:// over the `secure` it is created with (measured 2026-11-26,
+// Bun 1.3.14 and Node 24). So the stand-in is the storage too: no TLS, no
+// certificate, and no change to the application.
+const BUCKET = 'qwen-smoke-bucket'
+// A region that is not one of OSS's. Should the application ever build the
+// endpoint from the region again, instead of taking the answer's, the name it
+// builds is `oss-smoke-1.aliyuncs.com`: not one this smoke knows a storage
+// behind. In a container without a network nothing leaves; on a runner with one,
+// a lookup of that name is all that would go out — and the step fails on an
+// upload that never reached the stand-in.
+const REGION = 'oss-smoke-1'
+const ACCESS_KEY_ID = 'smoke-access-key'
+const SECURITY_TOKEN = 'smoke-security-token'
+const FILE_ID = 'smoke-file-1'
+const FILE_PATH = 'smoke-files/agent-context.txt'
+const STS_PATH = '/api/v2/files/getstsToken'
+const PARSE_PATH = '/api/v2/files/parse'
+const PARSE_STATUS_PATH = '/api/v2/files/parse/status'
+// What the CDN behind the stand-in holds. A generation answers with a link to
+// it; the application fetches the picture itself, straight from Node — the CDN
+// is not qwen.ai, and the page is not asked for it.
+const PICTURE_PATH = '/cdn/smoke-picture.png'
+const VIDEO_PATH = '/cdn/smoke-video.mp4'
+// A PNG's signature and a few bytes after it: nothing decodes it, the client gets it back as it is.
+const PICTURE_BYTES = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('the picture of the smoke\n')
+])
+const VIDEO_TASK = 'smoke-video-task-1'
+// A video's answer is JSON — a task to poll, read whole.
+const TASK_ANSWER = { type: 'application/json', pieces: [JSON.stringify({ success: true, data: { task_id: VIDEO_TASK } })] }
+// The answer to a request with tools. The application's turn gate takes a bare
+// text from such a request for a turn that is not over, and asks again — so
+// the answer says the turn is over. (The v1 scenario above answers the same way.)
+const AGENT_ANSWER = {
+    type: 'text/event-stream',
+    pieces: [frame({ phase: 'answer', content: `<agent_final>${ANSWER}</agent_final>` }), REST]
+}
+// How a generation's chats/new is answered, by the kind asked for: each generation
+// gets a chat of its own. The text scenario's chat is one and the same (CHAT_ID).
+const CHAT_OF = { t2i: 'image', t2v: 'video' }
 
 /**
- * A loopback stand-in for the two services the application talks to in browser
- * mode: the signin worker (/session, /renew, /egress) and qwen.ai itself.
- * qwen.ai is asked directly for one thing only, the model list; everything
- * else reaches it from inside the account's page, i.e. through /egress. The
- * page is on a session of its own: a sign-in or a forced reload puts it on
- * one, and a call that brings an authorization of its own is refused, as the
- * app's was on 2026-11-24 (Qwen2API-jr9).
+ * A loopback stand-in for what the application talks to in browser mode: the
+ * signin worker (/session, /renew, /egress), qwen.ai itself, and — behind the
+ * same address — the storage a file's bytes go to and the CDN a generation's
+ * result lies on. Straight from the application come the model list, a file's
+ * bytes and the picture; everything else reaches qwen.ai from inside the
+ * account's page, i.e. through /egress. The page is on a session of its own: a
+ * sign-in or a forced reload puts it on one, and a call that brings an
+ * authorization of its own is refused, as the app's was on 2026-11-24
+ * (Qwen2API-jr9).
  */
 function standIn() {
     const calls = []
     const direct = []
     const failures = []
+    // The puts the storage was asked for, as they arrived.
+    const puts = []
     const state = {
         // The session the page is on (null: logged out).
         page: null,
@@ -96,7 +183,15 @@ function standIn() {
         // A promise from the scenario: the rest of the next streamed answer waits for it.
         hold: null,
         // The code the next relay fails with, before it has a head to send.
-        failRelay: null
+        failRelay: null,
+        // What the next relay carries; null: the text answer.
+        answer: null,
+        // qwen.ai's verdicts on the page's next calls of any other address, by address, in order:
+        // 'refused', 'challenge', 'not-allowed', 'parsing'. A list that ran out is the address
+        // answered as this scenario needs it.
+        answers: {},
+        // The chats made for each kind of generation, to give each one a chat of its own.
+        chats: {}
     }
     const server = createServer((request, response) => {
         let raw = ''
@@ -111,6 +206,8 @@ function standIn() {
             }
         })
     })
+    // Its own address — qwen.ai's here, and the storage's and the CDN's as the answers name them.
+    const origin = () => `http://127.0.0.1:${server.address().port}`
 
     async function answer(request, response, raw) {
         const { pathname } = new URL(request.url, 'http://stand-in.invalid')
@@ -120,10 +217,21 @@ function standIn() {
         }
         if (!['/session', '/renew', '/egress'].includes(pathname)) {
             direct.push(`${request.method} ${pathname}`)
-            if (pathname !== '/api/models') return json(404, { error: `Unexpected direct path: ${pathname}` })
-            return json(200, { data: [{
+            if (pathname === '/api/models') return json(200, { data: [{
                 id: MODEL, name: MODEL, info: { meta: { chat_type: ['t2t'], abilities: {} } }
             }] })
+            // The storage: a file's bytes, put there by the application itself.
+            if (request.method === 'PUT' && pathname === `/${FILE_PATH}`) {
+                puts.push({ headers: request.headers, body: raw })
+                response.writeHead(200, { etag: '"smoke-etag"' })
+                return response.end()
+            }
+            // The CDN: the picture behind a generation's link.
+            if (request.method === 'GET' && pathname === PICTURE_PATH) {
+                response.writeHead(200, { 'content-type': 'image/png', 'content-length': String(PICTURE_BYTES.length) })
+                return response.end(PICTURE_BYTES)
+            }
+            return json(404, { error: `Unexpected direct path: ${request.method} ${pathname}` })
         }
         const authorized = request.headers.authorization === `Bearer ${WORKER_TOKEN}`
         const body = raw ? JSON.parse(raw) : {}
@@ -137,23 +245,53 @@ function standIn() {
         }
         if (body.stream === true) return relay(response, body)
         // What /egress answers: qwen.ai's status and body inside, plus the live jar.
-        const egress = (payload, headers = { 'content-type': 'application/json' }) => ({
-            status: 200, headers, body: typeof payload === 'string' ? payload : JSON.stringify(payload),
+        const page = new URL(body.url).pathname
+        const egress = (payload, headers = { 'content-type': 'application/json' }, status = 200) => ({
+            status, headers, body: typeof payload === 'string' ? payload : JSON.stringify(payload),
             url: body.url, redirected: false, cookies: [cookie('cna', `from-${state.page}`)]
         })
-        const verdict = 'authorization' in (body.headers || {}) ? 'refused' : (state.chatsNew.shift() || 'accepted')
+        // qwen.ai's verdict on a call of the page. chats/new's comes from state.chatsNew, any other
+        // address's from state.answers; a list that has run out is the address answered as this
+        // scenario needs it, below.
+        const verdict = 'authorization' in (body.headers || {}) ? 'refused'
+            : (page === '/api/v2/chats/new' ? state.chatsNew : (state.answers[page] ||= [])).shift()
         if (verdict === 'refused') return json(200, egress({ success: false, data: { code: 'unauthorized', details: SECRET } }))
-        if (verdict === 'challenge') {
-            return json(200, egress('<!doctype html><meta name="aliyun_waf_aa" content="x"></meta><title>Verification</title>',
-                { 'content-type': 'text/html; charset=utf-8' }))
+        if (verdict === 'challenge') return json(200, egress(CHALLENGE_PAGE, { 'content-type': 'text/html; charset=utf-8' }))
+        // As qwen.ai answered the page's token call where its front end no longer asks (Qwen2API-3ue.12).
+        if (verdict === 'not-allowed') return json(200, egress(REFUSED_PAGE, { 'content-type': 'text/html; charset=utf-8' }, 405))
+        if (verdict === 'parsing') return json(200, egress({ success: true, data: { list: [{ file_id: FILE_ID, status: 'parsing' }] } }))
+        if (page === '/api/v2/chats/new') {
+            // A chat of the kind asked for: the text one is the scenario's own, each generation gets its own.
+            const kind = JSON.parse(body.body).chat_type || 't2t'
+            const id = kind === 't2t' ? CHAT_ID : `smoke-browser-${CHAT_OF[kind] || kind}-${state.chats[kind] = (state.chats[kind] || 0) + 1}`
+            return json(200, egress({ success: true, data: { id } }))
         }
-        return json(200, egress({ success: true, data: { id: CHAT_ID } }))
+        // The token of a file: the storage is this stand-in, and the answer says so (Qwen2API-3ue.11).
+        if (page === STS_PATH) return json(200, egress({ success: true, data: {
+            access_key_id: ACCESS_KEY_ID, access_key_secret: 'smoke-access-secret', security_token: SECURITY_TOKEN,
+            bucketname: BUCKET, region: REGION, endpoint: origin(),
+            file_id: FILE_ID, file_path: FILE_PATH, file_url: `${origin()}/${FILE_PATH}`
+        } }))
+        if (page === PARSE_PATH) return json(200, egress({ success: true, data: {} }))
+        if (page === PARSE_STATUS_PATH) return json(200, egress({ success: true, data: { list: [{ file_id: FILE_ID, status: 'success' }] } }))
+        // The chat, as its detail comes back with the picture in its history.
+        if (page.startsWith('/api/v2/chats/')) return json(200, egress({ success: true, data: { chat: { history: { messages: {
+            m1: { response_id: 'r1', content: [{ type: 'image', image: { url: `${origin()}${PICTURE_PATH}` } }] }
+        } } } } }))
+        // The task, done — with the video.
+        if (page.startsWith('/api/v1/tasks/status/')) return json(200, egress({ task_status: 'success', content: `${origin()}${VIDEO_PATH}` }))
+        // An address nothing here answers is the scenario's mistake: said, and answered as a worker
+        // that could not carry the call.
+        failures.push(new Error(`nothing on the page answers ${body.method || 'GET'} ${page}`))
+        return json(502, { code: 'page_fault', message: `nothing on the page answers ${body.method || 'GET'} ${page}` })
     }
 
     // The worker's streaming /egress: one JSON event per line, as the app reads them.
     async function relay(response, call) {
         const hold = state.hold
         state.hold = null
+        const answer = state.answer || TEXT_ANSWER
+        state.answer = null
         response.writeHead(200, { 'content-type': 'application/x-ndjson' })
         const event = payload => response.write(`${JSON.stringify(payload)}\n`)
         // A relay the worker could not carry owns its answer: it says so with an error event, as it goes.
@@ -172,18 +310,20 @@ function standIn() {
         // seen, the stand-in stands in a Node process — tools/client-gone-smoke.js.)
         event({
             type: 'head', status: 200, url: call.url, redirected: false,
-            headers: { 'content-type': 'text/event-stream' }, cookies: [cookie('cna', 'from-head')]
+            headers: { 'content-type': answer.type }, cookies: [cookie('cna', 'from-head')]
         })
-        event({ type: 'chunk', data: Buffer.from(FIRST_FRAME).toString('base64') })
+        event({ type: 'chunk', data: Buffer.from(answer.pieces[0]).toString('base64') })
         await (hold || Promise.resolve())
-        event({ type: 'chunk', data: Buffer.from(REST).toString('base64') })
+        for (const piece of answer.pieces.slice(1)) event({ type: 'chunk', data: Buffer.from(piece).toString('base64') })
         response.end(`${JSON.stringify({ type: 'end', cookies: [cookie('ssxmod_itna', 'from-end')] })}\n`)
     }
 
     return {
-        state, calls, direct, failures, server,
+        state, calls, direct, failures, puts, server,
         routes: () => calls.map(call => call.route),
-        to: route => calls.filter(call => call.route === route).map(call => call.body)
+        to: route => calls.filter(call => call.route === route).map(call => call.body),
+        // An address of the stand-in itself: where a link it hands out leads.
+        asset: pathname => `${origin()}${pathname}`
     }
 }
 
@@ -200,7 +340,7 @@ const closeListener = server => {
 const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g')
 const plain = text => text.replace(ANSI, '')
 const evidence = logs => plain(logs).split('\n')
-    .filter(line => /v2 |V2SESSION|CHAT|chat creation|signin-worker|MODULE_NOT_FOUND|upstream|Error/.test(line))
+    .filter(line => /v2 |V2SESSION|CHAT|chat creation|signin-worker|UPLOAD|Agent |MODULE_NOT_FOUND|upstream|Error/.test(line))
     .slice(-30).join('\n')
 
 // `promise`, or a rejection once `ms` passed — the timer gone either way.
@@ -298,7 +438,10 @@ async function run({ startApplication, stopApplication, disposeApplication, bina
             CHAT_CREATION_TRANSPORT: 'browser',
             COMPLETIONS_TRANSPORT: 'browser',
             QWEN_CHAT_PROXY_URL: upstream,
-            QWEN_CLI_PROXY_URL: upstream
+            QWEN_CLI_PROXY_URL: upstream,
+            // A context over this goes up as a document (step 8). The smallest the setting takes
+            // (its floor is 32 KiB); prod's is 90 KiB.
+            AGENT_CONTEXT_FILE_THRESHOLD_BYTES: '32768'
         })
         const start = async () => {
             const reservation = createServer()
@@ -331,8 +474,8 @@ async function run({ startApplication, stopApplication, disposeApplication, bina
             body: JSON.stringify({ model: MODEL, max_tokens: 32, stream, messages: [{ role: 'user', content }] })
         })
         // An answer read to its end: one that never ends must not hang the smoke.
-        const whole = async response => ({
-            status: response.status, headers: response.headers, text: await within(response.text(), 30000, 'the answer did not end in 30 s')
+        const whole = async (response, ms = 30000, message = 'the answer did not end in 30 s') => ({
+            status: response.status, headers: response.headers, text: await within(response.text(), ms, message)
         })
         const log = () => plain(application.logs)
         const wait = (condition, message) => until(condition, message, application.logs)
@@ -437,15 +580,160 @@ async function run({ startApplication, stopApplication, disposeApplication, bina
         assert.deepEqual(worker.routes().slice(callsBeforeChallenge), ['/egress', '/renew', '/egress'])
         console.log('PASS: browser mode — a WAF challenge page is a 503 with one reload and one retry')
 
-        // 7. What left for qwen.ai, and how.
+        // 7. One more start. Each recovery is its process's first: prod allows an account's page one
+        //    reload in 30 seconds (V2_SESSION_RECOVERY_MIN_INTERVAL_MS), and step 6 has just had
+        //    its — the step below needs one of its own. The session is read back from disk, as after step 5.
+        const exitAfterChallenge = await stopApplication(application)
+        if (process.platform !== 'win32') assert.equal(exitAfterChallenge, 0, 'SIGTERM should exit cleanly — the second launch')
+        await start()
+        await wait(() => /v2 会话恢复完成: 1 个有效/.test(log()), 'the session was not restored at the third start')
+        assert.equal(worker.routes().filter(route => route === '/session').length, 1, 'the third start costs no password')
+        console.log('PASS: browser mode — the session is back from disk for the steps below, with no sign-in')
+
+        // 8. A file in the prompt (Qwen2API-3ue.11). upload.js takes browser-egress.js inside two
+        //    functions — the token call and the parse — and both are run here, in the application
+        //    as this run starts it. A prompt over the threshold, asked for with tools: a request
+        //    that may not make do without the document.
+        const DOCUMENT = 'The agent context of the smoke, long enough to go up as a document. '.repeat(600)
+        const withTools = () => request('/v1/chat/completions', {
+            method: 'POST', headers: jsonHeaders,
+            body: JSON.stringify({
+                model: MODEL, max_tokens: 32, stream: false, messages: [{ role: 'user', content: DOCUMENT }],
+                tools: [{ type: 'function', function: { name: 'read_file', parameters: { type: 'object', properties: {} } } }]
+            })
+        })
+        // What the worker was asked since `from`: the route — and for a call of the page, its method and address.
+        const trail = from => worker.calls.slice(from).map(call => call.route !== '/egress' ? call.route
+            : `${call.body.method} ${new URL(call.body.url).pathname}${call.body.stream === true ? ' (stream)' : ''}`)
+        // qwen.ai refuses the token call: the chat is made, the page is asked for the token once, and
+        // the client's answer is a retryable 503. Nothing is uploaded.
+        worker.state.answer = AGENT_ANSWER
+        worker.state.answers[STS_PATH] = ['not-allowed']
+        const beforeRefusal = worker.calls.length
+        const refused = await whole(await withTools())
+        assert.equal(refused.status, 503, `${refused.text}\n${evidence(application.logs)}`)
+        assert.equal(JSON.parse(refused.text).error.code, 'upstream_unavailable', refused.text)
+        assert.equal(refused.headers.get('retry-after'), '10', 'the client is told how long to wait')
+        assert.deepEqual(trail(beforeRefusal), ['POST /api/v2/chats/new', `POST ${STS_PATH}`],
+            'the chat, then one token call of the page: its refusal is not worth a retry')
+        assert.equal(worker.puts.length, 0, 'a refused token call uploads nothing')
+        console.log('PASS: browser mode — a token call qwen.ai refuses is the client\'s 503: asked of the page once, nothing uploaded')
+
+        // The whole path. The parse is answered with a WAF challenge page once — as qwen.ai answered
+        // the first parse of a document on 2026-11-26: one reload of the page, exactly one retry, and
+        // no password. The status is asked for until the parse is done.
+        worker.state.answer = AGENT_ANSWER
+        worker.state.answers[PARSE_PATH] = ['challenge']
+        worker.state.answers[PARSE_STATUS_PATH] = ['parsing']
+        const beforeDocument = worker.calls.length
+        const document = await whole(await withTools())
+        assert.equal(document.status, 200, `${document.text}\n${evidence(application.logs)}`)
+        assert.equal(JSON.parse(document.text).choices[0].message.content, ANSWER, document.text)
+        assert.deepEqual(trail(beforeDocument), [
+            'POST /api/v2/chats/new', `POST ${STS_PATH}`,
+            `POST ${PARSE_PATH}`, '/renew', `POST ${PARSE_PATH}`,
+            `POST ${PARSE_STATUS_PATH}`, `POST ${PARSE_STATUS_PATH}`,
+            'POST /api/v2/chat/completions (stream)'
+        ], 'the chat, the token of the page, the parse — challenged once, asked once more after a reload — its status until done, the answer through the relay')
+        assert.equal(worker.to('/renew').at(-1).force, true, 'a challenge page is a forced reload')
+        assert.match(log(), /v2 会话已续期 \([^)]*触发原因: upstream_waf_challenge\)/, 'the log does not say why the page was reloaded')
+        // The bytes went to the storage the answer named — straight from the application, signed as
+        // the page signs (Qwen2API-3ue.12): V4, in the region of the answer. The context is the one
+        // the application builds for a request with tools: the prompt, under the protocol's own head.
+        assert.equal(worker.puts.length, 1, 'the document is uploaded once')
+        const [put] = worker.puts
+        assert.ok(put.body.includes(DOCUMENT), 'the bytes carry the context')
+        assert.equal(put.headers.host, `${BUCKET}.${REGION}.aliyuncs.com`, 'the bucket and the region the answer named')
+        assert.equal(put.headers['x-oss-security-token'], SECURITY_TOKEN)
+        assert.match(String(put.headers.authorization),
+            new RegExp(`^OSS4-HMAC-SHA256 Credential=${ACCESS_KEY_ID}/\\d{8}/smoke-1/oss/aliyun_v4_request(,AdditionalHeaders=[^,]+)?,Signature=[0-9a-f]{64}$`),
+            'signed V4, in the region the answer named')
+        // The token call of the page: the page's own body — the size of what was uploaded, as a
+        // string — and no Bearer.
+        const tokenCall = worker.to('/egress').filter(call => new URL(call.url).pathname === STS_PATH).at(-1)
+        const asked = JSON.parse(tokenCall.body)
+        assert.match(asked.filename, /^QWEN2API_AGENT_CONTEXT_\d+\.txt$/)
+        assert.deepEqual([asked.filesize, asked.filetype], [String(Buffer.byteLength(put.body)), 'file'],
+            'the body the page sends: the size as a string')
+        assert.ok(!('authorization' in tokenCall.headers), 'the token call carries no Bearer (Qwen2API-jr9)')
+        // And the generation qwen.ai is asked for carries the document it parsed.
+        const generation = JSON.parse(worker.to('/egress').filter(call => call.stream === true).at(-1).body)
+        assert.deepEqual(generation.messages[0].files.map(file => [file.id, file.url]), [[FILE_ID, worker.asset(`/${FILE_PATH}`)]],
+            'the parsed document is not in the request made of the page')
+        console.log('PASS: browser mode — a file in the prompt: the token of the page, the bytes to the storage the answer named, the parse by the page — a challenge page on it is one reload and one retry')
+
+        // 9. An image, generated through the page: one chats/new, one relay — the fetch of the page's
+        //    own — with the link in its answer. The application fetches the picture itself, straight
+        //    from where the link leads: the CDN is not qwen.ai.
+        worker.state.answer = pictureAnswer(worker.asset(PICTURE_PATH))
+        const beforeImage = worker.calls.length
+        const directBeforeImage = worker.direct.length
+        const image = await whole(await request('/v1/images/generations', {
+            method: 'POST', headers: jsonHeaders,
+            body: JSON.stringify({ model: MODEL, prompt: 'a smoke picture', response_format: 'b64_json' })
+        }))
+        assert.equal(image.status, 200, `${image.text}\n${evidence(application.logs)}`)
+        // The bytes the client gets are the ones behind the link.
+        assert.deepEqual(Buffer.from(JSON.parse(image.text).data[0].b64_json, 'base64'), PICTURE_BYTES)
+        assert.deepEqual(trail(beforeImage), ['POST /api/v2/chats/new', 'POST /api/v2/chat/completions (stream)'],
+            'one chats/new and one generation through the relay; the link is in the answer, so the chat is not looked up')
+        assert.deepEqual(worker.direct.slice(directBeforeImage), [`GET ${PICTURE_PATH}`], 'the picture is fetched from where its link leads')
+        const imageGeneration = worker.calls.slice(beforeImage)[1].body
+        assert.equal(imageGeneration.url, `${upstream}/api/v2/chat/completions?chat_id=smoke-browser-image-${worker.state.chats.t2i}`)
+        assert.equal(JSON.parse(imageGeneration.body).messages[0].chat_type, 't2i')
+        assert.equal(JSON.parse(imageGeneration.body).stream, true, 'the generation is the page\'s own fetch: a stream')
+        console.log('PASS: browser mode — an image is generated through the relay, and its link, out of the answer, is fetched directly')
+
+        // 10. The link is not in the answer: it is looked up in the chat — through the page, as a whole answer.
+        worker.state.answer = NO_LINK_ANSWER
+        const beforeLookup = worker.calls.length
+        const directBeforeLookup = worker.direct.length
+        const lookedUp = await whole(await request('/v1/images/generations', {
+            method: 'POST', headers: jsonHeaders, body: JSON.stringify({ model: MODEL, prompt: 'another smoke picture' })
+        }))
+        assert.equal(lookedUp.status, 200, `${lookedUp.text}\n${evidence(application.logs)}`)
+        assert.equal(JSON.parse(lookedUp.text).data[0].url, worker.asset(PICTURE_PATH))
+        const secondGeneration = worker.calls.slice(beforeLookup)[1].body
+        const chatOf = new URL(secondGeneration.url).searchParams.get('chat_id')
+        assert.notEqual(chatOf, new URL(imageGeneration.url).searchParams.get('chat_id'), 'a generation gets a chat of its own')
+        assert.deepEqual(trail(beforeLookup), ['POST /api/v2/chats/new', 'POST /api/v2/chat/completions (stream)', `GET /api/v2/chats/${chatOf}`],
+            'the link is looked up in the chat the picture was generated in, through the page')
+        assert.deepEqual(worker.direct.slice(directBeforeLookup), [], 'a link the client is only given is fetched by nobody')
+        console.log('PASS: browser mode — an image whose link is not in the answer is looked up in the chat through the page')
+
+        // 11. A video: the relay's answer is JSON, read whole — a task to poll. The task is asked for
+        //     through the page, and answers done at once. (A poll that is not done waits the task's
+        //     twenty seconds for the next one: tests/browser-egress.test.js holds that.)
+        worker.state.answer = TASK_ANSWER
+        const beforeVideo = worker.calls.length
+        const video = await whole(await request('/v1/videos', {
+            method: 'POST', headers: jsonHeaders, body: JSON.stringify({ model: MODEL, prompt: 'a smoke video' })
+        }), 15000, 'the video did not come in 15 s: its task answers done at the first poll, and nothing here waits for a second')
+        assert.equal(video.status, 200, `${video.text}\n${evidence(application.logs)}`)
+        assert.equal(JSON.parse(video.text).data[0].url, worker.asset(VIDEO_PATH))
+        assert.deepEqual(trail(beforeVideo), [
+            'POST /api/v2/chats/new', 'POST /api/v2/chat/completions (stream)', `GET /api/v1/tasks/status/${VIDEO_TASK}`
+        ], 'one chats/new, the generation through the relay, one poll of the task through the page')
+        const videoGeneration = JSON.parse(worker.calls.slice(beforeVideo)[1].body.body)
+        // The video's body asks qwen.ai for no stream; the call is the page's fetch all the same.
+        assert.deepEqual([videoGeneration.messages[0].chat_type, videoGeneration.stream], ['t2v', false])
+        assert.equal(worker.calls.at(-1).body.url, `${upstream}/api/v1/tasks/status/${VIDEO_TASK}`)
+        console.log('PASS: browser mode — a video is generated through the relay, its answer read whole, and its task polled through the page')
+
+        // 12. What left for qwen.ai, and how.
         assert.equal(worker.failures.length, 0, `the stand-in failed: ${worker.failures[0]?.message}`)
         assert.equal(worker.routes().filter(route => route === '/session').length, 1, 'a challenge costs no password')
         assert.ok(worker.calls.every(call => call.authorized), 'every worker call carries SIGNIN_WORKER_TOKEN')
         assert.ok(worker.to('/egress').every(call => call.email === EMAIL), 'every call left from the account\'s page')
         assert.ok(worker.to('/egress').every(call => !('authorization' in call.headers)),
             'the app put a Bearer of its own on an egress call (Qwen2API-jr9)')
-        assert.deepEqual([...new Set(worker.direct)], ['GET /api/models'],
-            'chats/new and completions must reach qwen.ai through the page only')
+        assert.ok(worker.to('/egress').every(call => new URL(call.url).origin === upstream),
+            'a call of the page left for somewhere else than the address the application has for qwen.ai')
+        // Straight from the application went the model list, and the two that are not qwen.ai: the
+        // file's bytes and the picture. Chats, completions, the token, the parse, the chat and the
+        // task reached qwen.ai through the page only.
+        assert.deepEqual(worker.direct.filter(line => line !== 'GET /api/models'), [`PUT /${FILE_PATH}`, `GET ${PICTURE_PATH}`],
+            'straight from the application went something else than the model list, the file\'s bytes and the picture')
         const exitCode = await stopApplication(application)
         if (process.platform !== 'win32') assert.equal(exitCode, 0, 'SIGTERM should exit cleanly')
         assert.ok(!log().includes('MODULE_NOT_FOUND'), `something was not found inside the application:\n${evidence(application.logs)}`)
@@ -459,7 +747,8 @@ async function run({ startApplication, stopApplication, disposeApplication, bina
     } finally {
         if (application) await disposeApplication(application)
         await closeListener(worker.server)
-        await rm(temporaryDirectory, { recursive: true, force: true })
+        // Not a check: a directory Windows still holds is left, and said — not failed over (Qwen2API-3ue.13).
+        await discardTemporaryDirectory(temporaryDirectory)
     }
 }
 

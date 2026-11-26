@@ -59,8 +59,11 @@ async function start(t, options) {
   const server = createServer({ dataDir, minRenewDelayMs: 60000, ...options })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   const { port } = server.address()
+  // A request that is never answered fails its test in ten seconds, saying so — not on the gate's
+  // timeout, minutes later, with every test behind it cancelled.
   const post = (pathName, payload) => fetch(`http://127.0.0.1:${port}${pathName}`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload)
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(10000)
   })
   t.after(async () => {
     await server.workerShutdown()
@@ -89,7 +92,8 @@ test('login pacer hands out slots one interval apart, plus jitter', () => {
   // The jitter is up to the interval again: a burst never looks metronomic.
   const jittered = createLoginPacer({ minIntervalMs: 1000, random: () => 0.999 })
   const base = jittered.admit()
-  assert.ok(jittered.admit().at - base.at > 1998)
+  const gap = jittered.admit().at - base.at
+  assert.ok(gap > 1998 && gap <= 2000, `${gap}ms: one interval plus up to one more, and no more`)
 })
 
 test('a slot that would be waited for longer than the budget is refused at once and stays free', () => {
@@ -162,9 +166,16 @@ test('/session answers from the live harvested session instead of signing in aga
   assert.equal(signIns().length, 2)
 })
 
+// An interval with room to spare over the budget (maxLoginWaitMs, 250 in the tests that refuse).
+// What a request is refused over is the gap after the sign-in ahead of it, less how much later it
+// arrived — and the gap is never below the interval. So with 3000 against 250 the refusal holds
+// while the request reaches the worker up to 2750 ms after the slot it would wait for was taken,
+// whatever the jitter and whatever the runner is doing. With 300 against 250 it held for 50 ms.
+const ROOMY_INTERVAL_MS = 3000
+
 test('a cached answer takes no slot: it delays nobody and is never refused', async t => {
   const signer = fakeSigner()
-  const { post } = await start(t, { signer, minLoginIntervalMs: 300, maxLoginWaitMs: 250 })
+  const { post } = await start(t, { signer, minLoginIntervalMs: ROOMY_INTERVAL_MS, maxLoginWaitMs: 250 })
   const email = 'warm@example.invalid'
   await (await post('/session', { email, password: 'pw' })).json()
 
@@ -274,26 +285,48 @@ test('full sign-ins across accounts start at least minLoginIntervalMs apart', as
 })
 
 test('a sign-in that would wait past the budget is refused as signin_paced and signs nobody in', async t => {
-  const signer = fakeSigner()
-  const { post } = await start(t, { signer, minLoginIntervalMs: 300, maxLoginWaitMs: 250 })
-  const [first, second] = await Promise.all([
-    post('/session', { email: 'first@example.invalid', password: 'pw' }),
-    post('/session', { email: 'second@example.invalid', password: 'pw' })
-  ])
-  // The second in line has a whole interval (300-600 ms) ahead: over budget.
-  const [admitted, refused] = first.status === 200 ? [first, second] : [second, first]
-  assert.equal(admitted.status, 200)
-  assert.equal(refused.status, 429)
-  const failure = await refused.json()
+  // The first sign-in stays where it is until the test lets it go: when the second arrives, the slot is taken for good.
+  let letGo = () => {}
+  const signer = fakeSigner({
+    signin: email => email === 'first@example.invalid'
+      ? new Promise(resolve => { letGo = () => resolve(harvest(email)) })
+      : harvest(email)
+  })
+  const minLoginIntervalMs = 600
+  const maxLoginWaitMs = 250
+  const { post } = await start(t, { signer, minLoginIntervalMs, maxLoginWaitMs })
+  const signIns = () => signer.calls.filter(call => call.op === 'signin')
+  const first = post('/session', { email: 'first@example.invalid', password: 'pw' })
+  // One at a time: the second goes out once the first is in its sign-in, so it holds the only slot
+  // there is. (Sent together, the two arrive however a loaded runner likes. By that this test
+  // used to fail, 2026-11-25: the second a few milliseconds late made its wait look too short.)
+  await until(() => signIns().length === 1)
+  const second = await post('/session', { email: 'second@example.invalid', password: 'pw' })
+  const answeredAt = Date.now()
+  letGo()
+  assert.equal((await first).status, 200)
+  assert.equal(second.status, 429, `the second was answered ${second.status}: its wait for a slot was not refused`)
+  const failure = await second.json()
   assert.equal(failure.code, 'signin_paced')
-  assert.ok(failure.retryAfterMs >= 300 - SLOP && failure.retryAfterMs < 600)
-  assert.equal(signer.calls.filter(call => call.op === 'signin').length, 1)
+  // What the second would have waited: the gap after the first sign-in — one interval and up to one
+  // more of jitter — less the moment it came later than that. So more than the budget, which is the
+  // refusal; and never more than two intervals. Where the low end falls is not this test's to say:
+  // how much of it is jitter and how much the late arrival, the worker does not tell. The gap itself
+  // is the pacer's, and is measured above with the jitter held still.
+  assert.ok(failure.retryAfterMs > maxLoginWaitMs,
+    `${failure.retryAfterMs}ms: a wait within the budget is made, not refused`)
+  assert.ok(failure.retryAfterMs <= 2 * minLoginIntervalMs,
+    `${failure.retryAfterMs}ms: more than two intervals`)
+  assert.equal(signIns().length, 1, 'the refusal signed nobody in')
 
-  // A caller that comes back after the retry delay gets its slot.
+  // A caller that comes back after the retry delay gets its slot — and at once, not an interval later.
   await sleep(failure.retryAfterMs)
   const retried = await post('/session', { email: 'third@example.invalid', password: 'pw' })
-  assert.equal(retried.status, 200)
-  assert.equal(signer.calls.filter(call => call.op === 'signin').length, 2)
+  assert.equal(retried.status, 200, `the third was answered ${retried.status} after waiting the delay it was told`)
+  assert.equal(signIns().length, 2)
+  const lateBy = signIns()[1].at - answeredAt - failure.retryAfterMs
+  assert.ok(lateBy < minLoginIntervalMs,
+    `the third sign-in began ${lateBy}ms after the delay it was told: the delay named is not the delay kept`)
 })
 
 test('a session that turned live while the request waited for its slot answers without a sign-in', async t => {
@@ -349,7 +382,7 @@ test('a rejected sign-in takes a slot too: failed attempts are what the WAF coun
   const signer = fakeSigner({
     signin: () => { throw new Error('Sign-in did not leave the auth page.'); }
   })
-  const { post } = await start(t, { signer, minLoginIntervalMs: 300, maxLoginWaitMs: 250 })
+  const { post } = await start(t, { signer, minLoginIntervalMs: ROOMY_INTERVAL_MS, maxLoginWaitMs: 250 })
   const rejected = await post('/session', { email: 'stuck@example.invalid', password: 'pw' })
   assert.equal(rejected.status, 500)
   const next = await post('/session', { email: 'next@example.invalid', password: 'pw' })
