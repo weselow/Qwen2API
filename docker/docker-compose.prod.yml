@@ -98,6 +98,10 @@ services:
       # exception: a sign-in that begins just before a load's turn holds it back by up to one interval
       # more — one interval in all, however many begin. 0 = no limit.
       - RESIDENT_LOAD_MAX_WAIT_MS=${RESIDENT_LOAD_MAX_WAIT_MS:-120000}
+      # Removing an account in the app tells the worker (POST /forget), which
+      # drops its session and closes its page. Set to true, the browser
+      # profile goes too: an account added again then signs in afresh.
+      - SIGNIN_FORGET_DELETES_PROFILE=${SIGNIN_FORGET_DELETES_PROFILE:-false}
     # One Chromium profile per account; keep them on a volume so auth.qwen.ai
     # sessions survive restarts and renewal stays a silent reload.
     volumes:
