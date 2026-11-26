@@ -1,7 +1,10 @@
 name: CI
 on:
   push:
+    branches: [main, production]
+    paths-ignore: ['**/*.md', 'docs/**']
   pull_request:
+    paths-ignore: ['**/*.md', 'docs/**']
 
 permissions:
   contents: read
@@ -13,3 +16,5 @@ concurrency:
 jobs:
   verify:
     uses: ./.github/workflows/verify.yml
+    with:
+      filter-builds: true

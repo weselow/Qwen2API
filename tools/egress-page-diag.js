@@ -9,6 +9,7 @@
  *        [--origin=https://chat.qwen.ai] [--out=/tmp/egress-page-diag]
  *        [--headless-mode=shell|chrome] [--settle-ms=0] [--transport=worker|xhr|fetch]
  *        [--like-fe=1] [--completions=1] [--ui-send=1] [--signed=1]
+ *        [--ui-upload=1]
  *        [--bearer-compare=1] [--like-own=1] [--isolate-xhr=1] [--loopback-only=1] [--fast=1]
  *
  * How the call is sent:
@@ -33,6 +34,17 @@
  *                    reported (2026-11-25: completions sent from the page was
  *                    refused while chats/new passed; was the page's own call
  *                    refused too?).
+ *   --ui-upload=1   the page uploads a file with its own interface — a small
+ *                    text file is put into its file input — and what its own
+ *                    file calls carried and what qwen.ai answered is reported:
+ *                    the STS token, the parse and its status, as the page makes
+ *                    them, and the request that carried the bytes to the object
+ *                    store (host and status only). No message is sent: the file
+ *                    stays attached to a draft that is never sent. Built for
+ *                    Qwen2API-03v (2026-11-25: the app's own STS call from the
+ *                    page was answered 405; what the page's own carries, nobody
+ *                    had seen). What gives access — the STS answer's secrets, a
+ *                    signed url — is masked in the report.
  *   --signed=1      after the page's own completions passed (needs
  *                    --ui-send=1): one chats/new, then one completions call by
  *                    the worker's own code, carrying the bx-ua / bx-umidtoken
@@ -131,6 +143,9 @@ const COMPLETIONS = args.completions === '1'
 // The page sends a message with its own interface, and what it sent and what
 // qwen.ai answered is reported instead of this run's own chats/new calls.
 const UI_SEND = args['ui-send'] === '1'
+// The page uploads a file with its own interface; what its own file calls
+// carried, and what qwen.ai answered them, is reported (Qwen2API-03v).
+const UI_UPLOAD = args['ui-upload'] === '1'
 // After the page's own completions passed: one chats/new, then one completions
 // call by the worker's own code, carrying the bx-ua / bx-umidtoken the page put
 // on its own completions request.
@@ -158,6 +173,9 @@ const TRANSPORT_LABEL = {
 // The pause between two calls: the runbook's minute, or next to none in a rehearsal.
 const PAUSE_MS = args.fast === '1' ? 2000 : MIN_BETWEEN_CALLS_MS
 const UI_TEXT = 'Say pong'
+// The file the page is given to upload: plain text, small, and nothing in it.
+const UPLOAD_NAME = 'e4diag-upload.txt'
+const UPLOAD_TEXT = 'A small plain text file, put into the chat page\'s own file input by a diagnostic.\n'.repeat(24)
 if (!WORKER || !PROFILE) {
     console.error('usage: node tools/egress-page-diag.js --profile=<dir> --worker=<dir with lib/> [--origin=] [--out=]')
     process.exit(2)
@@ -168,6 +186,10 @@ if (args.fast === '1' && !LOOPBACK_ONLY) {
 }
 if (SIGNED && !UI_SEND) {
     console.error('--signed=1 needs --ui-send=1: the signature is taken from the page\'s own completions request')
+    process.exit(2)
+}
+if (UI_UPLOAD && (UI_SEND || LIKE_OWN || ISOLATE_XHR || BEARER_COMPARE)) {
+    console.error('--ui-upload=1 is a run of its own: the page uploads a file, and no message is sent')
     process.exit(2)
 }
 
@@ -528,7 +550,7 @@ async function main() {
         }
         console.error('E4 diagnostic stopped by its own watchdog')
         process.exit(3)
-    }, UI_SEND || LIKE_OWN || ISOLATE_XHR ? 780000 : 420000).unref()
+    }, UI_SEND || UI_UPLOAD || LIKE_OWN || ISOLATE_XHR ? 780000 : 420000).unref()
     const page = context.pages()[0]
     log('life', `browser open in ${tOpen} ms`)
 
@@ -935,6 +957,121 @@ async function main() {
         return report
     }
 
+    // ---- the page's own file upload (--ui-upload) ---------------------------------------------
+    // The file calls of the origin: the STS token, the parse and its status.
+    const FILE_PATHS = /^\/api\/v\d+\/files\//
+    // What was asked from the moment the file was put into the input: the file
+    // calls as the responses — for what they carried and what was answered —,
+    // every other call the page made on the origin, by path and status (on
+    // 2026-11-25 the one file input of the chat's front page was the support
+    // widget's: the page answered the file with its support entry call), and
+    // every request to another host.
+    const upload = { startedAt: null, files: [], origin: [], foreign: [] }
+    page.on('response', response => {
+        const entry = requests.get(response.request())
+        if (upload.startedAt === null || !entry || entry.t < upload.startedAt) return
+        if (entry.host === originHost) {
+            if (!apiType(entry) || entry.type === 'document') return
+            if (upload.origin.length < 80) upload.origin.push({ at: entry.t, type: entry.type, method: entry.method, path: entry.path, status: response.status() })
+            if (FILE_PATHS.test(entry.path) && upload.files.length < 60) upload.files.push(response)
+        } else if (upload.foreign.length < 60) {
+            upload.foreign.push({ at: entry.t, type: entry.type, method: entry.method, host: entry.host, path: entry.path, status: response.status() })
+        }
+    })
+    // What gives access, masked: the STS answer's credentials, a signed url's query, a support widget's entry.
+    const SECRET_VALUE = /("(?:access_key_secret|accessKeySecret|security_token|securityToken|access_key_id|accessKeyId|signature|Signature|x-oss-signature|x-oss-security-token|x-oss-credential|OSSAccessKeyId|token|key|xtoken|xsign)"\s*:\s*")([^"]*)(")/g
+    const SECRET_QUERY = /([?&](?:key|Signature|OSSAccessKeyId|x-oss-signature|x-oss-security-token|x-oss-credential|security-token|token|x-amz-[^&=\s]+|xtoken|xsign)=)[^&"\s<>]+/gi
+    const maskSecrets = value => String(value).replace(SECRET_VALUE, '$1<masked>$3').replace(SECRET_QUERY, '$1<masked>')
+
+    /** What the page's own file call carried, and what was answered to it. */
+    async function fileExchange(response) {
+        const request = response.request()
+        const entry = requests.get(request)
+        const sent = await request.allHeaders().catch(() => ({}))
+        const text = maskSecrets(String(await withTimeout(response.text(), 20000, 'the answer').catch(() => '')))
+        const posted = request.postData()
+        const said = {
+            at: entry.t, how: entry.type, method: entry.method, path: entry.path,
+            sent: headerNames(sent), status: response.status(), contentType: response.headers()['content-type'] || ''
+        }
+        // The body as sent; the page's own headers that give access are named, not shown (headerNames).
+        if (posted) said.body = cut(maskSecrets(posted).replace(/\s+/g, ' '), 900)
+        said.answer = cut(text.replace(/\s+/g, ' '), 700)
+        return said
+    }
+
+    /** All of --ui-upload: the page uploads the file, and what its own calls carried. */
+    async function ownUpload() {
+        // The file input, in the page's main frame first, then in the frames it embeds.
+        let inputs = null
+        let count = 0
+        for (const frame of page.frames()) {
+            const candidates = frame.locator('input[type="file"]')
+            const found = await withTimeout(candidates.count(), 8000, 'the file inputs').catch(() => 0)
+            if (found) {
+                inputs = candidates
+                count = found
+                if (frame !== page.mainFrame()) log('upload', `the file input is in a frame: ${hostPath(frame.url())}`)
+                break
+            }
+        }
+        inputs = inputs || page.locator('input[type="file"]')
+        const report = { inputs: count }
+        if (!count) {
+            log('upload', 'no file input on the page: nothing was put into it, no file call made')
+            report.stateAfter = await withTimeout(page.evaluate(pageState), 8000, 'the page').catch(error => ({ error: cut(error.message, 100) }))
+            return report
+        }
+        report.found = await withTimeout(inputs.evaluateAll(nodes => nodes.map(node => ({
+            id: node.id || '', accept: node.accept || '', multiple: node.multiple,
+            hidden: ['none', 'hidden'].includes(getComputedStyle(node).display) || getComputedStyle(node).visibility === 'hidden'
+        }))), 8000, 'the file inputs').catch(() => [])
+        log('upload', `file inputs: ${report.found.map(item => `${item.id ? '#' + item.id : '(no id)'} accept="${item.accept}"${item.multiple ? ' multiple' : ''}${item.hidden ? ' (hidden)' : ''}`).join(' | ')}`)
+        const file = { name: UPLOAD_NAME, mimeType: 'text/plain', buffer: Buffer.from(UPLOAD_TEXT) }
+        upload.startedAt = ms()
+        try {
+            await inputs.first().setInputFiles(file, { timeout: 10000 })
+        } catch (error) {
+            log('upload', `the file could not be put into the input: ${cut(error.message, 160)}`)
+            report.stateAfter = await withTimeout(page.evaluate(pageState), 8000, 'the page').catch(() => ({}))
+            return report
+        }
+        log('upload', `a text file of ${file.buffer.length} bytes put into the first file input`)
+        // The page's own upload takes what it takes: it is waited for until the
+        // parse status answers success, or 25 s pass with no new file call, or 90 s in all.
+        const until = Date.now() + 90000
+        while (Date.now() < until) {
+            await sleep(1000)
+            const latest = upload.files[upload.files.length - 1]
+            const lastAt = latest ? requests.get(latest.request())?.t : upload.startedAt
+            if (Date.now() - T0 - lastAt > 25000) break
+        }
+        report.files = []
+        for (const response of upload.files) {
+            const said = await fileExchange(response)
+            report.files.push(said)
+            log('upload', `its ${said.method} ${said.path} at ${said.at} ms -> HTTP ${said.status} [${said.how}; ${said.contentType.split(';')[0] || 'no content-type'}]`)
+            log('upload', `  sent: ${said.sent.join(' ')}`)
+            if (said.body) log('upload', `  body: ${said.body}`)
+            log('upload', `  answered: ${said.answer}`)
+        }
+        if (!report.files.length) log('upload', 'the page made no file call on the origin after the file was put in')
+        report.origin = upload.origin
+        if (!report.files.length) {
+            // What the page did instead — by path and status, as the requests of the origin go.
+            for (const item of upload.origin.slice(0, 20)) log('upload', `the page asked: ${item.type} ${item.method} ${item.path} -> HTTP ${item.status}`)
+        }
+        report.foreign = upload.foreign
+        for (const item of upload.foreign) {
+            log('upload', `to another host: ${item.type} ${item.method} ${item.host}${cut(item.path, 40)} -> HTTP ${item.status}`)
+        }
+        report.screenshotAfter = await shot('after-the-upload.png')
+        report.stateAfter = await withTimeout(page.evaluate(pageState), 8000, 'the page').catch(error => ({ error: cut(error.message, 100) }))
+        log('upload', `the page shows: ${JSON.stringify(report.stateAfter)}`)
+        lastCallEndedAt = ms()
+        return report
+    }
+
     // ---- our completions call the way the page's own front end makes it (--like-own) ---------
     // The page's clock in the format its front end sends: 'Sat Nov 21 2026 19:55:52 GMT+0400'.
     const pageTimezone = () => {
@@ -1117,6 +1254,8 @@ async function main() {
 
     if (!harvested) {
         log('life', 'no page to probe: stopping without any call')
+    } else if (UI_UPLOAD) {
+        out.upload = await ownUpload()
     } else if (UI_SEND) {
         out.ui = await ownMessage()
     } else if (LIKE_OWN) {
@@ -1343,6 +1482,25 @@ async function main() {
             if (ui.signed.completions) console.log(`the worker's completions on the page's signature: ${JSON.stringify(ui.signed.completions)}`)
         }
     }
+    if (out.upload) {
+        const up = out.upload
+        console.log('--- the page\'s own file upload (no message sent)')
+        console.log(`file inputs on the page: ${up.inputs}${up.found ? ` — ${up.found.map(item => `${item.id ? '#' + item.id : '(no id)'} accept="${item.accept}"${item.multiple ? ' multiple' : ''}${item.hidden ? ' (hidden)' : ''}`).join(' | ')}` : ''}`)
+        if (!up.files) console.log('nothing was put into it: no file call made')
+        for (const said of up.files || []) {
+            console.log(`its ${said.method} ${said.path} at ${said.at} ms -> HTTP ${said.status} [${said.how}; ${said.contentType.split(';')[0] || 'no content-type'}]`)
+            console.log(`  sent: ${said.sent.join(' ')}`)
+            if (said.body) console.log(`  body: ${said.body}`)
+            console.log(`  answered: ${said.answer}`)
+        }
+        if (up.files && !up.files.length) {
+            console.log('the page made no file call on the origin after the file was put in; what it asked instead:')
+            for (const item of up.origin || []) console.log(`  ${item.type} ${item.method} ${item.path} -> HTTP ${item.status}`)
+        }
+        if (up.files && up.files.length) console.log(`other calls the page made on the origin meanwhile: ${(up.origin || []).filter(item => !FILE_PATHS.test(item.path)).map(item => `${item.method} ${item.path.slice(0, 40)} -> ${item.status}`).join('; ') || 'none'}`)
+        for (const item of up.foreign || []) console.log(`to another host: ${item.type} ${item.method} ${item.host}${cut(item.path, 40)} -> HTTP ${item.status}`)
+        console.log(`the page shows after it: ${JSON.stringify(up.stateAfter)}`)
+    }
     if (out.own) {
         console.log('--- our completions call, made the way the page\'s own front end makes it')
         for (const label of ['own-completions-1', 'own-completions-2']) {
@@ -1378,7 +1536,7 @@ async function main() {
     console.log('end:  ', JSON.stringify(out.factsEnd))
     console.log('--- still open at the end')
     for (const line of out.pendingAtEnd.slice(0, 12)) console.log(line)
-    console.log(`screenshots: ${out.screenshotReady}, ${out.screenshotEnd}${out.ui ? `, after-the-message.png` : ''} in ${OUT}`)
+    console.log(`screenshots: ${out.screenshotReady}, ${out.screenshotEnd}${out.ui ? ', after-the-message.png' : ''}${out.upload ? ', after-the-upload.png' : ''} in ${OUT}`)
     fs.writeFileSync(path.join(OUT, 'summary.json'), JSON.stringify({ ...out, events, requests: list, console: consoleAll }, null, 1))
 }
 

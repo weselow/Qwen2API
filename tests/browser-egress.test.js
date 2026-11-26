@@ -2137,7 +2137,11 @@ test('Qwen2API-jr9: the app puts exactly content-type and x-request-id on /egres
 // status, STS token, file parse — behind the flag of chats/new (enabled()).
 const CHAT_INFO = 'https://chat.qwen.ai/api/v2/chats/chat-1'
 const TASK_STATUS = 'https://chat.qwen.ai/api/v1/tasks/status/task-1'
-const STS_TOKEN = 'https://chat.qwen.ai/api/v1/files/getstsToken'
+// Where the page's own code asks for the STS token (front end 0.3.50). The
+// v1 address next to it is the direct path's, and the one qwen.ai answered 405
+// while it was asked from the page (2026-11-25, Qwen2API-3ue.12).
+const STS_TOKEN = 'https://chat.qwen.ai/api/v2/files/getstsToken'
+const STS_TOKEN_DIRECT = 'https://chat.qwen.ai/api/v1/files/getstsToken'
 const CHAT = { success: true, data: { chat: { id: 'chat-1' } } }
 // What qwen.ai answers a file's parse with, and what it is asked for.
 const STS = {
@@ -3632,10 +3636,16 @@ const upload = require('../src/utils/upload')
 const { ContextExternalizationError } = require('../src/utils/upstream-error')
 const OSS = require('ali-oss')
 const CONTENT = Buffer.from('file content')
-// The STS call's body, as the direct path builds it.
-const STS_BODY = { filename: 'upload.txt', filesize: CONTENT.length, filetype: 'file' }
+// The STS call's body as the page's own code builds it (Qwen2API-3ue.12): the size as a string.
+const STS_BODY = { filename: 'upload.txt', filesize: String(CONTENT.length), filetype: 'file' }
+// The same body on the direct path, as it always was.
+const STS_BODY_DIRECT = { ...STS_BODY, filesize: CONTENT.length }
+// As qwen.ai answered the v1 address from the page on 2026-11-25: 405 with an HTML error page.
+const REFUSED_PAGE = '<!doctypehtml><html lang="zh-cn"><meta charset="utf-8"><meta name="data-spm" content="a3c0e"><title>405</title><body>405</body></html>'
+const stsRefused = () => egress(REFUSED_PAGE, [], 405)
 
 // OSS is ali-oss's own client, not axios: its put is what stands between the test and its network.
+const OSS_PUT = OSS.prototype.put
 async function withOssPut(put, fn) {
     const real = OSS.prototype.put
     OSS.prototype.put = put
@@ -3645,15 +3655,35 @@ async function withOssPut(put, fn) {
         OSS.prototype.put = real
     }
 }
-const putRecording = puts => async function (objectKey, content) {
-    puts.push({ objectKey, content: content.toString(), agent: this.agent ?? null, urllib: this.urllib ?? null })
-    return { res: { status: 200 } }
+// What one put would have carried to OSS: ali-oss's own put, as it is, with the
+// client's HTTP replaced for the call — the request is caught on its way out, with
+// the signature the client built for it, and answered 200. Nothing reaches a network.
+const putRecording = puts => async function (objectKey, content, options) {
+    const client = this
+    const urllib = client.urllib
+    client.urllib = {
+        async request(url, params) {
+            puts.push({
+                objectKey, content: content.toString(),
+                url, method: params.method, signature: params.headers.authorization,
+                client: { v4: client.options.authorizationV4, region: client.options.region, endpoint: String(client.options.endpoint) }
+            })
+            return { status: 200, headers: {}, data: Buffer.alloc(0), res: { status: 200, headers: {}, size: 0 } }
+        }
+    }
+    try {
+        return await OSS_PUT.call(client, objectKey, content, options)
+    } finally {
+        client.urllib = urllib
+    }
 }
 const qwenFilesBehindThePage = (sts, parse, parseStatus) => {
     worker.script.egress = body => {
         assert.equal(body.stream, undefined, 'a whole-answer call')
         const pathname = new URL(body.url).pathname
-        if (pathname === '/api/v1/files/getstsToken') return typeof sts === 'function' ? sts() : sts
+        // The v1 address is one the page no longer asks: qwen.ai answers it as it did the app's (Qwen2API-3ue.12).
+        if (pathname === '/api/v1/files/getstsToken') return stsRefused()
+        if (pathname === '/api/v2/files/getstsToken') return typeof sts === 'function' ? sts() : sts
         if (pathname === '/api/v2/files/parse') return typeof parse === 'function' ? parse() : parse
         if (pathname === '/api/v2/files/parse/status') return typeof parseStatus === 'function' ? parseStatus() : parseStatus
         throw new Error(`nothing on the page answers ${pathname}`)
@@ -3723,7 +3753,7 @@ test('Qwen2API-03v: an agent context file goes up whole — STS of the page, byt
     assert.equal(puts.length, 1)
     // STS, parse, the status: three calls, all the page's.
     assert.deepEqual(worker.sent('/egress').map(call => new URL(call.url).pathname), [
-        '/api/v1/files/getstsToken', '/api/v2/files/parse', '/api/v2/files/parse/status'
+        '/api/v2/files/getstsToken', '/api/v2/files/parse', '/api/v2/files/parse/status'
     ])
     assert.deepEqual(worker.sent('/egress').map(bringsBearer), [false, false, false])
     assert.deepEqual(direct, [])
@@ -3871,5 +3901,143 @@ test('Qwen2API-03v: with chats/new direct, STS and parse stay on axios, with the
         '/api/v1/files/getstsToken', '/api/v2/files/parse', '/api/v2/files/parse/status'
     ])
     assert.deepEqual(direct.map(bearerOf), [`Bearer ${account.token}`, `Bearer ${account.token}`, `Bearer ${account.token}`])
+    assert.equal(worker.calls.length, 0, 'the worker is not involved')
+})
+
+/* ------------ the page's own address, body and signature for a file (Qwen2API-3ue.12) -- */
+
+test('Qwen2API-3ue.12: the token is asked where the page\'s own code asks it, and with its body — the size as a string', async () => {
+    const account = givenAccount()
+    qwenFilesBehindThePage(() => json({ success: true, data: STS }))
+    // The type is the one the app names as it always did: by the main part of the MIME type,
+    // as the page names it. Only the size differs from the direct path's body.
+    for (const [name, filetype] of [['upload.txt', 'file'], ['photo.PNG', 'image'], ['logo.svg', 'image'],
+        ['clip.mp4', 'video'], ['reel.webm', 'video'], ['voice.mp3', 'audio'], ['archive.bin', 'file']]) {
+        worker.calls.length = 0
+        await withOssPut(putRecording([]), () => upload.uploadFileToQwenOss(CONTENT, name, account.token, account))
+        // The page answers the v1 address 405 (the stand-in above): the call came back whole.
+        const [call] = worker.sent('/egress')
+        assert.equal(call.url, STS_TOKEN, name)
+        assert.equal(call.method, 'POST', name)
+        assert.deepEqual(JSON.parse(call.body), { filename: name, filesize: String(CONTENT.length), filetype }, name)
+        assert.equal(bringsBearer(call), false, name)
+        assert.equal(call.headers['content-type'], 'application/json', name)
+    }
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-3ue.12: the bytes go to OSS as the page sends them — signed V4, in the region the answer named, to the endpoint it gave', async () => {
+    const account = givenAccount()
+    // The endpoint is not the one a region would give: the answer's own address is the one to use.
+    qwenFilesBehindThePage(() => json({ success: true, data: {
+        ...STS, region: 'oss-cn-shanghai', endpoint: 'oss-accelerate.aliyuncs.com'
+    } }))
+    const puts = []
+
+    await withOssPut(putRecording(puts), () => upload.uploadFileToQwenOss(CONTENT, 'upload.txt', account.token, account))
+    assert.equal(puts.length, 1)
+    assert.equal(puts[0].method, 'PUT')
+    assert.equal(puts[0].objectKey, STS.file_path)
+    assert.equal(puts[0].content, CONTENT.toString())
+    // The request ali-oss built: to the endpoint the answer gave, not to one built from the region.
+    assert.equal(new URL(puts[0].url).host, `${STS.bucketname}.oss-accelerate.aliyuncs.com`)
+    assert.equal(new URL(puts[0].url).pathname, `/${STS.file_path}`)
+    assert.equal(puts[0].client.v4, true)
+    assert.equal(puts[0].client.region, 'oss-cn-shanghai')
+    assert.match(puts[0].signature,
+        /^OSS4-HMAC-SHA256 Credential=test-access-key\/\d{8}\/cn-shanghai\/oss\/aliyun_v4_request(,AdditionalHeaders=[^,]+)?,Signature=[0-9a-f]{64}$/)
+    assert.equal(bringsBearer(worker.sent('/egress')[0]), false)
+})
+
+test('Qwen2API-3ue.12: an answer that names no endpoint still uploads — to the endpoint built from the region, as before', async () => {
+    const account = givenAccount()
+    qwenFilesBehindThePage(() => json({ success: true, data: STS }))
+    const puts = []
+
+    const result = await withOssPut(putRecording(puts), () => upload.uploadFileToQwenOss(CONTENT, 'upload.txt', account.token, account))
+    assert.equal(result.status, 200)
+    assert.equal(new URL(puts[0].url).host, `${STS.bucketname}.oss-cn-hangzhou.aliyuncs.com`)
+    assert.equal(puts[0].client.v4, true)
+    assert.equal(puts[0].client.region, 'oss-cn-hangzhou')
+    assert.match(puts[0].signature,
+        /^OSS4-HMAC-SHA256 Credential=test-access-key\/\d{8}\/cn-hangzhou\/oss\/aliyun_v4_request(,AdditionalHeaders=[^,]+)?,Signature=[0-9a-f]{64}$/)
+})
+
+// What the chat controller answers with, as tests/context-attachment-529.test.js hands it one.
+const fakeRes = () => {
+    const res = { statusCode: 200, headers: {}, body: null, headersSent: false, writableEnded: false }
+    res.status = code => { res.statusCode = code; return res }
+    res.set = (key, value) => {
+        if (key && typeof key === 'object') Object.assign(res.headers, key)
+        else res.headers[key] = value
+        return res
+    }
+    res.json = body => { res.body = body; res.headersSent = true; res.writableEnded = true; return res }
+    res.write = () => true
+    res.end = () => { res.writableEnded = true }
+    res.flushHeaders = () => { res.headersSent = true }
+    res.on = () => res
+    return res
+}
+
+test('Qwen2API-3ue.12: qwen.ai refusing the token call is the client\'s 503 for a request with tools, as it was — one call, no retry, no upload', { timeout: 15000 }, async () => {
+    const account = givenAccount()
+    upload.resetParseBreaker()
+    upload.resetParseRateLimiter()
+    // The refusal of 2026-11-25, come on the address the page asks now.
+    qwenFilesBehindThePage(stsRefused)
+    const files = worker.script.egress
+    // The chat is made as in any request: the page answers chats/new, and refuses the token call.
+    worker.script.egress = body => (new URL(body.url).pathname === '/api/v2/chats/new' ? egress(chat('chat-1')) : files(body))
+    const puts = []
+    const threshold = config.agentContextFileThresholdBytes
+    const getAccount = accountManager.getAccount
+    // A context over the threshold, asked for as a chat completion with tools.
+    config.agentContextFileThresholdBytes = 2048
+    accountManager.getAccount = () => account
+    const res = fakeRes()
+    try {
+        await withOssPut(putRecording(puts), () => require('../src/controllers/chat').handleChatCompletion({
+            body: {
+                model: MODEL, stream: false,
+                tools: [{ type: 'function', function: { name: 'read_file' } }],
+                messages: [{ role: 'user', content: 'x'.repeat(4096) }]
+            },
+            has_tools: true, tool_choice: 'auto', allowed_tool_names: ['read_file']
+        }, res))
+    } finally {
+        config.agentContextFileThresholdBytes = threshold
+        accountManager.getAccount = getAccount
+    }
+    assert.equal(res.statusCode, 503)
+    assert.equal(res.body.error.code, 'upstream_unavailable')
+    assert.equal(res.body.error.type, 'server_error')
+    assert.equal(res.headers['Retry-After'], '10')
+    assert.match(res.body.error.message, /document parse unavailable/i)
+    // The chat was made; the token was asked for once, and the 405 is not worth a retry.
+    assert.deepEqual(worker.sent('/egress').map(call => new URL(call.url).pathname), ['/api/v2/chats/new', '/api/v2/files/getstsToken'])
+    assert.equal(worker.count('/renew'), 0)
+    assert.equal(puts.length, 0, 'nothing is uploaded')
+    assert.deepEqual(direct, [])
+})
+
+test('Qwen2API-3ue.12: with chats/new direct, the file call is the one it always was — the v1 address, the size as a number, the upload signed V1', async () => {
+    config.chatCreationTransport = 'direct'
+    const account = givenAccount()
+    const asks = []
+    directReply = async (url, data) => {
+        assert.ok(url.endsWith('/api/v1/files/getstsToken'), `no direct call to ${url} is scripted`)
+        asks.push([new URL(url).pathname, data])
+        // An endpoint of its own is read off the answer on the page's address alone.
+        return { status: 200, data: { ...STS, endpoint: 'oss-cn-beijing.aliyuncs.com' } }
+    }
+    const puts = []
+
+    await withOssPut(putRecording(puts), () => upload.uploadFileToQwenOss(CONTENT, 'upload.txt', account.token, account))
+    assert.deepEqual(asks, [[new URL(STS_TOKEN_DIRECT).pathname, STS_BODY_DIRECT]])
+    // Signed as it was, V1 and with no region of its own, to the endpoint built from the region.
+    assert.equal(puts[0].client.v4, false)
+    assert.match(puts[0].signature, /^OSS test-access-key:[A-Za-z0-9+/=]+$/)
+    assert.equal(new URL(puts[0].url).host, `${STS.bucketname}.oss-cn-hangzhou.aliyuncs.com`)
     assert.equal(worker.calls.length, 0, 'the worker is not involved')
 })
