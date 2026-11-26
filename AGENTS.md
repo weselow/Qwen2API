@@ -82,3 +82,58 @@ bd close <id>         # Complete work
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
 <!-- END BEADS INTEGRATION -->
+
+## Session Close: Leave Nothing Unsaved
+
+Adds to step 1 ("File issues for remaining work") and step 7 ("Hand off") of
+the Session Completion protocol above. It applies whenever a session is being
+closed: the user asks to close or end it, or the work is declared done.
+
+**During the session, record as you go.** A finding that bears on another task
+goes into that task's notes at once — the next session reads `bd show <id>`,
+never the last report.
+
+**Before the final report, run the tails review.** Go back over the whole
+session and collect everything that was noticed, thought or decided, but not
+saved:
+
+1. **Ideas and improvements** — "it would be better if …", including the ones
+   judged not worth doing now.
+2. **Bugs and defects** — in code, docs, CI, tooling, infrastructure — that
+   were seen and not fixed.
+3. **Secondary tasks and loose ends** — what came up and was left undone;
+   unverified cases and untested paths ("not checked live", "one observation").
+4. **Deliberate omissions** — every "I decided not to do X", with the reason.
+   These are the first to vanish.
+5. **Comments on other open tasks** — anything that changes another task's
+   scope, risk, plan or priority belongs in that task's notes.
+6. **Volatile artifacts** — scripts, recipes and workarounds that live only in
+   a temp directory or on a server: say where they are, or propose moving them
+   into the repository.
+
+Ask the owner's question in so many words: *what did I notice, decide not to
+do, or leave unverified that is not in beads yet?*
+
+**Then save every item in its place:**
+
+- It bears on another open task → that task's notes:
+  `bd update <id> --append-notes "$(cat file)"`.
+- It is work of its own → a new issue:
+  `bd create --title "$(cat title.txt)" --type task --priority 3 --body-file body.md --silent`
+  (`--type bug` for a defect; the command prints the id).
+- It is small, and there are several → one checklist issue, an item per line.
+- It is a fact about the environment or the tooling → bd memory:
+  `bd remember "$(cat file)" --key <slug>`, and the agent's persistent memory
+  where it has one.
+- It changes the scope or the design of the current task → its notes or design
+  field, the earlier wording kept.
+
+Priorities are preliminary: P3 for what matters soon, P4 for the rest; the
+owner sets them and closes. Check `bd list` before filing, and do not file
+twice. Write bodies through files. Say what is fact and what is hypothesis.
+The review files and records; it does not take up the work itself — that
+belongs to a new session with its own prompt.
+
+**In the final report**, list what was filed, by id, and what was left as an
+observation on purpose, with the reason. The owner closes the session trusting
+that nothing stayed only in the agent's head.
