@@ -2,7 +2,6 @@ const axios = require('axios')
 const { logger } = require('../utils/logger.js')
 const { setResponseHeaders } = require('./chat.js')
 const accountManager = require('../utils/account.js')
-const { sleep } = require('../utils/tools.js')
 const { generateChatID } = require('../utils/request.js')
 const sessionPersistence = require('../utils/v2-session-persistence.js')
 const { uploadFileToQwenOss } = require('../utils/upload.js')
@@ -14,14 +13,132 @@ const { buildRequestHeaders } = require('../utils/header-profile')
 const browserEgress = require('../utils/browser-egress.js')
 const {
     assertChatChallengeBreakerClosed, bindChatChallengeContext, chatChallengeFrom,
-    isWafChallengeError, noteChatChallengeAnswer, releaseChatProbe, ChatCreationError
+    isWafChallengeError, noteChatChallengeAnswer, releaseChatProbe, ChatCreationError, isTransportInterruption
 } = require('../utils/upstream-error.js')
+const { ClientGoneError, isClientGone, watchClient } = require('../utils/client-gone.js')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
 // How long qwen.ai may take with a generation. To axios it is the whole call's
 // budget; through the egress it is the silence between two pieces of the answer.
 const GENERATION_TIMEOUT_MS = 1000 * 60 * 5
+
+/**
+ * A client that goes away takes its upstream with it on the paths of images
+ * and video, as it does on the text paths (Qwen2API-3ue.10; the mechanism is
+ * utils/client-gone.js, Qwen2API-mxs). The `client` each entry point makes with
+ * watchClient(req) is passed down to the reading of the generation call, the
+ * lookups in the chat and the polls of the video task. A caller that brings
+ * none reads exactly as it did before.
+ *
+ * The closing is not a failure: every step asks whether the client is still
+ * there before it goes on, and lets ClientGoneError out as it is — no error
+ * line, no second attempt, no answer built for a client that is gone.
+ */
+
+/** Throws ClientGoneError once the client has gone: what every step asks before it goes on. */
+const assertClientStays = (client) => {
+    if (client && client.gone()) throw new ClientGoneError()
+}
+
+/**
+ * `sleep` for as long as the client stays: a client that goes away ends the
+ * wait at once with ClientGoneError, instead of leaving the request asleep for
+ * the rest of the pause (a video task is polled every twenty seconds).
+ */
+const sleepWhileClientStays = (ms, client) => new Promise((resolve, reject) => {
+    if (client && client.gone()) {
+        reject(new ClientGoneError())
+        return
+    }
+    let unsubscribe = null
+    const timer = setTimeout(() => {
+        if (unsubscribe) unsubscribe()
+        resolve()
+    }, ms)
+    if (client) {
+        unsubscribe = client.onGone(() => {
+            clearTimeout(timer)
+            reject(new ClientGoneError())
+        })
+    }
+})
+
+/**
+ * Closes `stream` when the client goes away: on the egress this closes the
+ * relay, and the worker cancels the fetch inside the page when it sees the
+ * relay go. A stream closed this way reports itself as a transport that broke,
+ * so whether the closing was for the client is kept here, where it is known,
+ * and not guessed from the code downstream.
+ * @param {*} stream - The upstream body
+ * @param {object|null} client - What watchClient returns
+ * @returns {{closed: () => boolean, stop: () => void}}
+ */
+const closeStreamWithClient = (stream, client) => {
+    let closed = false
+    const unsubscribe = client
+        ? client.onGone(() => {
+            closed = true
+            if (stream && typeof stream.destroy === 'function') stream.destroy()
+        })
+        : null
+    return {
+        closed: () => closed,
+        stop: () => { if (unsubscribe) unsubscribe() }
+    }
+}
+
+/**
+ * What a read that failed is once the client is gone: the stream reports its
+ * own closing as a transport that broke (ERR_STREAM_PREMATURE_CLOSE and the
+ * like) — the code of a failure, and none happened. Whether the closing was
+ * for the client is known here, where the stream was closed, and is not
+ * guessed from the code; a transport that broke under a client already gone
+ * is the same thing by another way. Anything else stays what it was: a quota
+ * packet or a challenge is thrown by whoever read it, and is not hidden under
+ * the client's leaving.
+ */
+const failedRead = (error, closing, client) => {
+    if (closing.closed() || (client && client.gone() && isTransportInterruption(error))) return new ClientGoneError()
+    return error
+}
+
+/**
+ * The body by its 'data' events, each handed to `onChunk`, until it ends — for
+ * as long as the client stays. A client that goes away has the stream closed
+ * at once, and the read ends in ClientGoneError: a closed stream never ends.
+ */
+const readUpstreamEvents = async (responseStream, onChunk, client = null) => {
+    const closing = closeStreamWithClient(responseStream, client)
+    try {
+        await new Promise((resolve, reject) => {
+            let settled = false
+            const settle = (outcome, value) => {
+                if (settled) return
+                settled = true
+                outcome(value)
+            }
+            responseStream.on('data', onChunk)
+            responseStream.on('end', () => settle(resolve))
+            responseStream.on('error', error => settle(reject, error))
+            responseStream.on('close', () => {
+                // A stream closed for the client never ends: its close is what ends the read.
+                if (closing.closed() || (client && client.gone())) settle(reject, new ClientGoneError())
+            })
+            // The client gone before a byte was read: the stream is closed already, and
+            // none of the events above may ever come.
+            if (closing.closed()) settle(reject, new ClientGoneError())
+        })
+        // The body ended just as the client left — under Bun the leaving is reported by
+        // nothing but the socket's address, which the watch asks for on its own clock:
+        // the read is over, and nobody is left for what it read.
+        if (client && client.gone()) throw new ClientGoneError()
+    } catch (error) {
+        throw failedRead(error, closing, client)
+    } finally {
+        closing.stop()
+    }
+}
 
 /**
  * 将上游响应体格式化为便于日志输出的对象
@@ -884,9 +1001,11 @@ const resolveRequestedModel = async (model, chatType) => {
 /**
  * 读取视频上游流并提取任务信息
  * @param {*} responseStream - 上游响应流
+ * @param {object|null} [client] - 该请求客户端的离开信号（utils/client-gone.js#watchClient）
  * @returns {Promise<{ upstreamError: object|null, contentUrl: string|null, videoTaskID: string|null, videoTaskCandidates: string[], responseIDs: string[], rawPreview: string }>} 解析结果
+ * @throws {ClientGoneError} 客户端已离开，上游流已随之关闭
  */
-const readVideoUpstreamResult = async (responseStream) => {
+const readVideoUpstreamResult = async (responseStream, client = null) => {
     if (!responseStream || typeof responseStream.on !== 'function') {
         const videoTaskCandidates = extractVideoTaskIdentifiersFromPayload(responseStream)
         const responseIDs = extractResponseIDsFromPayload(responseStream)
@@ -936,23 +1055,21 @@ const readVideoUpstreamResult = async (responseStream) => {
         }
     }
 
-    await new Promise((resolve, reject) => {
-        responseStream.on('data', (chunk) => {
-            const decoded = decoder.decode(chunk, { stream: true })
-            rawText += decoded
-            buffer += decoded
+    const onChunk = (chunk) => {
+        const decoded = decoder.decode(chunk, { stream: true })
+        rawText += decoded
+        buffer += decoded
 
-            const parsedResult = parseSsePayloads(buffer)
-            buffer = parsedResult.buffer
+        const parsedResult = parseSsePayloads(buffer)
+        buffer = parsedResult.buffer
 
-            for (const payload of parsedResult.payloads) {
-                applyPayload(payload)
-            }
-        })
+        for (const payload of parsedResult.payloads) {
+            applyPayload(payload)
+        }
+    }
 
-        responseStream.on('end', resolve)
-        responseStream.on('error', reject)
-    })
+    // For as long as the client stays: gone, the stream is closed and this throws ClientGoneError.
+    await readUpstreamEvents(responseStream, onChunk, client)
 
     const flushedResult = parseSsePayloads(buffer, true)
     for (const payload of flushedResult.payloads) {
@@ -985,9 +1102,11 @@ const readVideoUpstreamResult = async (responseStream) => {
 /**
  * 读取图片上游流并提取响应信息
  * @param {*} responseStream - 上游响应流
+ * @param {object|null} [client] - 该请求客户端的离开信号（utils/client-gone.js#watchClient）
  * @returns {Promise<{ upstreamError: object|null, contentUrl: string|null, responseIDs: string[], rawPreview: string }>} 解析结果
+ * @throws {ClientGoneError} 客户端已离开，上游流已随之关闭
  */
-const readImageUpstreamResult = async (responseStream) => {
+const readImageUpstreamResult = async (responseStream, client = null) => {
     if (!responseStream || typeof responseStream.on !== 'function') {
         return {
             upstreamError: parseUpstreamBody(responseStream, responseStream),
@@ -1023,23 +1142,21 @@ const readImageUpstreamResult = async (responseStream) => {
         }
     }
 
-    await new Promise((resolve, reject) => {
-        responseStream.on('data', (chunk) => {
-            const decoded = decoder.decode(chunk, { stream: true })
-            rawText += decoded
-            buffer += decoded
+    const onChunk = (chunk) => {
+        const decoded = decoder.decode(chunk, { stream: true })
+        rawText += decoded
+        buffer += decoded
 
-            const parsedResult = parseSsePayloads(buffer)
-            buffer = parsedResult.buffer
+        const parsedResult = parseSsePayloads(buffer)
+        buffer = parsedResult.buffer
 
-            for (const payload of parsedResult.payloads) {
-                applyPayload(payload)
-            }
-        })
+        for (const payload of parsedResult.payloads) {
+            applyPayload(payload)
+        }
+    }
 
-        responseStream.on('end', resolve)
-        responseStream.on('error', reject)
-    })
+    // For as long as the client stays: gone, the stream is closed and this throws ClientGoneError.
+    await readUpstreamEvents(responseStream, onChunk, client)
 
     const flushedResult = parseSsePayloads(buffer, true)
     for (const payload of flushedResult.payloads) {
@@ -1229,10 +1346,12 @@ const pollSilence = () => {
  * @param {string} chatID - 会话 ID
  * @param {string} token - 当前账号令牌
  * @param {Object} account - 当前账号：egress 模式下聊天详情从它的页面取（Qwen2API-03v）
+ * @param {object|null} [client] - 该请求客户端的离开信号（utils/client-gone.js#watchClient）
  * @returns {Promise<string>} 图片链接
+ * @throws {ClientGoneError} 客户端已离开：上游随之关闭，补取与轮询不再继续
  */
-const resolveImageResultContentUrl = async (responseData, chatID, token, account) => {
-    const { upstreamError, contentUrl: upstreamContentUrl, responseIDs, rawPreview } = await readImageUpstreamResult(responseData)
+const resolveImageResultContentUrl = async (responseData, chatID, token, account, client = null) => {
+    const { upstreamError, contentUrl: upstreamContentUrl, responseIDs, rawPreview } = await readImageUpstreamResult(responseData, client)
     if (upstreamError) {
         throw upstreamError
     }
@@ -1244,15 +1363,17 @@ const resolveImageResultContentUrl = async (responseData, chatID, token, account
 
         const silence = pollSilence()
         for (let attempt = 1; attempt <= 5; attempt++) {
+            assertClientStays(client)
             let chatDetail
             try {
                 chatDetail = await getChatDetail(chatID, token, account)
             } catch (error) {
                 // qwen.ai let this lookup go by: the pause, and the next lookup, as after "not ready yet".
                 if (!silence.skipped(error)) throw error
-                await sleep(800)
+                await sleepWhileClientStays(800, client)
                 continue
             }
+            assertClientStays(client)
             silence.answered()
             const extractedInfo = extractVideoInfoFromChatDetail(chatDetail, responseIDs)
             if (extractedInfo.contentUrl) {
@@ -1260,7 +1381,7 @@ const resolveImageResultContentUrl = async (responseData, chatID, token, account
                 break
             }
 
-            await sleep(800)
+            await sleepWhileClientStays(800, client)
         }
     }
 
@@ -1278,10 +1399,12 @@ const resolveImageResultContentUrl = async (responseData, chatID, token, account
  * @param {string} token - 当前账号令牌
  * @param {string} chatID - 会话 ID
  * @param {Object} account - 当前账号：egress 模式下聊天详情和任务状态从它的页面取（Qwen2API-03v）
+ * @param {object|null} [client] - 该请求客户端的离开信号（utils/client-gone.js#watchClient）
  * @returns {Promise<string>} 视频链接
+ * @throws {ClientGoneError} 客户端已离开：上游随之关闭，补取与轮询不再继续
  */
-const resolveVideoResultContentUrl = async (responseStream, token, chatID, account) => {
-    const { upstreamError, contentUrl: upstreamContentUrl, videoTaskCandidates, responseIDs, rawPreview } = await readVideoUpstreamResult(responseStream)
+const resolveVideoResultContentUrl = async (responseStream, token, chatID, account, client = null) => {
+    const { upstreamError, contentUrl: upstreamContentUrl, videoTaskCandidates, responseIDs, rawPreview } = await readVideoUpstreamResult(responseStream, client)
     if (upstreamError) {
         throw upstreamError
     }
@@ -1307,15 +1430,17 @@ const resolveVideoResultContentUrl = async (responseStream, token, chatID, accou
         logger.info(`视频上游未直接返回任务信息，尝试从聊天详情补取，chat_id=${chatID} responseIDs=${JSON.stringify(responseIDs)}`, 'CHAT')
 
         for (let attempt = 1; attempt <= 5; attempt++) {
+            assertClientStays(client)
             let chatDetail
             try {
                 chatDetail = await getChatDetail(chatID, token, account)
             } catch (error) {
                 // qwen.ai let this lookup go by: the pause, and the next lookup, as after "nothing there yet".
                 if (!silence.skipped(error)) throw error
-                await sleep(1200)
+                await sleepWhileClientStays(1200, client)
                 continue
             }
+            assertClientStays(client)
             silence.answered()
             const extractedInfo = extractVideoInfoFromChatDetail(chatDetail, responseIDs)
 
@@ -1333,7 +1458,7 @@ const resolveVideoResultContentUrl = async (responseStream, token, chatID, accou
                 break
             }
 
-            await sleep(1200)
+            await sleepWhileClientStays(1200, client)
         }
     }
 
@@ -1355,21 +1480,24 @@ const resolveVideoResultContentUrl = async (responseStream, token, chatID, accou
         logger.info(`开始轮询视频任务ID: ${taskCandidate}`, 'CHAT')
 
         for (let i = 0; i < maxAttempts; i++) {
+            // A client that left is not polled for any longer, and not waited the twenty seconds for.
+            assertClientStays(client)
             let content
             try {
                 content = await getVideoTaskStatus(taskCandidate, token, account)
             } catch (error) {
                 // One poll qwen.ai let go by is one of the task's sixty, as its "not done" is.
                 if (!silence.skipped(error)) throw error
-                await sleep(delay)
+                await sleepWhileClientStays(delay, client)
                 continue
             }
+            assertClientStays(client)
             silence.answered()
             if (content) {
                 return content
             }
 
-            await sleep(delay)
+            await sleepWhileClientStays(delay, client)
         }
     }
 
@@ -1383,9 +1511,12 @@ const resolveVideoResultContentUrl = async (responseStream, token, chatID, accou
 /**
  * 统一执行图片/视频请求
  * @param {object} payload - 内部请求体
+ * @param {object|null} [client] - 该请求客户端的离开信号（utils/client-gone.js#watchClient）：客户端走了，
+ *   上游随之关闭，补取与轮询停止，并以 ClientGoneError 结束
  * @returns {Promise<{ model: string, chatType: string, contentUrl: string, content: string }>} 执行结果
+ * @throws {ClientGoneError} 客户端已离开——不是错误：调用方原样放行
  */
-const generateImageVideoResult = async (payload) => {
+const generateImageVideoResult = async (payload, client = null) => {
     const { model, messages, size, chat_type } = payload
     // 一次取出账户对象，确保 token 与 proxy 走同一个账号
     const account = accountManager.getAccount()
@@ -1427,11 +1558,17 @@ const generateImageVideoResult = async (payload) => {
             throw imageChallengeError(challenge)
         }
 
+        // A client that is gone already is not made a chat for.
+        assertClientStays(client)
         const chatID = await generateChatID(token, model, account, chat_type)
 
         if (!chatID) {
             throw new Error('生成 chat_id 失败')
         }
+
+        // Nor is one that left while the chat was being made sent a generation
+        // that takes seconds to minutes: nobody would read it.
+        assertClientStays(client)
 
         // Creating the chat may have recovered the session and rotated its
         // token (Qwen2API-3ue.2): the generation rides the token the store holds.
@@ -1569,7 +1706,7 @@ const generateImageVideoResult = async (payload) => {
             }
             // The video's answer is read whole, as the direct path asks Axios for it.
             const response = await relayedGeneration({
-                url: completionsUrl, body: reqBody, account, whole: newChatType === 't2v'
+                url: completionsUrl, body: reqBody, account, whole: newChatType === 't2v', client
             })
             // The egress may have recovered the session on the way (Qwen2API-3ue.3):
             // a call that follows on the direct road (chats/new direct, completions
@@ -1591,18 +1728,20 @@ const generateImageVideoResult = async (payload) => {
                 if (inlineUpstreamError?.code === 'upstream_waf_challenge') throw inlineUpstreamError
                 if (attempt < maxUpstreamAttempts && isRetryableUpstreamError(inlineUpstreamError)) {
                     logger.warn(`图片/视频请求上游返回业务错误包，准备第 ${attempt + 1} 次重试，请求ID: ${inlineUpstreamError.request_id || '未知'}`, 'CHAT')
-                    await sleep(800)
+                    await sleepWhileClientStays(800, client)
                     continue
                 }
 
                 break
             } catch (error) {
+                // The client went away (a video's answer is read whole inside the call): nothing failed, and nobody is left for a second attempt.
+                if (isClientGone(error)) throw error
                 logger.error('图片/视频请求失败', 'CHAT', '', buildAxiosErrorLog(error))
                 const upstreamError = parseUpstreamBody(error.response?.data, breakerContext)
                 if (isWafChallengeError(upstreamError)) throw upstreamError
                 if (attempt < maxUpstreamAttempts && isRetryableUpstreamError(upstreamError)) {
                     logger.warn(`图片/视频请求上游返回瞬时内部错误，准备第 ${attempt + 1} 次重试`, 'CHAT')
-                    await sleep(800)
+                    await sleepWhileClientStays(800, client)
                     continue
                 }
 
@@ -1611,7 +1750,7 @@ const generateImageVideoResult = async (payload) => {
         }
 
         if (newChatType === 't2i' || newChatType === 'image_edit') {
-            const contentUrl = await resolveImageResultContentUrl(responseData.data, chatID, token, account)
+            const contentUrl = await resolveImageResultContentUrl(responseData.data, chatID, token, account, client)
             noteChatChallengeAnswer(breakerContext)
             return {
                 model,
@@ -1622,7 +1761,7 @@ const generateImageVideoResult = async (payload) => {
         }
 
         if (newChatType === 't2v') {
-            const contentUrl = await resolveVideoResultContentUrl(responseData.data, token, chatID, account)
+            const contentUrl = await resolveVideoResultContentUrl(responseData.data, token, chatID, account, client)
             noteChatChallengeAnswer(breakerContext)
             return {
                 model,
@@ -1634,6 +1773,12 @@ const generateImageVideoResult = async (payload) => {
 
         throw new Error('不支持的图片/视频类型')
     } catch (error) {
+        // The client went away: its upstream is closed and nothing failed (utils/client-gone.js).
+        // The probe is given back, as for any request that ended before qwen.ai answered.
+        if (isClientGone(error)) {
+            releaseChatProbe(breakerContext)
+            throw error
+        }
         if (error instanceof ChatCreationError) {
             releaseChatProbe(breakerContext)
             throw {
@@ -1684,6 +1829,9 @@ const generateImageVideoResult = async (payload) => {
 const handleImageVideoCompletion = async (req, res) => {
     const downstreamStream = req.body.stream === true
     let keepAliveTimer = null
+    // Watched until the response is over: a client that goes away takes its upstream
+    // with it, on the signal of req and its socket (utils/client-gone.js).
+    const client = watchClient(req)
 
     try {
         if (downstreamStream && req.body.chat_type === 't2v') {
@@ -1695,17 +1843,20 @@ const handleImageVideoCompletion = async (req, res) => {
             }, 15000)
         }
 
-        const result = await generateImageVideoResult(req.body)
+        const result = await generateImageVideoResult(req.body, client)
 
         if (keepAliveTimer) {
             clearInterval(keepAliveTimer)
         }
-
         return returnResponse(res, result.model, result.content, downstreamStream)
     } catch (error) {
         if (keepAliveTimer) {
             clearInterval(keepAliveTimer)
         }
+
+        // The client went away: its upstream is closed with it, and there is nobody to
+        // answer — not a failure of the picture or of the video.
+        if (isClientGone(error)) return
 
         logger.error('图片视频资源处理错误', 'CHAT', '', error)
 
@@ -1736,6 +1887,9 @@ const handleImageVideoCompletion = async (req, res) => {
             status: 500,
             error: error?.message || 'Service error, please try again later'
         })
+    } finally {
+        // The socket outlives the request on keep-alive: its closing later is not this client leaving.
+        client.dispose()
     }
 }
 
@@ -1817,6 +1971,8 @@ const returnResponse = (res, model, content, stream) => {
  * @returns {Promise<void>}
  */
 const handleOpenAIImagesGeneration = async (req, res) => {
+    // Watched until the response is over, as in handleImageVideoCompletion (utils/client-gone.js).
+    const client = watchClient(req)
     try {
         if (!req.body?.prompt) {
             return sendOpenAIErrorResponse(res, {
@@ -1837,7 +1993,7 @@ const handleOpenAIImagesGeneration = async (req, res) => {
             size: normalizeOpenAIImageVideoSize(req.body.size),
             chat_type: 't2i',
             stream: false
-        })
+        }, client)
 
         const imageData = await buildOpenAIImageResultItem(result.contentUrl, req.body.response_format)
 
@@ -1846,8 +2002,12 @@ const handleOpenAIImagesGeneration = async (req, res) => {
             data: [imageData]
         })
     } catch (error) {
+        // The client went away: not a failure of the endpoint.
+        if (isClientGone(error)) return
         logger.error('OpenAI 图片生成端点处理失败', 'CHAT', '', error)
         return sendOpenAIErrorResponse(res, error)
+    } finally {
+        client.dispose()
     }
 }
 
@@ -1858,6 +2018,8 @@ const handleOpenAIImagesGeneration = async (req, res) => {
  * @returns {Promise<void>}
  */
 const handleOpenAIImagesEdit = async (req, res) => {
+    // Watched until the response is over, as in handleImageVideoCompletion (utils/client-gone.js).
+    const client = watchClient(req)
     try {
         const imageItems = await collectRequestMediaItems(req, 'image', 'image')
         if (imageItems.length === 0) {
@@ -1886,7 +2048,7 @@ const handleOpenAIImagesEdit = async (req, res) => {
             size: normalizeOpenAIImageVideoSize(req.body.size),
             chat_type: 'image_edit',
             stream: false
-        })
+        }, client)
 
         const imageData = await buildOpenAIImageResultItem(result.contentUrl, req.body.response_format)
 
@@ -1895,8 +2057,12 @@ const handleOpenAIImagesEdit = async (req, res) => {
             data: [imageData]
         })
     } catch (error) {
+        // The client went away: not a failure of the endpoint.
+        if (isClientGone(error)) return
         logger.error('OpenAI 图片编辑端点处理失败', 'CHAT', '', error)
         return sendOpenAIErrorResponse(res, error)
+    } finally {
+        client.dispose()
     }
 }
 
@@ -1907,6 +2073,8 @@ const handleOpenAIImagesEdit = async (req, res) => {
  * @returns {Promise<void>}
  */
 const handleOpenAIVideoGeneration = async (req, res) => {
+    // Watched until the response is over, as in handleImageVideoCompletion (utils/client-gone.js).
+    const client = watchClient(req)
     try {
         if (!req.body?.prompt) {
             return sendOpenAIErrorResponse(res, {
@@ -1927,7 +2095,7 @@ const handleOpenAIVideoGeneration = async (req, res) => {
             size: normalizeOpenAIImageVideoSize(req.body.size),
             chat_type: 't2v',
             stream: false
-        })
+        }, client)
 
         res.json({
             id: `video_${new Date().getTime()}`,
@@ -1942,8 +2110,12 @@ const handleOpenAIVideoGeneration = async (req, res) => {
             ]
         })
     } catch (error) {
+        // The client went away: not a failure of the endpoint.
+        if (isClientGone(error)) return
         logger.error('OpenAI 视频生成端点处理失败', 'CHAT', '', error)
         return sendOpenAIErrorResponse(res, error)
+    } finally {
+        client.dispose()
     }
 }
 
@@ -2016,11 +2188,20 @@ const getVideoTaskStatus = async (videoTaskID, token, account) => {
  * the parsing below takes a string as it takes an object, and qwen.ai is known
  * to answer this call with a page or a data:-wrapped frame despite the ask.
  * @param {*} responseStream - The body, a Readable
+ * @param {object|null} [client] - What watchClient returns: a client that goes away has the body closed
  * @returns {Promise<*>} The answer as JSON, or as text
+ * @throws {ClientGoneError} The body was closed because the client went away (utils/client-gone.js)
  */
-const readWholeAnswer = async (responseStream) => {
+const readWholeAnswer = async (responseStream, client = null) => {
+    const closing = closeStreamWithClient(responseStream, client)
     const chunks = []
-    for await (const chunk of responseStream) chunks.push(Buffer.from(chunk))
+    try {
+        for await (const chunk of responseStream) chunks.push(Buffer.from(chunk))
+    } catch (error) {
+        throw failedRead(error, closing, client)
+    } finally {
+        closing.stop()
+    }
     const text = Buffer.concat(chunks).toString('utf8')
     try {
         return JSON.parse(text)
@@ -2035,20 +2216,24 @@ const readWholeAnswer = async (responseStream) => {
  * @param {object} body - v2.1 请求体
  * @param {Object} account - 当前账号：从它的页面发出
  * @param {boolean} whole - 视频的响应整个读完；图片的照旧作为流交给调用方
+ * @param {object|null} [client] - 该请求客户端的离开信号：客户端走了，读着的响应随之关闭
  * @returns {Promise<{status: number, statusText: string, headers: Object, data: *}>} axios 形状的响应
+ * @throws {ClientGoneError} 视频的响应读到一半客户端离开
  */
-const relayedGeneration = async ({ url, body, account, whole }) => {
+const relayedGeneration = async ({ url, body, account, whole, client = null }) => {
     // The same fetch the text completions are (Qwen2API-3ue.9), through the one
     // seam that sends it: qwen.ai refuses this address to an XMLHttpRequest,
     // whole-answer or not.
     const response = await browserEgress.postCompletions({
         url, body: JSON.stringify(body), account, timeoutMs: GENERATION_TIMEOUT_MS
     })
+    // An image's answer is handed on as the stream it is: whoever reads it closes it for a
+    // client that goes away (readImageUpstreamResult), a video's is read whole here.
     return {
         status: response.status,
         statusText: response.statusText,
         headers: response.headers,
-        data: whole ? await readWholeAnswer(response.data) : response.data
+        data: whole ? await readWholeAnswer(response.data, client) : response.data
     }
 }
 
