@@ -8,6 +8,7 @@ const AccountRotator = require('./account-rotator')
 const { logger } = require('./logger')
 const { generateDeterministicFingerprint } = require('./fingerprint')
 const signinWorker = require('./signin-worker-client')
+const accountRegistry = require('./account-registry')
 
 /**
  * 默认 daily stats 结构。返回新对象，调用方安全修改
@@ -986,6 +987,9 @@ class Account {
                 return false
             }
 
+            // The account is the app's again: its calls reach the worker from here on (Qwen2API-u50).
+            accountRegistry.noteAdded(email)
+
             // 更新轮询器
             this.accountRotator.setAccounts(this.accountTokens)
 
@@ -1073,7 +1077,10 @@ class Account {
                 // Keep memory and rotation intact if storage refuses the deletion.
                 if (!await this.dataPersistence.deleteAccount(email)) return false
                 const index = this.accountTokens.findIndex(acc => acc.email === email)
-                lab.sessions.delete(email)
+                // The session and its recovery state go with the account (Qwen2API-u50): a
+                // request still out on it must find nothing to recover, and an account
+                // added again must not inherit the old one's backoff.
+                sessionPersistence.forgetRecovery(email)
                 if (index !== -1) this.accountTokens.splice(index, 1)
                 if (account.cli_info?.refresh_token_interval) clearInterval(account.cli_info.refresh_token_interval)
                 this.accountRotator.setAccounts(this.accountTokens)
@@ -1225,4 +1232,4 @@ process.on('SIGINT', () => {
 
 module.exports = accountManager
 // Said where code that must not load this module can find it once it is loaded.
-require('./account-registry').manager = accountManager
+accountRegistry.manager = accountManager

@@ -3,6 +3,7 @@ const config = require('../config')
 const store = require('./v2-session-store')
 const DataPersistence = require('./data-persistence')
 const signinWorker = require('./signin-worker-client')
+const { accountRemoved, noteRemoved, ACCOUNT_REMOVED } = require('./account-registry')
 const { logger } = require('./logger')
 const { JwtDecode } = require('./tools')
 
@@ -171,6 +172,10 @@ async function adoptToken(email, session) {
  * later: what the WAF counts is attempts.
  */
 async function relogin(email, account) {
+    // The one guard on this road (Qwen2API-u50): a renewal that was out when the
+    // account was removed comes back with a lost session once the worker has
+    // closed its page — or deleted its profile — and the sign-in would follow.
+    if (accountRemoved(email)) return null
     if (!reloginAllowed(email)) {
         logger.warn(`v2 полный вход отложен (${email}): чаще одного раза в ${reloginIntervalMs(email)} мс входы не выполняются`, 'V2SESSION')
         return null
@@ -183,7 +188,8 @@ async function relogin(email, account) {
     try {
         return await signinWorker.acquireSession(email, account.password, account, { force: true })
     } catch (error) {
-        reloginFailures.set(email, (reloginFailures.get(email) || 0) + 1)
+        // Removed while the sign-in was out: not a failure of the account added again.
+        if (!accountRemoved(email)) reloginFailures.set(email, (reloginFailures.get(email) || 0) + 1)
         throw error
     }
 }
@@ -227,6 +233,8 @@ async function renew(email, account, reason, refused) {
             }
         }
         if (!harvested) return null
+        // Removed while the renewal was out: nothing of it is kept — the account is gone (Qwen2API-u50).
+        if (accountRemoved(email)) return null
         const decoded = JwtDecode(harvested.token)
         if (!decoded || decoded.exp <= Math.floor(Date.now() / 1000)) {
             throw new Error('renewed token has no live expiry')
@@ -245,6 +253,9 @@ async function renew(email, account, reason, refused) {
         logger.success(`v2 会话已续期 (${email}, 触发原因: ${reason})`, 'V2SESSION')
         return session
     } catch (error) {
+        // The app no longer has the account (Qwen2API-u50): no failure of any session, and nothing to say —
+        // neither of a call refused as removed, nor of a renewal or sign-in that was out when it was removed.
+        if (error.code === ACCOUNT_REMOVED || accountRemoved(email)) return null
         logger.error(
             `v2 会话续期失败 (${email}, 触发原因: ${reason}): ${error.code || 'error'}${error.workerCode ? ` (${error.workerCode})` : ''}`,
             'V2SESSION'
@@ -253,11 +264,29 @@ async function renew(email, account, reason, refused) {
     }
 }
 
+/**
+ * The account is gone from the app (Qwen2API-2l0, Qwen2API-u50): nothing of
+ * its session's recovery stays behind. The maps are kept by email, so without
+ * this an account added again would inherit the old one's backoff and its
+ * "needs a sign-in" mark, and the old one's session would be in the store.
+ * A renewal of the old one still in flight keeps nothing when it ends (renew).
+ */
+function forgetRecovery(email) {
+    // From here on no call of the app reaches the worker for this account (Qwen2API-u50).
+    noteRemoved(email)
+    recoveredAt.delete(email)
+    reloggedInAt.delete(email)
+    reloginFailures.delete(email)
+    reloginNeeded.delete(email)
+    store.deleteSession(email)
+}
+
 /** Single-flight per account: every caller of one moment shares one renewal. */
 function scheduleRenewal(email, account, reason, refused) {
     if (renewals.has(email)) return renewals.get(email)
     const task = renew(email, account, reason, refused).finally(() => {
-        recoveredAt.set(email, clock())
+        // Removed meanwhile: its recovery leaves no trace for an account added again (forgetRecovery).
+        if (!accountRemoved(email)) recoveredAt.set(email, clock())
         renewals.delete(email)
     })
     renewals.set(email, task)
@@ -269,11 +298,14 @@ function scheduleRenewal(email, account, reason, refused) {
  * one) is replaced by a live one — now, so the caller can retry inside its
  * request. The refused session stays in place meanwhile: a failed recovery
  * leaves the account exactly as it was, not in a state nothing will renew.
- * Resolves to null at once inside the interval of the account's last recovery.
+ * Resolves to null at once inside the interval of the account's last recovery —
+ * and for an account the app has removed: there is no session of it to
+ * recover, and nothing is asked of the worker for it (Qwen2API-u50).
  * @returns {Promise<Object|null>} the live session, or null
  */
 function recoverSession(email, account, reason) {
     if (!store.browser || !email) return Promise.resolve(null)
+    if (accountRemoved(email)) return Promise.resolve(null)
     if (renewals.has(email)) return renewals.get(email)
     if (recoveryThrottled(email)) return Promise.resolve(null)
     return scheduleRenewal(email, account, reason, store.sessions.get(email))
@@ -288,6 +320,8 @@ function recoverSession(email, account, reason) {
  */
 function escalateToRelogin(email, account, reason) {
     if (!store.browser || !email) return
+    // Removed from the app while a request of its was out: nothing is left to sign in, and no note of it is kept (Qwen2API-u50).
+    if (accountRemoved(email)) return
     const refused = store.sessions.get(email)
     if (refused?.reloggedIn && !refused.reloginRefused) {
         refused.reloginRefused = true
@@ -322,6 +356,9 @@ function dropSession(email, reason) {
 function invalidateSession(email, account, reason) {
     if (!store.browser || !email) return
     if (!store.sessions.has(email)) return
+    // Removed from the app (Qwen2API-u50): a session in the store is a re-add's, published before its
+    // record is; it is not dropped, and no renewal is scheduled for it.
+    if (accountRemoved(email)) return
     if (reason === WAF_CHALLENGE || recoveryThrottled(email)) return
     const drop = dropSession(email, reason)
     // A renewal already in flight publishes a session of its own.
@@ -370,6 +407,7 @@ module.exports = {
     recoverSession,
     escalateToRelogin,
     markSessionAccepted,
+    forgetRecovery,
     syncCookies,
     readSetCookies,
     sessionToken,

@@ -3,6 +3,7 @@ const { StringDecoder } = require('node:string_decoder')
 const config = require('../config')
 const store = require('./v2-session-store')
 const { SigninError } = require('./signin-error')
+const { accountRemoved, ACCOUNT_REMOVED } = require('./account-registry')
 const { resolveProxyUrl } = require('./proxy-helper')
 
 /**
@@ -102,6 +103,18 @@ async function callWorker(path, payload) {
     return { token, expiresAt, cookies }
 }
 
+// No call that a request makes reaches the worker for an account the app has
+// removed (account-registry.js, Qwen2API-u50); the worker's own forget and
+// the sign-in that adds an account are not a request's. What such a call ends
+// with is not a lost session — no password sign-in follows it — nor the kind
+// of failure a retry mends: the request ends there, and nothing is charged to
+// the account.
+const refuseRemoved = email => {
+    if (!accountRemoved(email)) return
+    throw Object.assign(new SigninError(ACCOUNT_REMOVED, 409, 'The account was removed from the app.'),
+        { workerCode: 'account_removed', notAccountFault: true })
+}
+
 /**
  * Full interactive sign-in; returns a jar-backed session for the store.
  * The worker answers from the session it already holds while that one is
@@ -123,8 +136,10 @@ async function acquireSession(email, password, account, { force = false } = {}) 
  * @param {Object} [options]
  * @param {boolean} [options.force] - the session was refused upstream: reload
  *   the page live instead of answering from the worker's cache (Qwen2API-3ue.2)
+ * @throws {SigninError} signin_account_removed — the app no longer has the account
  */
 async function renewSession(email, account, { force = false } = {}) {
+    refuseRemoved(email)
     const payload = { email, proxy: resolveProxyUrl(account) }
     if (force) payload.force = true
     const harvested = await callWorker('/renew', payload)
@@ -187,8 +202,10 @@ const EGRESS_OPEN_MARGIN_MS = 60000
  * @param {string} [request.body] - Passed through as text
  * @param {number} [request.timeoutMs] - Budget for the call inside the page
  * @returns {Promise<{status:number, headers:Object, body:string, url:string, redirected:boolean, cookies:Object[]}>}
+ * @throws {SigninError} signin_account_removed — the app no longer has the account (refuseRemoved)
  */
 async function egress(email, account, { url, method = 'POST', headers = {}, body, timeoutMs = 30000 }) {
+    refuseRemoved(email)
     const answer = (await postWorker('/egress', {
         email, url, method, headers, body, timeoutMs, proxy: resolveProxyUrl(account)
     }, timeoutMs + config.signinWorkerTimeoutMs + EGRESS_OPEN_MARGIN_MS)).data
@@ -310,10 +327,12 @@ async function streamWorkerFailure(error, timedOut) {
  *   the relay; by default the call's silence budget, the worker's own budget
  *   and the page's open, as for egress()
  * @returns {Promise<{frames: AsyncGenerator<Object>, close: () => void}>}
- * @throws {SigninError} the worker could not take the call
+ * @throws {SigninError} the worker could not take the call; signin_account_removed —
+ *   the app no longer has the account (refuseRemoved)
  */
 async function egressStream(email, account, { url, method = 'POST', headers = {}, body, timeoutMs = 30000 },
     { budgetMs } = {}) {
+    refuseRemoved(email)
     const controller = new AbortController()
     let expired = false
     const timer = setTimeout(() => {
@@ -347,4 +366,7 @@ async function egressStream(email, account, { url, method = 'POST', headers = {}
     }
 }
 
-module.exports = { acquireSession, renewSession, forgetAccount, egress, egressStream, EGRESS_OPEN_MARGIN_MS, FORGET_TIMEOUT_MS }
+module.exports = {
+    acquireSession, renewSession, forgetAccount, egress, egressStream,
+    EGRESS_OPEN_MARGIN_MS, FORGET_TIMEOUT_MS
+}

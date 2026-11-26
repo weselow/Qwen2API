@@ -3,6 +3,7 @@ const http = require('node:http')
 const { Readable } = require('node:stream')
 const store = require('./v2-session-store')
 const signinWorker = require('./signin-worker-client')
+const { accountRemoved, ACCOUNT_REMOVED } = require('./account-registry')
 const sessionPersistence = require('./v2-session-persistence')
 const {
     ChatCreationError, assertChatCreationResponse, detectWafChallenge, isWafChallengeBody,
@@ -136,6 +137,19 @@ const accepted = async context => {
 }
 
 /**
+ * The account was removed from the app while a request of its was out on it
+ * (Qwen2API-u50). The request ends as one that did not get through — a 503
+ * the client may retry — never as a fault of a session of an account that is
+ * gone. Said once, here: what a request's own failures log is categories.
+ * @param {string} email
+ * @returns {ChatCreationError}
+ */
+const removedRequest = email => {
+    logger.warn(`The account was removed from the app while its request was out on it; the request ends here (${email})`, 'CHAT')
+    return new ChatCreationError(TRANSPORT, 503)
+}
+
+/**
  * Create a chat through the account's resident page, with real recovery: a
  * session the upstream refuses is replaced by a live one (the page is
  * reloaded, or the account re-logged in) and the call is made exactly once
@@ -159,7 +173,10 @@ async function createChat({ account, url, body }) {
     let session = store.sessions.get(email)
     // No session at all (invalidated meanwhile, or never restored): one recovery may still produce one.
     if (!session) session = await sessionPersistence.recoverSession(email, account, 'v2_session_required')
-    if (!session) throw new ChatCreationError('v2_session_required', 409)
+    if (!session) {
+        if (accountRemoved(email)) throw removedRequest(email)
+        throw new ChatCreationError('v2_session_required', 409)
+    }
     try {
         return await accepted(context)
     } catch (error) {
@@ -172,7 +189,8 @@ async function createChat({ account, url, body }) {
         const recovered = latest && latest.token !== session.token
             ? latest
             : await sessionPersistence.recoverSession(email, account, error.code)
-        if (!recovered) throw error
+        // Refused as a session while the account was being removed: the account is gone, not its session.
+        if (!recovered) throw accountRemoved(email) ? removedRequest(email) : error
         try {
             return await accepted(context)
         } catch (retryError) {
@@ -302,6 +320,10 @@ async function openCompletions(context) {
             url: context.url, headers: egressHeaders('application/json'), body: context.body, timeoutMs: context.timeoutMs
         })
     } catch (error) {
+        // The account was removed from the app while this request was out on it
+        // (Qwen2API-u50): thrown as it is, ahead of the relay failure a retry
+        // would mend — it is neither that nor the account's fault.
+        if (error.code === ACCOUNT_REMOVED) throw error
         // The profile no longer authenticates: the same refusal chats/new makes of it.
         if (error.sessionLost) throw httpError(401, { headers: {} }, '')
         // The worker refusing the call itself (bad token, bad request) is a
@@ -570,7 +592,9 @@ async function postCompletions(context) {
         } catch (error) {
             if (error.response?.status !== 401 || attempt > 1) throw error
             const live = await recovered(UNAUTHORIZED)
-            if (!live) throw error
+            // Refused as a session while the account was being removed (Qwen2API-u50): a failure
+            // the retry mends — by refusing it; the retry is where the removal is said.
+            if (!live) throw accountRemoved(email) ? relayFailure('account_removed', 'The account was removed from the app.') : error
             session = live
         }
     }
@@ -730,7 +754,8 @@ async function egressJson(context) {
             const live = latest && latest.token !== session?.token
                 ? latest
                 : await sessionPersistence.recoverSession(email, account, error.code)
-            if (!live) throw error
+            // The account was removed meanwhile (Qwen2API-u50): a call that did not get through, not a session's fault.
+            if (!live) throw accountRemoved(email) ? notCarried({ workerCode: 'account_removed' }) : error
             session = live
         }
     }
