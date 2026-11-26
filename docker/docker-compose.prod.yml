@@ -44,7 +44,8 @@ services:
       - SIGNIN_WORKER_URL=http://signin-worker:3100
       - SIGNIN_WORKER_TOKEN=${SIGNIN_WORKER_TOKEN:-}
       # Must stay above the worker's SIGNIN_LOGIN_MAX_WAIT_MS + SIGNIN_TIMEOUT_MS, and above a renewal's
-      # worst wait: RESIDENT_STREAM_WAIT_MS + RESIDENT_LOAD_MAX_WAIT_MS + 30000.
+      # worst wait: RESIDENT_STREAM_WAIT_MS + RESIDENT_LOAD_MAX_WAIT_MS + 2 x RESIDENT_LOAD_MIN_INTERVAL_MS
+      # + 25000 (the calls in flight, the token settling after the reload) + the reload itself: about 200000 by default.
       - SIGNIN_WORKER_TIMEOUT_MS=${SIGNIN_WORKER_TIMEOUT_MS:-240000}
     dns:
       - ${DNS_SIDECAR_IP:?Set an unused IP inside DNS_SUBNET}
@@ -93,8 +94,9 @@ services:
       # previous one, plus up to the same again as jitter; 1 = no queue. A sign-in is not in
       # that queue: the login pacer spaces sign-ins.
       - RESIDENT_LOAD_MIN_INTERVAL_MS=${RESIDENT_LOAD_MIN_INTERVAL_MS:-10000}
-      # No page load waits longer than this for its turn; a longer queue is packed closer.
-      # 0 = no limit.
+      # No page load waits longer than this for its turn; a longer queue is packed closer. One
+      # exception: a sign-in that begins just before a load's turn holds it back by up to one interval
+      # more — one interval in all, however many begin. 0 = no limit.
       - RESIDENT_LOAD_MAX_WAIT_MS=${RESIDENT_LOAD_MAX_WAIT_MS:-120000}
     # One Chromium profile per account; keep them on a volume so auth.qwen.ai
     # sessions survive restarts and renewal stays a silent reload.

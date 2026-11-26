@@ -50,10 +50,11 @@
  * Since Qwen2API-nch, Qwen2API-ops and Qwen2API-xun (2026-11-26), for many
  * accounts:
  *
- *   - every page load of every account — a lazy open, a renewal, a sign-in —
- *     takes a turn in one queue (lib/page-load-queue.js), so that a burst of
- *     openings after a restart, or of renewals in one tick of the app's timer,
- *     is not a burst of page loads from one address;
+ *   - the page loads of every account — a lazy open, a renewal — take turns
+ *     in one queue (lib/page-load-queue.js), so that a burst of openings after
+ *     a restart, or of renewals in one tick of the app's timer, is not a burst
+ *     of page loads from one address; a sign-in does not wait in that queue
+ *     (the login pacer spaces sign-ins), it only tells it when it begins;
  *   - a navigation on a live page waits first for the streams running on it
  *     (RESIDENT_STREAM_WAIT_MS), which a reload cuts otherwise;
  *   - a page's token is renewed in place before a call that finds it nearly
@@ -61,7 +62,8 @@
  *
  *   token-refresh ok (…), token-refresh failed (…)          the page's token, renewed in place
  *   resident-wait ended (…), resident-wait N still running (…)   what a navigation waited for
- *   page-load waited (…)                                     how long a load waited for its turn
+ *   page-load waited (…[, a long line packed])             how long a load waited for its turn
+ *   renew no reload (…)                                      a renewal answered by a session that turned live meanwhile
  *
  * Design: docs/browser-egress-design.md.
  */
@@ -194,9 +196,13 @@ function createServer(overrides = {}) {
         // the login pacer spaces them.
         loadMinIntervalMs: overrides.loadMinIntervalMs ?? envInt('RESIDENT_LOAD_MIN_INTERVAL_MS', 10000),
         // No page load waits longer than this for its turn; a longer line is
-        // packed closer instead. A renewal waits for the streams on its page
-        // (streamWaitMs) and then here, inside the application's budget for
-        // /renew (SIGNIN_WORKER_TIMEOUT_MS); this must leave both room.
+        // packed closer instead. One exception: a sign-in that begins just
+        // before a load's turn holds it back by up to one interval more — one
+        // interval in all, however many begin. A renewal waits, inside the
+        // application's budget for /renew (SIGNIN_WORKER_TIMEOUT_MS), for the
+        // streams on its page (streamWaitMs), for the calls in flight
+        // (drainMs), then here, then for the reload and for the token to
+        // settle after it: this must leave all of them room.
         // 0 = no limit.
         loadMaxWaitMs: overrides.loadMaxWaitMs ?? envCount('RESIDENT_LOAD_MAX_WAIT_MS', 120000)
     }
@@ -208,6 +214,11 @@ function createServer(overrides = {}) {
     // email -> the live renewal in flight; every caller of one moment shares
     // one page reload.
     const renewing = new Map()
+    // The accounts whose renewal in flight has a caller that insists on a live
+    // reload: for these the cache answers nothing, whoever started the renewal.
+    const insisting = new Set()
+    // Set when the worker begins to stop: no browser is launched for a request that lands after it.
+    let halting = false
     // Chromium locks a profile directory: serialize every launch per account.
     const locks = new Map()
     // email -> the full sign-in now running for it. A /session that lands on
@@ -230,6 +241,8 @@ function createServer(overrides = {}) {
     // The pages' token refreshes take turns of their own, closer together —
     // they are no page loads.
     const pageLoads = createPageLoadQueue({ minIntervalMs: config.loadMinIntervalMs, maxWaitMs: config.loadMaxWaitMs, log })
+    // The refreshes take the queue's default limit of two minutes: with a gap of two to four
+    // seconds it would take more than sixty pages in one moment for a line to be packed.
     const tokenRefreshes = createPageLoadQueue({ minIntervalMs: config.tokenRefreshMinIntervalMs })
     const profileDir = email => path.join(config.dataDir,
         'account-' + crypto.createHash('sha256').update(email).digest('hex').slice(0, 32))
@@ -354,17 +367,34 @@ function createServer(overrides = {}) {
         if (!cached && !fs.existsSync(profileDir(email))) {
             throw new WorkerError('no_profile', 'No persisted profile for this account.')
         }
-        return withBrowserContext(email, effectiveProxy,
-            context => signer.renew(context, { chatOrigin: config.chatOrigin, timeoutMs: config.timeoutMs }))
+        // Asked once the account is this renewal's, before any turn is taken or page
+        // touched: the session may have turned live while it waited for the account's
+        // page — another load of it settled a fresh one. A renewal that stood in the
+        // line of page loads behind the page's own opening, for one, has nothing left
+        // to reload for: it answers that session, and loads no page. A caller whose
+        // session was refused gets its reload, whoever joined the renewal.
+        const outcome = await withBrowserContext(email, effectiveProxy,
+            async context => ({ reloaded: await signer.renew(context, { chatOrigin: config.chatOrigin, timeoutMs: config.timeoutMs }) }),
+            { unless: () => (insisting.has(email) ? undefined : fresh(email)) })
+        // The cache answered: its entry. Else what the reload harvested.
+        return outcome.reloaded ? outcome : { answered: outcome }
     }
 
     /**
      * `turn` false: the operation is a sign-in, which does not wait in the
      * line of page loads (lib/page-load-queue.js) — the login pacer spaces
      * sign-ins — and tells the queue itself when it begins.
+     *
+     * `unless` is asked under the account's lock, before anything else: when it
+     * returns something other than undefined, that is the operation's answer, and
+     * no turn is taken and no page touched.
      */
-    async function withBrowserContext(email, proxy, operation, { turn = true } = {}) {
+    async function withBrowserContext(email, proxy, operation, { turn = true, unless } = {}) {
         return serialized(email, async () => {
+            // The worker is stopping: a request that reached it late launches and reloads nothing.
+            if (halting) throw new WorkerError('page_closed', 'The worker is shutting down.')
+            const instead = unless?.()
+            if (instead !== undefined) return instead
             // A resident page owns the profile directory (Chromium locks it):
             // sign-in and renewal run on that page instead of a second launch.
             // A null proxy means "whatever the account already uses".
@@ -477,15 +507,21 @@ function createServer(overrides = {}) {
      */
     function liveRenewShared(email, proxy, forced = false, quiet = false) {
         if (!renewing.has(email)) {
-            const task = liveRenew(email, proxy).then(harvested => {
-                remember(email, harvested, proxy)
+            const task = liveRenew(email, proxy).then(outcome => {
+                // Nothing reloaded: the session turned live while the renewal waited (liveRenew).
+                if (outcome.reloaded) remember(email, outcome.reloaded, proxy)
                 // One line per reload: the callers that joined it do not log
                 // their own, or a burst would read as a burst of reloads.
-                if (!quiet) log('renew', `ok${forced ? ' (forced)' : ''} (${sessions.size} sessions)`)
+                if (!quiet) log('renew', `${outcome.reloaded ? `ok${forced ? ' (forced)' : ''}` : 'no reload'} (${sessions.size} sessions)`)
                 return shape(sessions.get(email))
-            }).finally(() => { renewing.delete(email) })
+            }).finally(() => {
+                renewing.delete(email)
+                insisting.delete(email)
+            })
             renewing.set(email, task)
         }
+        // A caller whose session was refused needs the reload, whoever started the renewal it joins.
+        if (forced) insisting.add(email)
         return renewing.get(email)
     }
 
@@ -689,6 +725,7 @@ function createServer(overrides = {}) {
     server.workerConfig = config
     server.workerShutdown = () => {
         // Nobody waits for a turn any more: a page that was to load is closed instead.
+        halting = true
         pageLoads.stop()
         tokenRefreshes.stop()
         return residents.shutdown(config.shutdownMs)

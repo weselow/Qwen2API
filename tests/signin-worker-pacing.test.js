@@ -559,36 +559,41 @@ test('Qwen2API-nch: a sign-in is not in the line of page loads — it begins at 
 test('Qwen2API-nch: a stop ends every wait for a turn with page_closed, and nobody gets a turn after it', { timeout: 10000 }, async t => {
   const signer = fakeSigner()
   // The first load takes the only turn there is for a long time.
-  const { post, dataDir, server } = await start(t, { signer, loadMinIntervalMs: 60000 })
+  const { post, dataDir, server, health } = await start(t, { signer, loadMinIntervalMs: 60000 })
   for (const email of ['first@example.invalid', 'waiting@example.invalid', 'late@example.invalid']) withProfile(dataDir, email)
   assert.equal((await renewal(post, 'first@example.invalid')).status, 200)
 
   const waiting = renewal(post, 'waiting@example.invalid')
-  await sleep(100)
-  const { answer, lines } = await logged(async lines => {
+  // In line, and said so by /health — not left to a sleep that a loaded machine may outlast.
+  await until(async () => (await health()).pageLoadQueue.waiting === 1)
+  const answer = await logged(async () => {
     await server.workerShutdown()
     const response = await waiting
-    return { answer: { status: response.status, body: await response.json() }, lines }
+    return { status: response.status, body: await response.json() }
   })
   assert.deepEqual(answer, { status: 502, body: { code: 'page_closed', message: 'The worker is shutting down.' } })
   assert.equal(signer.calls.filter(call => call.op === 'renew').length, 1)
-  assert.equal(lines.some(line => /^resident-close (open_failed|operation_failed) /.test(line.replace(/^\S+ /, ''))), false,
-    `a page was said to have died while the worker was stopping:\n${lines.join('\n')}`)
-  // Nothing opens after the stop either.
+  // Nothing opens after the stop either, for a renewal...
   const late = await renewal(post, 'late@example.invalid')
   assert.equal(late.status, 502)
   assert.equal((await late.json()).code, 'page_closed')
   assert.equal(signer.calls.filter(call => call.op === 'renew').length, 1)
+  // ...or for a sign-in that lands after it: no browser is launched for a worker that is stopping.
+  const lateSignIn = await post('/session', { email: 'late@example.invalid', password: 'pw' })
+  assert.equal(lateSignIn.status, 502)
+  assert.equal((await lateSignIn.json()).code, 'page_closed')
+  assert.equal(signer.calls.filter(call => call.op === 'signin').length, 0)
+  assert.equal(signer.calls.filter(call => call.op === 'open').length, 1)
 })
 
-test('Qwen2API-nch: the queue hands out turns one interval apart plus jitter, is off at 1, and only a stop ends a wait', async () => {
-  const even = createPageLoadQueue({ minIntervalMs: 1000, random: () => 0 })
+test('Qwen2API-nch: the queue hands out turns one interval apart plus jitter, is off at 1, and only a stop ends a wait', { timeout: 10000 }, async () => {
+  const even = createPageLoadQueue({ minIntervalMs: 300, random: () => 0 })
   const since = Date.now()
   await even.wait()
   await even.wait()
   await even.wait()
-  // Timers never fire early; the second turn came a second after the first, the third a second after that.
-  assert.ok(Date.now() - since >= 2000 - SLOP, `${Date.now() - since}ms for three turns`)
+  // Timers never fire early; the second turn came an interval after the first, the third an interval after that.
+  assert.ok(Date.now() - since >= 600 - SLOP, `${Date.now() - since}ms for three turns`)
 
   // The jitter is up to the interval again: a line never looks metronomic.
   const jittered = createPageLoadQueue({ minIntervalMs: 200, random: () => 0.999 })
@@ -597,11 +602,13 @@ test('Qwen2API-nch: the queue hands out turns one interval apart plus jitter, is
   await jittered.wait()
   assert.ok(Date.now() - started >= 399 - SLOP, `${Date.now() - started}ms for the second turn`)
 
-  // Off: no turn is waited for.
-  const off = createPageLoadQueue({ minIntervalMs: 1 })
+  // Off: no turn is waited for, and nothing is said of one.
+  const said = []
+  const off = createPageLoadQueue({ minIntervalMs: 1, log: (event, detail) => said.push(detail) })
   const atOnce = Date.now()
   await Promise.all([off.wait(), off.wait(), off.wait()])
   assert.ok(Date.now() - atOnce < 500, `${Date.now() - atOnce}ms with the queue off`)
+  assert.deepEqual(said, [])
 
   // A stop ends the wait of whoever is in line...
   const stopping = createPageLoadQueue({ minIntervalMs: 60000, random: () => 0 })
@@ -648,6 +655,8 @@ test('Qwen2API-nch: a line that fits the limit is left alone — the ordinary sp
   const { said, began } = await lined(5, { minIntervalMs: 200, maxWaitMs: 1000, random: () => 0 })
   spaced(began, 200, 'loads')
   assert.ok(began[4] - since >= 800 - SLOP, `${began[4] - since}ms until the last load`)
+  // The four that waited are said so, and nothing is said of packing.
+  assert.equal(said.length, 4, said.join(' | '))
   assert.ok(said.every(line => /^page-load waited \(\d+ ms\)$/.test(line)), said.join(' | '))
 })
 
@@ -655,10 +664,11 @@ test('Qwen2API-nch: with maxWaitMs at 0 no line is packed, however long', { time
   const since = Date.now()
   const { said } = await lined(4, { minIntervalMs: 200, maxWaitMs: 0, random: () => 0 })
   assert.ok(Date.now() - since >= 600 - SLOP, `${Date.now() - since}ms for four loads`)
+  assert.equal(said.length, 3, said.join(' | '))
   assert.ok(said.every(line => /^page-load waited \(\d+ ms\)$/.test(line)), said.join(' | '))
 })
 
-test('Qwen2API-nch: one load in line is held to the limit too, when the gap after the load before it alone is longer', async () => {
+test('Qwen2API-nch: one load in line is held to the limit too, when the gap after the load before it alone is longer', { timeout: 10000 }, async () => {
   const queue = createPageLoadQueue({ minIntervalMs: 60000, maxWaitMs: 300, random: () => 0 })
   await queue.wait()
   const since = Date.now()
@@ -678,11 +688,65 @@ test('Qwen2API-nch: a load that began outside the line — a sign-in — is kept
   await Promise.all(loads)
   assert.ok(began[0] - signIn >= 200 - SLOP, `${began[0] - signIn}ms between the sign-in and the next load`)
   spaced(began, 200, 'loads')
-  // With nothing in line, what follows a sign-in begins a gap after it all the same.
+  // With nothing in line — once the last turn's own gap is over — what follows a sign-in
+  // begins a gap after it all the same.
+  await sleep(250)
   const alone = Date.now()
   queue.note()
   await queue.wait()
   assert.ok(Date.now() - alone >= 200 - SLOP, `${Date.now() - alone}ms from the sign-in to the next load`)
+})
+
+test('Qwen2API-nch: one load in line is held back by a sign-in the same, where the interval is longer than the limit', { timeout: 10000 }, async () => {
+  // A long interval and a short limit: the limit is not kept by coming close to a sign-in.
+  const queue = createPageLoadQueue({ minIntervalMs: 300, maxWaitMs: 100, random: () => 0 })
+  await queue.wait()
+  const since = Date.now()
+  const load = queue.wait()
+  // The load's own turn is one limit after its arrival...
+  await sleep(20)
+  queue.note()
+  await load
+  // ...and the sign-in that began then holds it back to one interval after itself, no further.
+  assert.ok(Date.now() - since >= 300 - SLOP && Date.now() - since < 450, `${Date.now() - since}ms until the load`)
+})
+
+test('Qwen2API-nch: sign-ins that begin while a load waits hold it back by one interval in all, and no longer', { timeout: 10000 }, async () => {
+  // Sign-ins coming faster than the interval would put the load's turn off for as long as they came.
+  const queue = createPageLoadQueue({ minIntervalMs: 300, maxWaitMs: 100, random: () => 0 })
+  await queue.wait()
+  const since = Date.now()
+  const began = []
+  const loads = [1, 2, 3].map(() => queue.wait().then(() => began.push(Date.now() - since)))
+  // The line stands at +100, +101, +102. Five sign-ins, half an interval apart, hold it back to
+  // +300, +450, +600, +700 — and the fifth changes nothing: one interval past the first turn is all.
+  for (let at = 0; at < 5; at++) {
+    if (at) await sleep(Math.max(0, since + at * 150 - Date.now()))
+    queue.note()
+  }
+  await Promise.all(loads)
+  assert.ok(began[0] >= 700 - SLOP && began[0] < 850, `${began[0]}ms until the first load: one limit, one interval, and no more`)
+  assert.ok(began[2] - began[0] < 100, `${began[2] - began[0]}ms from the first load to the last: the line moved as one`)
+})
+
+test('Qwen2API-nch: a sign-in holding the line back is not the line being too long — the rest is not packed closer for it', { timeout: 10000 }, async () => {
+  // The loads' own gaps are the bare interval; the sign-in's is nearly two.
+  let jitter = 0
+  const said = []
+  const queue = createPageLoadQueue({ minIntervalMs: 200, maxWaitMs: 700, random: () => jitter, log: (event, detail) => said.push(detail) })
+  await queue.wait()
+  const since = Date.now()
+  const began = []
+  const loads = [1, 2, 3].map(() => queue.wait().then(() => began.push(Date.now() - since)))
+  // Their turns: +200, +400, +600, inside the limit. A sign-in at +50 holds the line back to +430, +630, +830.
+  await sleep(50)
+  jitter = 0.9
+  queue.note()
+  await Promise.all(loads)
+  spaced(began, 200, 'loads')
+  assert.ok(began[2] >= 830 - SLOP, `${began[2]}ms until the last load`)
+  // Held back, not packed: nothing is said of packing.
+  assert.ok(said.every(detail => /^waited \(\d+ ms\)$/.test(detail)), said.join(' | '))
 })
 
 test('Qwen2API-nch: a turn that began late — a loaded machine — is what the next one keeps its distance from', { timeout: 10000 }, async () => {

@@ -424,7 +424,7 @@ test('the shapes it reads are the shapes the code prints', () => {
         [worker, "const CHALLENGE_NOTE = { page: ' — WAF challenge page', network: ' — WAF challenge page, kept from the call by the page' }"],
         // Since Qwen2API-0c6: what the line says of an answer beyond its status.
         [worker, ' + answerNote(result))'],
-        [read('signin-worker/lib/egress-fetch.js'), "notes.push(`code ${quoted(code, 80)}`)"],
+        [read('signin-worker/lib/egress-fetch.js'), 'notes.push(`code ${shown}`)'],
         [read('signin-worker/lib/egress-fetch.js'), "notes.push('refused, no code')"],
         [read('signin-worker/lib/egress-fetch.js'), "notes.push(`headers: ${shown.length ? shown.join(', ') : 'none'}`)"],
         [read('signin-worker/lib/egress-fetch.js'), "return notes.length ? ` — ${notes.join('; ')}` : ''"],
@@ -435,6 +435,8 @@ test('the shapes it reads are the shapes the code prints', () => {
         [residents, "`${left ? `${left} still running` : 'ended'} ("],
         [read('signin-worker/lib/page-load-queue.js'), "log('page-load', `waited ("],
         [read('signin-worker/lib/page-load-queue.js'), "ms${entry.packed ? ', a long line packed' : ''})`)"],
+        // A renewal answered by a session that turned live while it waited.
+        [worker, "log('renew', `${outcome.reloaded ? `ok${forced ? ' (forced)' : ''}` : 'no reload'} (${sessions.size} sessions)`)"],
         // And three of the app's own lines.
         [read('src/controllers/chat.js'), "logger.error('聊天处理错误', 'CHAT', '', error)"],
         [read('src/controllers/chat.js'), "logger.error('非流式聊天处理错误'"],
@@ -446,7 +448,6 @@ test('the shapes it reads are the shapes the code prints', () => {
         [worker, "log('request', `${req.method} ${req.url} -> ${res.statusCode} ${Date.now() - started}ms`)"],
         [residents, "log('resident-open', `ok (${pages.size}/${maxPages} pages, front-end "],
         [residents, "log('resident-close', `${reason} (${pages.size} pages)`)"],
-        [worker, "log('renew', `ok${forced ? ' (forced)' : ''} (${sessions.size} sessions)`)"],
         [worker, "log('session', `acquired (${sessions.size} sessions)`)"],
         [worker, 'log(\'session\', \'cached\')'],
         [worker, "log('session', `queued (${Math.ceil(slot.waitMs)}ms)`)"],
@@ -485,6 +486,8 @@ test('a refusal qwen.ai put in the body of a 2xx is counted as the refusal it is
         // A refusal that names no code is a refusal all the same; and a path is a path, dots or no dots.
         `${at(13)} egress /api/v2/chats/new -> 200 (1/16 pages) — refused, no code`,
         `${at(13)} egress /api/v2.1/tasks/status/x -> 200 (1/16 pages) — code RGV587_ERROR::SM::x`,
+        // A code with a separator of the worker's own in it is not cut at it.
+        `${at(13)} egress /api/v2/chats/new -> 200 (1/16 pages) — code a; b`,
         // Not a 2xx: said by its status, as before. What it quotes of a body is not looked into for a code.
         `${at(12)} egress /api/v2/files/getstsToken -> 405 (1/16 pages) — headers: content-type=text/html, x-region-restriction=true; body: <!doctype html><p>405; code in a body</p>`,
         `${at(13)} egress /api/v2/files/getstsToken -> 405 (1/16 pages) — code Method Not Allowed; headers: none; body: {"code":"Method Not Allowed"}`
@@ -497,13 +500,14 @@ test('a refusal qwen.ai put in the body of a 2xx is counted as the refusal it is
     assert.equal(report.counts.get('egress./api/v2/files/parse/status.refused.ParseFailed'), 1)
     assert.equal(report.counts.get('egress./api/v1/tasks/status/x.refused.FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::x'), 1)
     assert.equal(report.counts.get('egress./api/v2.1/tasks/status/x.refused.RGV587_ERROR::SM::x'), 1)
+    assert.equal(report.counts.get('egress.chatsNew.refused.a; b'), 1)
     assert.equal(report.counts.get('egress./api/v2/files/getstsToken.405'), 2)
     assert.equal([...report.counts].filter(([name]) => name.startsWith('unparsed.')).length, 0)
     const { verdict, why, text } = watch.render(report)
     assert.equal(verdict, 'LOOK')
-    assert.ok(why.includes('qwen.ai refused 5 call(s) in the body of a 2xx: chats/new unauthorized 1, ' +
+    assert.ok(why.includes('qwen.ai refused 6 call(s) in the body of a 2xx: chats/new unauthorized 1, ' +
         '/api/v2/files/parse/status ParseFailed 1, /api/v1/tasks/status/x FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::x 1, ' +
-        'chats/new no_code 1, /api/v2.1/tasks/status/x RGV587_ERROR::SM::x 1'), why.join('\n'))
+        'chats/new no_code 1, /api/v2.1/tasks/status/x RGV587_ERROR::SM::x 1, chats/new a; b 1'), why.join('\n'))
     assert.ok(why.includes('egress./api/v2/files/getstsToken.405: 2'), why.join('\n'))
     assert.match(text, /refused\.unauthorized {2}1/)
 })
@@ -530,10 +534,13 @@ test('the worker’s new lines are counted: a page’s token renewed in place, a
         `${at(27)} resident-wait ended (waited 900 ms for the page's streams)`,
         `${at(30)} resident-wait 1 still running (waited 20000 ms for the page's streams)`,
         `${at(30)} egress-stream ${COMPLETIONS} -> 200 (900 ms, 1/16 pages)`,
-        `${at(30)} egress-stream ${COMPLETIONS} browser_error (20010 ms)`
+        `${at(30)} egress-stream ${COMPLETIONS} browser_error (20010 ms)`,
+        // A renewal answered by a session that turned live while it waited: no page was loaded for it.
+        `${at(31)} renew no reload (1 sessions)`
     ]
     const report = watch.summarize(lines)
     assert.equal(report.counts.get('tokenRefresh.ok'), 2)
+    assert.equal(report.counts.get('renew.answered'), 1)
     // Two of one and one of the other: told apart, come what may.
     assert.equal(report.counts.get('pageWait.ended'), 2)
     assert.equal(report.counts.get('pageWait.timedOut'), 1)

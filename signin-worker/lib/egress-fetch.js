@@ -678,15 +678,19 @@ function isChallengePage(headers, body) {
 // with 405, and whether the header that names a regional block was there could
 // not be told afterwards. The app classifies the answer; the log only quotes it.
 
-// Headers whose values could hold a credential never reach a log line, whatever their case.
-const PRIVATE_HEADER = /cookie|token|key|secret|authorization|session/i
-// What looks like a credential inside a body: a Bearer, a JWT.
-const CREDENTIAL = /\bBearer\s+\S+|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}/g
-// What is named one: the value of a field ("AccessKeySecret":"…") or of a pair
-// of a form (securityToken=…). A name is not read for what it means: anything
-// with secret, token, key… in it loses its value.
-const NAMED_SECRET = /("[^"]*(?:secret|token|key|password|passwd|credential|signature|authorization)[^"]*"\s*:\s*)"(?:[^"\\]|\\.)*"/gi
-const PAIRED_SECRET = /(\b[\w.-]*(?:secret|token|key|password|passwd|credential|signature|authorization)[\w.-]*=)[^&\s"'<>]+/gi
+// What a name may hold for its value to be kept off a log line, whatever its
+// case: the name of a header, the key of a field in a JSON body, the name of a
+// pair in a form. A name is not read for what it means.
+const SECRET_NAME = 'cookie|token|key|secret|password|passwd|credential|signature|authorization|session'
+// Headers whose values could hold a credential never reach a log line.
+const PRIVATE_HEADER = new RegExp(SECRET_NAME, 'i')
+// What looks like a credential inside a body: a Bearer, a JWT. The parts of a JWT are bounded,
+// so that a long run of characters is not gone through again from every place a JWT may start in it.
+const CREDENTIAL = /\bBearer\s+\S+|eyJ[A-Za-z0-9_-]{10,2048}\.[A-Za-z0-9_-]{10,2048}\.[A-Za-z0-9_-]{5,2048}/gi
+// What is named one: the value of a field of a JSON body ("AccessKeySecret":"…", "token":123) or
+// of a pair of a form (securityToken=…). The name is bounded for the reason a JWT's parts are.
+const NAMED_SECRET = new RegExp(String.raw`("[^"]{0,256}(?:${SECRET_NAME})[^"]{0,256}"\s*:\s*)(?:"(?:[^"\\]|\\.)*"|[^,{}\[\]\s]+)`, 'gi')
+const PAIRED_SECRET = new RegExp(String.raw`(\b[\w.-]{0,64}(?:${SECRET_NAME})[\w.-]{0,64}=)("[^"]*"|[^&\s<>]+)`, 'gi')
 // A refusal is short: a longer body than this is not looked into.
 const REFUSAL_BODY_CHARS = 256 * 1024
 // Of what is quoted of a body, only this start is looked through for credentials: far more than is ever quoted.
@@ -697,11 +701,11 @@ const QUOTED_HEADERS = 12
 /** The value on one line of log: control characters, line separators and direction marks become spaces; nothing longer than `max`. */
 const quoted = (value, max) => String(value ?? '')
     // eslint-disable-next-line no-control-regex
-    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]+/g, ' ')
+    .replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]+/g, ' ')
     .trim().slice(0, max)
 
 /** The start of a body as a log line may show it: a credential, or what is named one, is not qwen.ai's message. */
-const masked = text => text.slice(0, MASKED_BODY_CHARS)
+const masked = text => String(text ?? '').slice(0, MASKED_BODY_CHARS)
     .replace(NAMED_SECRET, '$1"<credential>"')
     .replace(PAIRED_SECRET, '$1<credential>')
     .replace(CREDENTIAL, '<credential>')
@@ -710,13 +714,13 @@ const masked = text => text.slice(0, MASKED_BODY_CHARS)
  * The code qwen.ai refused an answer in the body with, where the app reads it
  * (src/utils/browser-egress.js#isUnauthorized, and the front end's own reader
  * of a punish envelope, NV): a string on the answer, on its data or on its
- * error, or the lines of its `ret`. Null when none is there.
+ * error, or the lines of its `ret`. A number is a code too. Null when none is there.
  */
 function refusalCode(payload) {
     if (!payload || typeof payload !== 'object') return null
     const candidates = [payload.code, payload.data?.code, payload.error?.code, payload.error]
-    const code = candidates.find(value => typeof value === 'string' && value.trim())
-    if (code) return code
+    const code = candidates.find(value => (typeof value === 'string' && value.trim()) || Number.isFinite(value))
+    if (code !== undefined) return String(code)
     if (Array.isArray(payload.ret)) {
         const lines = payload.ret.filter(value => typeof value === 'string' && value.trim())
         if (lines.length) return lines.join(' | ')
@@ -757,10 +761,12 @@ function answerNote({ status, headers, body }) {
         } catch { /* not JSON: a page, or text */ }
     }
     const accepted = status >= 200 && status < 300
-    const code = refusalCode(payload)
+    const refusal = isRefusal(payload)
+    // The code as a log line may show it: one line, short, and with nothing in it that looks like a credential.
+    const shown = quoted(masked(refusalCode(payload)), 80).trim()
     const notes = []
-    if (code && (isRefusal(payload) || !accepted)) notes.push(`code ${quoted(code, 80)}`)
-    else if (isRefusal(payload) && accepted) notes.push('refused, no code')
+    if (shown && (refusal || !accepted)) notes.push(`code ${shown}`)
+    else if (refusal && accepted) notes.push('refused, no code')
     if (!accepted) {
         const shown = Object.entries(headers || {})
             .filter(([name]) => !PRIVATE_HEADER.test(name))
@@ -844,5 +850,7 @@ function normalizeEgress(body, { chatOrigin, defaultTimeoutMs, maxTimeoutMs }) {
 module.exports = {
     pageCall, pageAbortStream, pageTokenState, pageRefreshToken, readFrontEndVersion, normalizeEgress,
     isChallengePage, isHtmlAnswer, answerNote, CODE_FOR_OUTCOME,
-    ABORT_REASON, STREAM_CHANNEL, STREAM_ABORTS, PAGE_HEADERS, CHALLENGE_HEAD_BYTES
+    ABORT_REASON, STREAM_CHANNEL, STREAM_ABORTS, PAGE_HEADERS, CHALLENGE_HEAD_BYTES,
+    // For the worker's own lines about a page's token (resident-pages.js#freshen).
+    quoted, masked
 }

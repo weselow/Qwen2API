@@ -86,20 +86,17 @@ const challengeName = said => {
 
 /**
  * A refusal qwen.ai put in the body of a whole answer, as the worker's line
- * says of it (Qwen2API-0c6): by its code ("code …", the first note after the
- * status), or, one that names none, by being one ("refused, no code"). Null
- * when the line says neither. What the line quotes of a body comes last, and
- * is not looked into: a body may say "code" itself.
+ * says of it (Qwen2API-0c6): by its code ("code …"), or, one that names none,
+ * by being one ("refused, no code"). Null when the line says neither. An
+ * answer of a 2xx carries one note and no more — no headers, no body — so the
+ * code is the whole rest of the line, whatever is in it.
  * @param {string} [said] - What the worker wrote after " — "
  * @returns {{code: string}|null}
  */
 function bodyRefusal(said) {
     if (!said) return null
-    const body = said.indexOf('; body: ')
-    const notes = body < 0 ? said : said.slice(0, body)
-    const found = /(?:^|; )code (.+?)(?:; |$)/.exec(notes)
-    if (found) return { code: found[1].trim().slice(0, 80) }
-    return /(?:^|; )refused, no code(?:; |$)/.test(notes) ? { code: NO_CODE } : null
+    if (said.startsWith('code ')) return { code: said.slice(5).trim().slice(0, 80) }
+    return said === 'refused, no code' ? { code: NO_CODE } : null
 }
 
 function readWorkerLine(report, event, detail) {
@@ -183,6 +180,8 @@ function readWorkerLine(report, event, detail) {
         case 'renew':
             if (/^ok \(forced\)/.test(detail)) bump(report, 'renew.forced')
             else if (/^ok \(/.test(detail)) bump(report, 'renew.live')
+            // The session turned live while the renewal waited for the account's page: nothing was loaded for it.
+            else if (/^no reload \(/.test(detail)) bump(report, 'renew.answered')
             else bump(report, 'unparsed.worker')
             return
         case 'session':
