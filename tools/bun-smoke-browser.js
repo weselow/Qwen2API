@@ -795,6 +795,10 @@ async function run({ startApplication, stopApplication, disposeApplication, bina
             `${cut.status} ${cut.text}; the worker was told ${toldAfterMs} ms after the relay's head\n${evidence(application.logs)}`)
         assert.equal(JSON.parse(cut.text).error?.code, 'upstream_error', cut.text)
         assert.equal(cut.text.includes(ANSWER), false, 'a cut answer reached the client')
+        // The application's last lines of the request can reach this pipe after its response reaches the
+        // client (seen on the Windows runner of CI): they are waited for, a while, not read at once.
+        await wait(() => /signin-worker 已忘掉账户/.test(log()) && /account_removed/.test(log()),
+            "the application does not say that the worker forgot the account and refused the retry as the account's being removed")
         assert.match(log(), /signin-worker 已忘掉账户/, 'the application does not say the worker forgot the account')
         assert.match(log(), /account_removed/, "the request's retry was not refused as the account's being removed")
         // What the application does of the failure takes its time: give a delayed call its chance to show.
