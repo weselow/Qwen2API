@@ -45,7 +45,11 @@
  *      through the page;
  *  11. a video is generated through the relay, its answer read whole, its task
  *      polled through the page;
- *  12. what left for qwen.ai, and how — no Bearer of the app's on any /egress
+ *  12. an account is removed while its request still waits for qwen.ai's first
+ *      frame (Qwen2API-2l0, Qwen2API-u50): the worker is told once (/forget),
+ *      the page's stream is cut with the page, and the request's retry does
+ *      not reach the worker for the account that is gone;
+ *  13. what left for qwen.ai, and how — no Bearer of the app's on any /egress
  *      (Qwen2API-jr9), the worker's token on every worker call, and straight
  *      from the application only the model list, the file's bytes and the picture.
  *
@@ -160,7 +164,7 @@ const CHAT_OF = { t2i: 'image', t2v: 'video' }
 
 /**
  * A loopback stand-in for what the application talks to in browser mode: the
- * signin worker (/session, /renew, /egress), qwen.ai itself, and — behind the
+ * signin worker (/session, /renew, /egress, /forget), qwen.ai itself, and — behind the
  * same address — the storage a file's bytes go to and the CDN a generation's
  * result lies on. Straight from the application come the model list, a file's
  * bytes and the picture; everything else reaches qwen.ai from inside the
@@ -175,6 +179,12 @@ function standIn() {
     const failures = []
     // The puts the storage was asked for, as they arrived.
     const puts = []
+    // The accounts the application has dropped (POST /forget, Qwen2API-2l0): a relay of theirs still open is cut.
+    // A relay asked for such an account later leaves this set — the page is opened again, as the worker of
+    // prod does while the profile is kept (relay()).
+    const forgotten = new Set()
+    // Lets go the relay held after its head: the /forget that cuts it. Null while none is held.
+    let releaseHeld = null
     const state = {
         // The session the page is on (null: logged out).
         page: null,
@@ -182,6 +192,9 @@ function standIn() {
         chatsNew: [],
         // A promise from the scenario: the rest of the next streamed answer waits for it.
         hold: null,
+        // True from the scenario: the next streamed answer waits after its head and before its
+        // first frame, until the account is forgotten — as the page's stream waits for qwen.ai.
+        holdAfterHead: false,
         // The code the next relay fails with, before it has a head to send.
         failRelay: null,
         // What the next relay carries; null: the text answer.
@@ -215,7 +228,7 @@ function standIn() {
             response.writeHead(status, { 'content-type': 'application/json' })
             response.end(JSON.stringify(payload))
         }
-        if (!['/session', '/renew', '/egress'].includes(pathname)) {
+        if (!['/session', '/renew', '/egress', '/forget'].includes(pathname)) {
             direct.push(`${request.method} ${pathname}`)
             if (pathname === '/api/models') return json(200, { data: [{
                 id: MODEL, name: MODEL, info: { meta: { chat_type: ['t2t'], abilities: {} } }
@@ -237,6 +250,17 @@ function standIn() {
         const body = raw ? JSON.parse(raw) : {}
         calls.push({ route: pathname, authorized, body })
         if (!authorized) return json(401, { code: 'unauthorized', message: 'Invalid worker token.' })
+        // The application dropped an account (Qwen2API-2l0). The worker's /forget closes the
+        // account's page; a relay of that account still open is cut with it, as a page's stream is
+        // when its page closes: an error event, page_closed. A relay asked for the account later
+        // is carried as the worker of prod carries it with the profile kept (see relay()).
+        if (pathname === '/forget') {
+            forgotten.add(body.email)
+            const release = releaseHeld
+            releaseHeld = null
+            release?.()
+            return json(200, { ok: true, session: true, page: true, profile: 'kept' })
+        }
         if (pathname !== '/egress') {
             // The page is on the session it hands back from here on.
             const label = pathname === '/session' ? 'signed-in' : body.force === true ? 'renewed' : state.page
@@ -290,6 +314,8 @@ function standIn() {
     async function relay(response, call) {
         const hold = state.hold
         state.hold = null
+        const heldAfterHead = state.holdAfterHead
+        state.holdAfterHead = false
         const answer = state.answer || TEXT_ANSWER
         state.answer = null
         response.writeHead(200, { 'content-type': 'application/x-ndjson' })
@@ -312,6 +338,16 @@ function standIn() {
             type: 'head', status: 200, url: call.url, redirected: false,
             headers: { 'content-type': answer.type }, cookies: [cookie('cna', 'from-head')]
         })
+        if (heldAfterHead) await new Promise(resolve => { releaseHeld = resolve })
+        // The relay that was open when its account was forgotten: the page is gone, and its stream with it.
+        if (heldAfterHead && forgotten.has(call.email)) {
+            return response.end(`${JSON.stringify({ type: 'error', code: 'page_closed', message: 'The resident page was closed.' })}\n`)
+        }
+        // A relay asked for an account forgotten earlier is carried — as the worker of prod carries it
+        // while the profile is kept (SIGNIN_FORGET_DELETES_PROFILE is off): it opens the page again from
+        // the profile, and nothing in the application stops it but the guard (Qwen2API-u50). With the
+        // profile deleted the worker answers 404 no_profile instead; that is not staged here.
+        forgotten.delete(call.email)
         event({ type: 'chunk', data: Buffer.from(answer.pieces[0]).toString('base64') })
         await (hold || Promise.resolve())
         for (const piece of answer.pieces.slice(1)) event({ type: 'chunk', data: Buffer.from(piece).toString('base64') })
@@ -322,6 +358,8 @@ function standIn() {
         state, calls, direct, failures, puts, server,
         routes: () => calls.map(call => call.route),
         to: route => calls.filter(call => call.route === route).map(call => call.body),
+        // Whether a relay is held after its head.
+        held: () => Boolean(releaseHeld),
         // An address of the stand-in itself: where a link it hands out leads.
         asset: pathname => `${origin()}${pathname}`
     }
@@ -720,7 +758,55 @@ async function run({ startApplication, stopApplication, disposeApplication, bina
         assert.equal(worker.calls.at(-1).body.url, `${upstream}/api/v1/tasks/status/${VIDEO_TASK}`)
         console.log('PASS: browser mode — a video is generated through the relay, its answer read whole, and its task polled through the page')
 
-        // 12. What left for qwen.ai, and how.
+        // 12. An account is removed while its request still waits for qwen.ai's first frame. The worker
+        //     is told once — POST /forget, on the worker's token (Qwen2API-2l0) — and the page's stream is
+        //     cut with the page. The request's retry does not reach the worker for the account that is
+        //     gone (Qwen2API-u50): no second /egress, no /renew, no /session; the client gets an error it
+        //     may retry, not a cut answer behind a 200.
+        //     The stand-in cuts the stream the moment it is told. The worker of prod waits for the streams
+        //     on a page first (RESIDENT_STREAM_WAIT_MS, 20 s), and a stream that gets its frames meanwhile
+        //     ends whole; what is staged here is the cut that lands before the first frame — a short wait,
+        //     or a page that died — which is the one whose retry would have brought the account back.
+        //     A relay asked for the account after the /forget is carried as the worker of prod carries it
+        //     with the profile kept: the page is opened again. Without the guard the retry is answered —
+        //     the client gets the answer of an account the application has removed, behind a 200.
+        worker.state.holdAfterHead = true
+        const beforeRemoval = worker.calls.length
+        const cutting = chat(true, 'Reply OK.')
+        // Its outcome is read below, once the account is removed: a rejection before that must not end the smoke.
+        cutting.catch(() => {})
+        await wait(() => worker.held(), 'the relay did not come to its hold after the head')
+        const heldAt = Date.now()
+        // Well inside the application's grace for the first frame: past it the stream is handed to the client as it is.
+        const removal = await whole(await request('/api/deleteAccount', {
+            method: 'DELETE', headers: jsonHeaders, body: JSON.stringify({ email: EMAIL })
+        }), 15000, 'the removal did not answer in 15 s')
+        assert.equal(removal.status, 200, `${removal.text}\n${evidence(application.logs)}`)
+        assert.deepEqual(worker.to('/forget'), [{ email: EMAIL }], 'the worker was told of the removal once, about that account alone')
+        assert.equal(worker.calls.at(-1).authorized, true, '/forget carries SIGNIN_WORKER_TOKEN')
+        const cut = await whole(await within(cutting, 15000, 'the request whose account was removed did not answer in 15 s'), 15000,
+            'the request whose account was removed did not end in 15 s')
+        // A retryable error, and the one the request's own failure answers with — not a cut answer behind a 200.
+        // (Had the removal come later than the application's 3 s of grace for the first frame, the stream
+        // would have been handed to the client as it was, and the status would read 200.)
+        const toldAfterMs = Date.now() - heldAt
+        assert.equal(cut.status, 503,
+            `the request of the removed account did not end in the error it should — it was carried after the removal: ` +
+            `${cut.status} ${cut.text}; the worker was told ${toldAfterMs} ms after the relay's head\n${evidence(application.logs)}`)
+        assert.equal(JSON.parse(cut.text).error?.code, 'upstream_error', cut.text)
+        assert.equal(cut.text.includes(ANSWER), false, 'a cut answer reached the client')
+        assert.match(log(), /signin-worker 已忘掉账户/, 'the application does not say the worker forgot the account')
+        assert.match(log(), /account_removed/, "the request's retry was not refused as the account's being removed")
+        // What the application does of the failure takes its time: give a delayed call its chance to show.
+        await delay(1500)
+        assert.deepEqual(trail(beforeRemoval), [
+            'POST /api/v2/chats/new', 'POST /api/v2/chat/completions (stream)', '/forget'
+        ], 'after the /forget nothing of the account reached the worker: no second relay, no renewal, no sign-in')
+        const left = await (await request('/api/getAllAccounts', { headers: { 'x-api-key': API_KEY } })).json()
+        assert.deepEqual(left.data, [], 'the account is gone from the application')
+        console.log('PASS: browser mode — an account removed mid-request: the worker is told once, and the request\'s retry does not reach it for that account')
+
+        // 13. What left for qwen.ai, and how.
         assert.equal(worker.failures.length, 0, `the stand-in failed: ${worker.failures[0]?.message}`)
         assert.equal(worker.routes().filter(route => route === '/session').length, 1, 'a challenge costs no password')
         assert.ok(worker.calls.every(call => call.authorized), 'every worker call carries SIGNIN_WORKER_TOKEN')
