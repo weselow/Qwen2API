@@ -37,6 +37,14 @@
  * one JSON event per line while qwen.ai's answer arrives, and the app cutting
  * its connection cuts the request inside the page (relayEgress).
  *
+ * Since Qwen2API-2l0 the app says when it drops an account, and the worker
+ * drops it too — the cached session with its silent-renew timer, and the
+ * resident page:
+ *
+ *   POST /forget  {email}                 -> {ok, session, page, profile}
+ *
+ * The profile stays unless SIGNIN_FORGET_DELETES_PROFILE is set (handleForget).
+ *
  * qwen.ai's status and body always travel inside a 200: a WAF challenge page
  * too, under whatever status it came. The worker names it in its log (and
  * hands it on whether the page's scripts did or kept it back,
@@ -90,6 +98,10 @@ const envCount = (name, fallback) => {
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 const REQUEST_BODY_LIMIT = 131072
+// How many times /forget waits for a sign-in or renewal that started for the
+// account while it was already at work (handleForget). A bound: requests that
+// keep coming for a removed account must not keep /forget here forever.
+const FORGET_ROUNDS = 5
 
 /**
  * Write one event of a relay, and say when the app has taken it: at once, or
@@ -204,7 +216,11 @@ function createServer(overrides = {}) {
         // (drainMs), then here, then for the reload and for the token to
         // settle after it: this must leave all of them room.
         // 0 = no limit.
-        loadMaxWaitMs: overrides.loadMaxWaitMs ?? envCount('RESIDENT_LOAD_MAX_WAIT_MS', 120000)
+        loadMaxWaitMs: overrides.loadMaxWaitMs ?? envCount('RESIDENT_LOAD_MAX_WAIT_MS', 120000),
+        // Whether /forget deletes the account's browser profile as well
+        // (Qwen2API-2l0). Off, a profile kept lets an account added again
+        // skip the sign-in. Only an exact "true" turns it on.
+        forgetDeletesProfile: overrides.forgetDeletesProfile ?? process.env.SIGNIN_FORGET_DELETES_PROFILE === 'true'
     }
 
     fs.mkdirSync(config.dataDir, { recursive: true })
@@ -641,6 +657,69 @@ function createServer(overrides = {}) {
         }
     }
 
+    /**
+     * The app dropped the account (Qwen2API-2l0): nothing here may keep it
+     * alive — not the cached session with its silent-renew timer, not the
+     * resident page with its background traffic. An account the worker never
+     * saw is forgotten all the same.
+     *
+     * A sign-in or renewal running for the account ends in remember(), and so
+     * does the lazy opening of its page: left alone, they would put the
+     * session — and with it a new timer — back the moment this was done. So
+     * each round here waits for what is running — a renewal may be standing
+     * in the line of page loads meanwhile, holding the account's lock until
+     * its turn — then takes the account lock (which a renewal needs itself:
+     * waiting for one under it would never end), closes the page (its streams
+     * get their moment to finish first, as with any close) and drops the
+     * session — and goes round again if something started for the account
+     * meanwhile. /forget itself takes no turn: it loads no page.
+     *
+     * The profile stays, so that an account added again skips the sign-in —
+     * unless the worker is told to delete profiles (forgetDeletesProfile): a
+     * removed account's auth cookies go with it. It is deleted once its
+     * browser is closed — bounded, like every close (closeMs): a browser that
+     * would not close in time may keep pieces of its profile. A profile that
+     * could not be removed is said so (`profile: "left"`), not failed over:
+     * the session and the page are gone by then, which is what was asked.
+     */
+    async function handleForget(body) {
+        const email = parseEmail(body)
+        // First of all: no timer may start a reload of this account from here
+        // on, and nothing hands its session out while this waits.
+        clearTimeout(sessions.get(email)?.timer)
+        let session = sessions.delete(email)
+        let page = false
+        for (let round = 0; round < FORGET_ROUNDS; round++) {
+            await Promise.allSettled([logins.get(email), renewing.get(email)])
+            const found = await serialized(email, async () => {
+                const resident = residents.get(email)
+                if (resident) await residents.close(resident, 'forgotten')
+                const cached = sessions.has(email)
+                forget(email)
+                return { page: Boolean(resident), session: cached }
+            })
+            page ||= found.page
+            session ||= found.session
+            if (!logins.has(email) && !renewing.has(email)) break
+        }
+        let profile = 'kept'
+        if (config.forgetDeletesProfile) {
+            const dir = profileDir(email)
+            profile = fs.existsSync(dir) ? 'deleted' : 'absent'
+            if (profile === 'deleted') {
+                try {
+                    await fs.promises.rm(dir, { recursive: true, force: true })
+                } catch (error) {
+                    profile = 'left'
+                    log('forget', `profile not removed (${error.code || 'error'})`)
+                }
+            }
+        }
+        log('forget', `${session ? 'session' : 'no session'}, ${page ? 'page' : 'no page'}, profile ${profile} ` +
+            `(${sessions.size} sessions)`)
+        return { ok: true, session, page, profile }
+    }
+
     function authorized(req) {
         if (!config.token) return true
         const header = Buffer.from(String(req.headers.authorization || ''))
@@ -706,6 +785,11 @@ function createServer(overrides = {}) {
                 loadMinIntervalMs: config.loadMinIntervalMs, loadMaxWaitMs: config.loadMaxWaitMs,
                 pageLoadQueue: pageLoads.stats()
             })
+        }
+        if (req.method === 'POST' && req.url === '/forget') {
+            if (!authorized(req)) throw new WorkerError('unauthorized', 'Invalid worker token.')
+            const body = await readJson(req, REQUEST_BODY_LIMIT)
+            return send(res, 200, await handleForget(body))
         }
         if ((req.method === 'POST' && req.url === '/session') || (req.method === 'POST' && req.url === '/renew')) {
             if (!authorized(req)) throw new WorkerError('unauthorized', 'Invalid worker token.')

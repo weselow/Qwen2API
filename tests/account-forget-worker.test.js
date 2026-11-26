@@ -1,5 +1,6 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const crypto = require('node:crypto')
 const fs = require('node:fs/promises')
 const http = require('node:http')
 const os = require('node:os')
@@ -205,8 +206,8 @@ test('a worker that does not answer is given up on after a bound; the account is
   const worker = await standIn(t)
   worker.mode.answer = 'hang'
   const lines = capture(t)
-  // The bound is 15 s (signin-worker-client.js); here it is short — the giving up is what is under test.
-  assert.equal(signinWorker.FORGET_TIMEOUT_MS, 15000)
+  // The bound is 35 s (signin-worker-client.js); here it is short — the giving up is what is under test.
+  assert.equal(signinWorker.FORGET_TIMEOUT_MS, 35000)
   const forgetAccount = signinWorker.forgetAccount
   t.mock.method(signinWorker, 'forgetAccount', email => forgetAccount(email, 200))
   await withAccounts(t, async ({ removed, retained }) => {
@@ -309,4 +310,52 @@ test('the client asks with the email alone and hands back what the worker report
   worker.mode.answer = 'malformed'
   await assert.rejects(signinWorker.forgetAccount('solo@example.invalid'),
     { code: 'signin_upstream_error', message: 'Signin worker returned a malformed forget.' })
+})
+
+test('the app and the real worker route, end to end: a removed account leaves nothing in the worker', async t => {
+  const { createServer } = require('../signin-worker/server')
+  const { fakeResidentBrowser } = require('./helpers/fake-resident-browser')
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'qwen-account-forget-e2e-'))
+  const signer = fakeResidentBrowser()
+  const server = createServer({
+    dataDir, token: 'e2e-secret', signer, forgetDeletesProfile: true,
+    frontEndMs: 100, settleStableMs: 40, settlePollMs: 10, settleTimeoutMs: 300,
+    minLoginIntervalMs: 1, loadMinIntervalMs: 1, tokenRefreshMinIntervalMs: 1
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  const origin = `http://127.0.0.1:${server.address().port}`
+  const saved = { signinWorkerUrl: config.signinWorkerUrl, signinWorkerToken: config.signinWorkerToken, accounts: accountManager.accountTokens }
+  config.signinWorkerUrl = origin
+  config.signinWorkerToken = 'e2e-secret'
+  t.after(async () => {
+    Object.assign(config, { signinWorkerUrl: saved.signinWorkerUrl, signinWorkerToken: saved.signinWorkerToken })
+    accountManager.accountTokens = saved.accounts
+    accountManager.accountRotator.setAccounts(saved.accounts)
+    await server.workerShutdown()
+    await new Promise(resolve => server.close(resolve))
+    await fs.rm(dataDir, { recursive: true, force: true })
+  })
+  const lines = capture(t)
+
+  const email = 'end-to-end@example.invalid'
+  const profile = path.join(dataDir, 'account-' + crypto.createHash('sha256').update(email).digest('hex').slice(0, 32))
+  await fs.mkdir(profile, { recursive: true })
+  const health = async () => (await fetch(`${origin}/health`, { signal: AbortSignal.timeout(8000) })).json()
+
+  // The account as the app holds it, and the page the worker opened for it on the account's first call.
+  const account = record(email)
+  accountManager.accountTokens = [account]
+  accountManager.accountRotator.setAccounts(accountManager.accountTokens)
+  await signinWorker.egress(email, account, {
+    url: 'https://chat.qwen.ai/api/v2/chats/new', method: 'POST', headers: {}, body: '{}', timeoutMs: 5000
+  })
+  assert.deepEqual([(await health()).sessions, (await health()).residentPages], [1, 1])
+
+  assert.equal(await accountManager.removeAccount(email), true)
+  assert.deepEqual([(await health()).sessions, (await health()).residentPages], [0, 0])
+  assert.equal(signer.contexts[0].closed, true)
+  await assert.rejects(fs.stat(profile), { code: 'ENOENT' })
+  assert.equal(accountManager.getAllAccountKeys().length, 0)
+  assert.equal(lines.warn.length, 0)
+  assert.ok(lines.info.some(line => line.includes(email) && line.includes('浏览器配置已删除')), lines.info.join('\n'))
 })

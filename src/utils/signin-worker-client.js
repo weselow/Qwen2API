@@ -128,11 +128,13 @@ async function renewSession(email, account, { force = false } = {}) {
     return { token: harvested.token, expiresAt: harvested.expiresAt, jar: store.jarFromCookies(harvested.cookies) }
 }
 
-// What /forget takes at the worker: the calls in flight on the page get a
-// moment to finish, then the page closes — both bounded at 5 s there. A
-// sign-in or renewal still running for the account is not waited for here:
-// the worker finishes the job without the app.
-const FORGET_TIMEOUT_MS = 15000
+// What /forget takes at the worker before the worker's own waits are over:
+// the streams on the page get their moment to finish (20 s by default,
+// RESIDENT_STREAM_WAIT_MS of the worker), then the whole-answer calls in
+// flight (5 s), then the page closes (5 s). A sign-in or renewal still
+// running for the account, or standing in the worker's line of page loads,
+// is not waited for here: the worker finishes the job without the app.
+const FORGET_TIMEOUT_MS = 35000
 
 /**
  * The app dropped the account: the worker forgets it too (Qwen2API-2l0) — the
