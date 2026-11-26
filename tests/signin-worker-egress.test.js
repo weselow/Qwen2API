@@ -1634,7 +1634,7 @@ test('Qwen2API-xun: a call on a page whose token is nearly spent renews the toke
   assert.ok(call.at >= refresh.at)
   // ...and no page was loaded for it: the one load is the page's own opening.
   assert.equal(signer.calls.filter(entry => entry.op === 'renew').length, 1)
-  assert.ok(lines.some(line => /token-refresh ok \(\d+ ms, 15 min left\)$/.test(line)), lines.join('\n'))
+  assert.ok(lines.some(line => /token-refresh ok \(\d+ ms, 15 min left(?:, after a wait of \d+ ms)?\)$/.test(line)), lines.join('\n'))
   assert.equal(lines.join('\n').includes(RENEWED), false, 'a token is not for the log')
   assert.equal((await health()).residentPages, 1)
 })
@@ -1704,7 +1704,7 @@ test('Qwen2API-xun: a refresh qwen.ai refuses costs the call its time and nothin
   assert.equal(signer.calls.filter(entry => entry.op === 'renew').length, 1)
   const said = lines.filter(line => / token-refresh /.test(line))
   assert.equal(said.length, 1, lines.join('\n'))
-  assert.match(said[0], /token-refresh failed \(refused, status 401, code unauthorized, \d+ ms\)$/)
+  assert.match(said[0], /token-refresh failed \(refused, status 401, code unauthorized, \d+ ms(?:, after a wait of \d+ ms)?\)$/)
   // What qwen.ai put in its refusal beyond the code is not for the worker's log.
   assert.equal(lines.join('\n').includes('private-upstream-refusal-fixture'), false)
 
@@ -1733,7 +1733,7 @@ test('Qwen2API-xun: a page that does not answer the refresh is said so, and the 
   assert.equal(status, 200)
   assert.equal(refreshesOf(asked).length, 0)
   assert.equal(asked.at(-1).init.headers.authorization, 'Bearer page-access-token')
-  assert.ok(lines.some(line => /token-refresh failed \(the page did not answer, \d+ ms\)$/.test(line)), lines.join('\n'))
+  assert.ok(lines.some(line => /token-refresh failed \(the page did not answer, \d+ ms(?:, after a wait of \d+ ms)?\)$/.test(line)), lines.join('\n'))
 })
 
 test('Qwen2API-xun: with the refresh off the page is not asked about its token at all', async t => {
@@ -2277,7 +2277,7 @@ test('Qwen2API-xun: a refresh the page reports as renewing to a token that is al
   assert.equal(status, 200)
   assert.equal(asked.at(-1).init.headers.authorization, 'Bearer page-access-token')
   assert.equal(lines.some(line => / token-refresh ok /.test(line)), false, `a spent token was said to be a renewal:\n${lines.join('\n')}`)
-  assert.ok(lines.some(line => / token-refresh failed \(.+, \d+ ms\)$/.test(line)), lines.join('\n'))
+  assert.ok(lines.some(line => / token-refresh failed \(.+, \d+ ms(?:, after a wait of \d+ ms)?\)$/.test(line)), lines.join('\n'))
 })
 
 test('Qwen2API-nch: a stop that lands while a page waits for its turn to open ends the call with page_closed, and no page is said to have died', async t => {
@@ -2579,7 +2579,7 @@ test('Qwen2API-xun: a refresh that does not get through keeps every page behind 
     assert.equal(await callOnce(post, down), 200)
     return lines
   })
-  assert.ok(first.some(line => / token-refresh failed \(network_error, \d+ ms\)$/.test(line)), first.join('\n'))
+  assert.ok(first.some(line => / token-refresh failed \(network_error, \d+ ms(?:, after a wait of \d+ ms)?\)$/.test(line)), first.join('\n'))
 
   // While it is down, no other page pays the wait for a try of its own: the
   // call goes out at once, on the token there is.
@@ -2598,7 +2598,7 @@ test('Qwen2API-xun: a refresh that does not get through keeps every page behind 
     return lines
   })
   assert.equal(refreshesOf(asked).length, 2)
-  assert.ok(refused.some(line => / token-refresh failed \(refused, status 401, code unauthorized, \d+ ms\)$/.test(line)), refused.join('\n'))
+  assert.ok(refused.some(line => / token-refresh failed \(refused, status 401, code unauthorized, \d+ ms(?:, after a wait of \d+ ms)?\)$/.test(line)), refused.join('\n'))
   // ...and a refresh qwen.ai refuses is that page's own: it keeps nobody else from trying.
   assert.equal(await callOnce(post, quiet), 200)
   assert.equal(refreshesOf(asked).length, 3)
@@ -2665,7 +2665,7 @@ test('Qwen2API-xun: the code of a refused refresh is cut to one line of at most 
   // Control characters are spaces, and 80 characters are quoted at most: one line, saying one failure.
   const said = lines.filter(line => / token-refresh /.test(line))
   assert.equal(said.length, 1, lines.join('\n'))
-  assert.match(said[0], / token-refresh failed \(refused, status 401, code unauthorized 2026-11-26T00:00:00\.000Z token-refresh ok \(forged\) z{16}, \d+ ms\)$/)
+  assert.match(said[0], / token-refresh failed \(refused, status 401, code unauthorized 2026-11-26T00:00:00\.000Z token-refresh ok \(forged\) z{16}, \d+ ms(?:, after a wait of \d+ ms)?\)$/)
 })
 
 // Another account's page takes the turn, so this account's page — opened for a call — stands in
