@@ -44,6 +44,12 @@ async function until(condition, timeoutMs = 5000) {
   }
 }
 
+// `pending`, or a failure after `ms`: nothing a test waits for may keep it for ever.
+const within = (pending, ms = 5000, what = 'it') => new Promise((resolve, reject) => {
+    const guard = setTimeout(() => reject(new Error(`${what} did not happen in ${ms} ms`)), ms)
+    Promise.resolve(pending).then(value => { clearTimeout(guard); resolve(value) }, error => { clearTimeout(guard); reject(error) })
+})
+
 // What the worker logs while `fn` runs.
 async function logged(fn) {
   const lines = []
@@ -94,6 +100,8 @@ test('/forget is the worker’s own secret to use, and wants an email', async t 
   // Nothing above changed anything, and /health is as open as everywhere.
   const state = await health()
   assert.deepEqual([state.ok, state.sessions, state.residentPages], [true, 0, 0])
+  // The one switch that makes a click in the dashboard delete a profile is to be seen on prod.
+  assert.equal(state.forgetDeletesProfile, false)
 })
 
 test('forgetting drops the cached session: the next /renew is a live reload, not the cache', async t => {
@@ -166,7 +174,7 @@ test('a whole-answer call in flight on the page is let to finish before the page
   const email = 'busy@example.invalid'
   withProfile(dataDir, email)
   const inFlight = egress(email)
-  await entered.promise
+  await within(entered.promise, 5000, 'the call reaching the page')
 
   let settled = false
   const forgetting = forget(email).then(answer => { settled = true; return answer })
@@ -180,10 +188,11 @@ test('a whole-answer call in flight on the page is let to finish before the page
 })
 
 test('with profiles deleted on forget the account is gone for good', async t => {
-  const { egress, call, forget, dataDir } = await start(t, { forgetDeletesProfile: true })
+  const { egress, call, forget, health, dataDir } = await start(t, { forgetDeletesProfile: true })
   const email = 'wiped@example.invalid'
   withProfile(dataDir, email)
   assert.equal((await egress(email)).status, 200)
+  assert.equal((await health()).forgetDeletesProfile, true)
   assert.deepEqual(await forget(email), { status: 200, ok: true, session: true, page: true, profile: 'deleted' })
   assert.equal(fs.existsSync(profileDir(dataDir, email)), false)
   assert.equal((await egress(email)).code, 'no_profile')
@@ -377,6 +386,112 @@ test('a sign-in still in the login line is waited for as well — and neither ke
   assert.equal(signedIn.status, 200)
   assert.deepEqual(answer, { status: 200, ok: true, session: true, page: false, profile: 'kept' })
   // The sign-in ended in remember(); only the account that was not forgotten is held.
+  assert.equal((await health()).sessions, 1)
+})
+
+test('/forget lands while the account’s page is still opening: it waits for the open, then closes what the open made', async t => {
+  const released = deferred()
+  let hold = true
+  // The opening of a page is a renewal of its own — it harvests the page — and the script holds that one.
+  const { egress, forget, health, dataDir, signer } = await start(t, {
+    script: { renew: async () => {
+      if (hold) { hold = false; await released.promise }
+      return { token: 'opened-token', exp: Math.floor(Date.now() / 1000) + 3600, cookies: [] }
+    } }
+  })
+  const email = 'opening@example.invalid'
+  withProfile(dataDir, email)
+  const opening = egress(email)
+  await until(() => signer.calls.some(call => call.op === 'renew'))
+
+  let settled = false
+  const forgetting = forget(email).then(answer => { settled = true; return answer })
+  await new Promise(resolve => setTimeout(resolve, 100))
+  // An open holds the account's lock for its whole length: /forget waits for it on the lock — the one wait it takes outside both maps.
+  assert.equal(settled, false)
+
+  released.resolve()
+  assert.equal((await opening).status, 200)
+  assert.deepEqual(await forgetting, { status: 200, ok: true, session: true, page: true, profile: 'kept' })
+  assert.deepEqual([(await health()).sessions, (await health()).residentPages], [0, 0])
+  assert.equal(signer.contexts[0].closed, true)
+})
+
+test('two /forget for one account: both are answered, and the page is closed once', async t => {
+  const { egress, forget, health, dataDir } = await start(t)
+  const email = 'twice@example.invalid'
+  withProfile(dataDir, email)
+  assert.equal((await egress(email)).status, 200)
+
+  const { lines, answers } = await logged(async captured => ({ answers: [await forget(email), await forget(email)], lines: captured }))
+  assert.deepEqual(answers.map(answer => [answer.ok, answer.session, answer.page]),
+    [[true, true, true], [true, false, false]])
+  assert.equal(lines.filter(line => / resident-close forgotten \(/.test(line)).length, 1)
+  assert.deepEqual([(await health()).sessions, (await health()).residentPages], [0, 0])
+})
+
+test('the profile is removed only once every browser of the account is gone — one an eviction began closing, too', async t => {
+  const released = deferred()
+  let hold = false
+  // One page at a time: the second account's page evicts the first's.
+  const { egress, forget, dataDir, signer } = await start(t, {
+    forgetDeletesProfile: true, maxPages: 1,
+    script: { beforeClose: async () => { if (hold) await released.promise } }
+  })
+  const evicted = 'evicted@example.invalid'
+  const other = 'other@example.invalid'
+  for (const email of [evicted, other]) withProfile(dataDir, email)
+  assert.equal((await egress(evicted)).status, 200)
+
+  hold = true
+  // The eviction closes the first account's page under the SECOND account's lock — one /forget never takes.
+  const opening = egress(other)
+  await until(() => signer.calls.some(call => call.op === 'closing' && call.dataDir === profileDir(dataDir, evicted)))
+
+  let settled = false
+  const forgetting = forget(evicted).then(answer => { settled = true; return answer })
+  await new Promise(resolve => setTimeout(resolve, 100))
+  // No page of the account is in the registry any more, but its browser is closing and holds the directory.
+  assert.equal(settled, false)
+  assert.equal(fs.existsSync(profileDir(dataDir, evicted)), true)
+
+  released.resolve()
+  assert.equal((await opening).status, 200)
+  assert.deepEqual(await forgetting, { status: 200, ok: true, session: true, page: false, profile: 'deleted' })
+  assert.equal(fs.existsSync(profileDir(dataDir, evicted)), false)
+})
+
+test('a renewal that keeps starting for the account outlives /forget’s patience — and the answer says so', async t => {
+  const released = deferred()
+  let hold = false
+  const { call, egress, forget, health, dataDir, signer, server } = await start(t, {
+    forgetRounds: 1,
+    script: { beforeClose: async () => { if (hold) await released.promise } }
+  })
+  const email = 'impatient@example.invalid'
+  withProfile(dataDir, email)
+  assert.equal((await egress(email)).status, 200)
+
+  hold = true
+  const { lines, answer, renewal } = await logged(async captured => {
+    const forgetting = forget(email)
+    await until(() => signer.calls.some(call => call.op === 'closing'))
+    // A renewal of the account arrives while /forget is still closing its page: it queues for the account's lock — one round too many.
+    const arrived = deferred()
+    const onRequest = req => { if (req.url === '/renew') arrived.resolve() }
+    server.on('request', onRequest)
+    const renewal = call('/renew', { email, force: true })
+    await within(arrived.promise, 5000, 'the renewal reaching the worker')
+    await new Promise(resolve => setTimeout(resolve, 20))
+    server.off('request', onRequest)
+    released.resolve()
+    return { answer: await forgetting, renewal: await renewal, lines: captured }
+  })
+  // Not a refusal — the session and the page were dropped — but the renewal was still to run.
+  assert.deepEqual(answer, { status: 200, ok: true, session: true, page: true, profile: 'kept', pending: 'renewal' })
+  assert.equal(lines.some(line => / forget session, page, profile kept, a renewal still running \(\d+ sessions\)$/.test(line)), true)
+  // And that is what the word is for: the renewal that outlived /forget ended in remember(), as every renewal does.
+  assert.equal(renewal.status, 200)
   assert.equal((await health()).sessions, 1)
 })
 

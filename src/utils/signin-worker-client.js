@@ -64,7 +64,10 @@ function workerFailure(error, timedOut = false) {
     }
     // The same code either way (callers branch on it); the log line should not blame a worker that is up and still working.
     if (timedOut || error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
-        return new SigninError('signin_transport_error', 502, 'Signin worker did not answer in time.')
+        const failure = new SigninError('signin_transport_error', 502, 'Signin worker did not answer in time.')
+        // Not a refusal: whatever the worker was asked goes on without the app.
+        failure.timedOut = true
+        return failure
     }
     return new SigninError('signin_transport_error', 502, 'Signin worker unreachable.')
 }
@@ -143,17 +146,23 @@ const FORGET_TIMEOUT_MS = 35000
  * profile goes with it is the worker's own setting.
  * @param {string} email
  * @param {number} [timeoutMs]
- * @returns {Promise<{session: boolean, page: boolean, profile: 'kept'|'deleted'|'absent'|'left'}>}
- *   what the worker dropped; `profile` says what became of the browser profile
+ * @returns {Promise<{session: boolean, page: boolean, profile: 'kept'|'deleted'|'absent'|'left',
+ *   pending?: 'login'|'renewal'}>}
+ *   what the worker dropped; `profile` says what became of the browser profile;
+ *   `pending` when the worker gave up waiting for a sign-in or a renewal that
+ *   kept starting for the account — it may leave a session behind after all
  * @throws {SigninError} the worker refused or did not answer
  */
 async function forgetAccount(email, timeoutMs = FORGET_TIMEOUT_MS) {
     const answer = (await postWorker('/forget', { email }, timeoutMs)).data
     if (answer?.ok !== true || typeof answer.session !== 'boolean' || typeof answer.page !== 'boolean' ||
-        !['kept', 'deleted', 'absent', 'left'].includes(answer.profile)) {
+        !['kept', 'deleted', 'absent', 'left'].includes(answer.profile) ||
+        (answer.pending !== undefined && !['login', 'renewal'].includes(answer.pending))) {
         throw new SigninError('signin_upstream_error', 502, 'Signin worker returned a malformed forget.')
     }
-    return { session: answer.session, page: answer.page, profile: answer.profile }
+    const forgotten = { session: answer.session, page: answer.page, profile: answer.profile }
+    if (answer.pending !== undefined) forgotten.pending = answer.pending
+    return forgotten
 }
 
 // What the worker's own budget does not cover on /egress: opening the

@@ -261,6 +261,23 @@ test('an account whose token was renewed meanwhile is left to it', async t => {
     })
 })
 
+test('an account whose token merely changed meanwhile — adopted from a recovered session, and still short-lived — is left to it too', async t => {
+  const clock = onFakeClock(t)
+  t.mock.method(Math, 'random', () => 0)
+  const lines = capture(t)
+  await withDueAccounts(t, ['a', 'b'], async ({ emails, starts, accounts }) => {
+    const cycle = within(accountManager.autoRefreshTokens(24, { paced: true }))
+    await settle()
+    // Adopted in place, as adoptSessionToken does it: another string, the same life.
+    accounts[1].token = token(HOUR + 60)
+    clock.tick(30000)
+    await settle()
+    assert.deepEqual(starts.map(start => start.email), [emails[0]])
+    assert.equal(await cycle, 1)
+    assert.equal(lines.info.filter(line => line.includes('令牌已是新的')).length, 1)
+  })
+})
+
 test('a refresh that failed paces the next account all the same — the attempt was a page load too', async t => {
     const clock = onFakeClock(t)
     t.mock.method(Math, 'random', () => 0)

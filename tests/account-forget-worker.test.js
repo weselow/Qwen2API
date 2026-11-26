@@ -183,7 +183,8 @@ test('a worker that cannot be reached does not keep the account either', async t
     assert.equal(await accountManager.removeAccount(removed.email), true)
     assert.deepEqual(accountManager.getAllAccountKeys().map(account => account.email), [retained.email])
     assert.equal(lines.warn.length, 1)
-    assert.ok(lines.warn[0].includes('(signin_transport_error)'), lines.warn[0])
+    // Nothing will finish on the worker's side here: the warning says so.
+    assert.ok(lines.warn[0].includes('(signin_transport_error)') && lines.warn[0].includes('直到 signin-worker 重启'), lines.warn[0])
   })
 })
 
@@ -227,9 +228,42 @@ test('a worker that does not answer is given up on after a bound; the account is
     assert.deepEqual(accountManager.getAllAccountKeys().map(account => account.email), [retained.email])
     assert.equal(worker.requests.length, 1)
     assert.equal(lines.warn.length, 1)
-    assert.ok(lines.warn[0].includes('(signin_transport_error)'), lines.warn[0])
+    // Said of a worker that is slow, not of one that refused: it goes on without the app and finishes.
+    assert.ok(lines.warn[0].includes('(signin_transport_error)') && lines.warn[0].includes('没有及时回答'), lines.warn[0])
+    assert.equal(lines.warn[0].includes('直到 signin-worker 重启'), false, lines.warn[0])
   })
   for (const res of worker.pending) reply(res, 200, { ok: true, session: true, page: true, profile: 'kept' })
+})
+
+test('a worker that gave up waiting for the account says so, and the warning says what may come of it', async t => {
+  const worker = await standIn(t)
+  worker.mode.payload = { ok: true, session: true, page: true, profile: 'kept', pending: 'renewal' }
+  const lines = capture(t)
+  await withAccounts(t, async ({ removed }) => { assert.equal(await accountManager.removeAccount(removed.email), true) })
+  // Not said to be forgotten: the removal's own line is the only one.
+  assert.equal(lines.info.filter(line => line.includes('signin-worker 已忘掉账户')).length, 0)
+  assert.equal(lines.warn.length, 1)
+  assert.ok(lines.warn[0].includes('等不下去了') && lines.warn[0].includes('续期') && lines.warn[0].includes('/forget'), lines.warn[0])
+})
+
+test('a word of what is still pending that is not one of the worker’s two is an answer out of shape', async t => {
+  const worker = await standIn(t)
+  worker.mode.payload = { ok: true, session: true, page: true, profile: 'kept', pending: 'bogus' }
+  await assert.rejects(signinWorker.forgetAccount('solo@example.invalid'),
+    { code: 'signin_upstream_error', message: 'Signin worker returned a malformed forget.' })
+})
+
+test('an answer that does not say yes is not taken for one, however well formed the rest of it is', async t => {
+  const worker = await standIn(t)
+  for (const payload of [
+    { session: true, page: true, profile: 'kept' },
+    { ok: false, session: true, page: true, profile: 'kept' },
+    { ok: 'true', session: true, page: true, profile: 'kept' }
+  ]) {
+    worker.mode.payload = payload
+    await assert.rejects(signinWorker.forgetAccount('solo@example.invalid'),
+      { code: 'signin_upstream_error', message: 'Signin worker returned a malformed forget.' })
+  }
 })
 
 test('outside browser mode the app does not use the worker, and does not tell it', async t => {
@@ -258,14 +292,17 @@ test('a storage that refuses the deletion keeps the worker out of it', async t =
   })
 })
 
-test('the worker is told once the deletion is durable, and nothing done to the account next overtakes it', async t => {
+test('the worker is told once the deletion is durable, and what the account’s queue does next does not overtake it', async t => {
   const worker = await standIn(t)
   worker.mode.answer = 'hang'
   await withAccounts(t, async ({ removed, retained }) => {
     const removal = accountManager.removeAccount(removed.email)
     await until(() => worker.requests.length === 1)
     // Gone from the app already, the worker not yet answered: the account's queue is still busy,
-    // so adding the account again waits — its sign-in cannot reach the worker ahead of the forget.
+    // so what goes through that queue for the account — the save of a re-add, a refresh — waits
+    // until the worker has been told. The sign-in that a re-add makes BEFORE its save is not on
+    // that queue: landing in the worker while the /forget is pending, it is waited for by the
+    // /forget, and the session it just made is dropped with the rest (Qwen2API-2l0, NOTES).
     assert.equal(accountManager.getAllAccountKeys().some(account => account.email === removed.email), false)
     let added = false
     const addition = accountManager.addAccountWithToken(removed.email, removed.password, removed.token, removed.expires)

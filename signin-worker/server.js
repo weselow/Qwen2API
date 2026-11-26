@@ -41,9 +41,10 @@
  * drops it too — the cached session with its silent-renew timer, and the
  * resident page:
  *
- *   POST /forget  {email}                 -> {ok, session, page, profile}
+ *   POST /forget  {email}                 -> {ok, session, page, profile[, pending]}
  *
- * The profile stays unless SIGNIN_FORGET_DELETES_PROFILE is set (handleForget).
+ * The profile stays unless SIGNIN_FORGET_DELETES_PROFILE is set; `pending`
+ * names a sign-in or renewal the route gave up waiting for (handleForget).
  *
  * qwen.ai's status and body always travel inside a 200: a WAF challenge page
  * too, under whatever status it came. The worker names it in its log (and
@@ -220,7 +221,9 @@ function createServer(overrides = {}) {
         // Whether /forget deletes the account's browser profile as well
         // (Qwen2API-2l0). Off, a profile kept lets an account added again
         // skip the sign-in. Only an exact "true" turns it on.
-        forgetDeletesProfile: overrides.forgetDeletesProfile ?? process.env.SIGNIN_FORGET_DELETES_PROFILE === 'true'
+        forgetDeletesProfile: overrides.forgetDeletesProfile ?? process.env.SIGNIN_FORGET_DELETES_PROFILE === 'true',
+        // How many rounds /forget takes (handleForget); tests make it one.
+        forgetRounds: overrides.forgetRounds ?? FORGET_ROUNDS
     }
 
     fs.mkdirSync(config.dataDir, { recursive: true })
@@ -676,11 +679,18 @@ function createServer(overrides = {}) {
      *
      * The profile stays, so that an account added again skips the sign-in —
      * unless the worker is told to delete profiles (forgetDeletesProfile): a
-     * removed account's auth cookies go with it. It is deleted once its
-     * browser is closed — bounded, like every close (closeMs): a browser that
-     * would not close in time may keep pieces of its profile. A profile that
-     * could not be removed is said so (`profile: "left"`), not failed over:
-     * the session and the page are gone by then, which is what was asked.
+     * removed account's auth cookies go with it. It is deleted once every
+     * browser of the account is closed — its own, and one an eviction began
+     * closing under another account's lock — bounded, like every close
+     * (closeMs): a browser that would not close in time may keep pieces of its
+     * profile. A profile that could not be removed is said so (`profile:
+     * "left"`), not failed over: the session and the page are gone by then,
+     * which is what was asked.
+     *
+     * A sign-in or renewal that keeps starting for the account for all the
+     * rounds outlives this: the answer says so (`pending`). It is not a
+     * refusal — the session and the page are dropped — but what is still
+     * running ends in remember(), and may leave a session behind.
      */
     async function handleForget(body) {
         const email = parseEmail(body)
@@ -689,7 +699,7 @@ function createServer(overrides = {}) {
         clearTimeout(sessions.get(email)?.timer)
         let session = sessions.delete(email)
         let page = false
-        for (let round = 0; round < FORGET_ROUNDS; round++) {
+        for (let round = 0; round < config.forgetRounds; round++) {
             await Promise.allSettled([logins.get(email), renewing.get(email)])
             const found = await serialized(email, async () => {
                 const resident = residents.get(email)
@@ -702,12 +712,17 @@ function createServer(overrides = {}) {
             session ||= found.session
             if (!logins.has(email) && !renewing.has(email)) break
         }
+        const pending = logins.has(email) ? 'login' : renewing.has(email) ? 'renewal' : undefined
         let profile = 'kept'
         if (config.forgetDeletesProfile) {
             const dir = profileDir(email)
             profile = fs.existsSync(dir) ? 'deleted' : 'absent'
             if (profile === 'deleted') {
                 try {
+                    // No page of the account is left to close here; a browser of
+                    // its that is closing still (an eviction, under another
+                    // account's lock) holds the directory till it is gone.
+                    await residents.whenClosed(email)
                     await fs.promises.rm(dir, { recursive: true, force: true })
                 } catch (error) {
                     profile = 'left'
@@ -715,9 +730,9 @@ function createServer(overrides = {}) {
                 }
             }
         }
-        log('forget', `${session ? 'session' : 'no session'}, ${page ? 'page' : 'no page'}, profile ${profile} ` +
-            `(${sessions.size} sessions)`)
-        return { ok: true, session, page, profile }
+        log('forget', `${session ? 'session' : 'no session'}, ${page ? 'page' : 'no page'}, profile ${profile}` +
+            `${pending ? `, a ${pending} still running` : ''} (${sessions.size} sessions)`)
+        return { ok: true, session, page, profile, ...(pending ? { pending } : {}) }
     }
 
     function authorized(req) {
@@ -776,14 +791,16 @@ function createServer(overrides = {}) {
         if (req.method === 'GET' && req.url === '/health') {
             // The headless mode is here to be checked after a flip, before the
             // first request that depends on it. So are the settings of
-            // 2026-11-26 (Qwen2API-xun, Qwen2API-nch, Qwen2API-ops), and how
-            // long the line of page loads is.
+            // 2026-11-26 (Qwen2API-xun, Qwen2API-nch, Qwen2API-ops), how
+            // long the line of page loads is, and whether removing an account
+            // in the app deletes its profile (Qwen2API-2l0).
             return send(res, 200, {
                 ok: true, sessions: sessions.size, ...residents.stats(),
                 headless: config.headless, headlessMode: config.headless ? config.headlessMode : null,
                 pageTokenRefresh: config.pageTokenRefresh, streamWaitMs: config.streamWaitMs,
                 loadMinIntervalMs: config.loadMinIntervalMs, loadMaxWaitMs: config.loadMaxWaitMs,
-                pageLoadQueue: pageLoads.stats()
+                pageLoadQueue: pageLoads.stats(),
+                forgetDeletesProfile: config.forgetDeletesProfile
             })
         }
         if (req.method === 'POST' && req.url === '/forget') {

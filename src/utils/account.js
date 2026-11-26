@@ -99,12 +99,16 @@ const _hasNonZeroStats = (stats) => {
 // deleted or not deletable are worth a word, kept and never-there are not.
 const FORGET_PROFILE_NOTE = { deleted: '，浏览器配置已删除', left: '，浏览器配置没能删除', absent: '', kept: '' }
 
-// The timer's cycle of token refreshes (Qwen2API-ops). In browser mode one
-// refresh is a reload of the account's page in the signin-worker, so two
-// accounts of one cycle are kept this far apart, plus up to the same again as
-// jitter — as the worker keeps its full sign-ins. Shorter, and the next
-// account's renewal would stand in the worker's line of page loads, holding
-// that account's lock until its turn (Qwen2API-m47).
+// The timer's cycle of token refreshes (Qwen2API-ops). In browser mode a
+// refresh is a reload of the account's page in the signin-worker whenever the
+// worker has no fresh session of it to answer from — after the worker's
+// restart, or once its cached session has run low; while the worker's own
+// timer keeps that session fresh, it answers from the cache and no page is
+// loaded. The cycle cannot tell the two apart beforehand, so every refresh is
+// given room: two accounts of one cycle are kept this far apart, plus up to
+// the same again as jitter — as the worker keeps its full sign-ins. Shorter,
+// and a renewal that does reload would stand in the worker's line of page
+// loads, holding its account's lock until its turn (Qwen2API-m47).
 const AUTO_REFRESH_MIN_INTERVAL_MS = 30000
 
 const STATS_HISTORY_RETENTION_DAYS = 90
@@ -570,19 +574,23 @@ class Account {
 
         logger.info(`发现 ${needsRefresh.length} 个令牌需要刷新`, 'TOKEN')
 
+        // What the due accounts' tokens were as the cycle began. The cycle can last minutes, and the
+        // record may change meanwhile both ways: a refresh replaces it, a recovered session rewrites
+        // its token in place — on the very object this cycle holds.
+        const tokenAtStart = new Map(needsRefresh.map(account => [account.email, account.token]))
+
         let successCount = 0
         let failedCount = 0
 
         // 逐个刷新账户，每次成功后立即保存
         for (const [index, account] of needsRefresh.entries()) {
-            // Judged by the record as it is now, not by the one the cycle began with: a
-            // refresh replaces the record, a recovered session rewrites its token in place.
             const current = this.accountTokens.find(acc => acc.email === account.email)
             if (!current) {
                 logger.info(`账户 ${account.email} 已被删除，跳过刷新`, 'TOKEN')
                 continue
             }
-            if (!this.tokenManager.isTokenExpiringSoon(current.token, thresholdHours)) {
+            if (current.token !== tokenAtStart.get(account.email) ||
+                !this.tokenManager.isTokenExpiringSoon(current.token, thresholdHours)) {
                 logger.info(`账户 ${account.email} 的令牌已是新的，跳过刷新`, 'TOKEN')
                 continue
             }
@@ -1086,7 +1094,10 @@ class Account {
     /**
      * 账户已经从应用里删掉——让 signin-worker 也忘掉它（Qwen2API-2l0）：否则它为这个
      * 账户留着的会话、悄悄续期的定时器和常驻页面会一直活着。删除已经落盘，这里只是
-     * 通知：signin-worker 拒绝或没有回答，账户照样是删除的，日志里留一条警告。
+     * 通知：signin-worker 拒绝或没有回答，账户照样是删除的，日志里留一条警告。警告分三种：
+     * 拒绝——它的会话和页面会留到 signin-worker 重启；没及时回答——那边会自己做完，
+     * 不用管；它等不下去了（这个账户的登录或续期一次又一次地开始）——结束后可能又
+     * 留下会话，要人手动再叫一次 /forget。
      * 只有 browser 模式用得到 signin-worker。
      * @param {string} email - 邮箱地址
      * @returns {Promise<void>}
@@ -1094,12 +1105,23 @@ class Account {
      */
     async _forgetWorkerSession(email) {
         if (!v2sessions.browser) return
+        const removed = `账户 ${email} 已删除，`
         try {
             const forgotten = await signinWorker.forgetAccount(email)
+            if (forgotten.pending) {
+                logger.warn(`${removed}但 signin-worker 等不下去了——这个账户的${forgotten.pending === 'login' ? '登录' : '续期'}还在进行，` +
+                    '结束后可能又留下会话：需要手动再叫一次 /forget（带 signin-worker 的密钥）', 'ACCOUNT')
+                return
+            }
             logger.info(`signin-worker 已忘掉账户 ${email}（会话${forgotten.session ? '已清除' : '本无'}，` +
                 `页面${forgotten.page ? '已关闭' : '本无'}${FORGET_PROFILE_NOTE[forgotten.profile] || ''}）`, 'ACCOUNT')
         } catch (error) {
-            logger.warn(`账户 ${email} 已删除，但 signin-worker 没能忘掉它 (${error.workerCode || error.code})：` +
+            if (error.timedOut) {
+                logger.warn(`${removed}但 signin-worker 没有及时回答 (${error.code})：那边会自己把它忘掉——` +
+                    '看 signin-worker 日志里的 forget 行', 'ACCOUNT')
+                return
+            }
+            logger.warn(`${removed}但 signin-worker 没能忘掉它 (${error.workerCode || error.code})：` +
                 '它的会话、续期定时器和页面会留在 signin-worker 里，直到 signin-worker 重启', 'ACCOUNT')
         }
     }
