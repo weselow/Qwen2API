@@ -1,5 +1,5 @@
 const { generateUUID } = require('../utils/tools.js')
-const { isChatType, isThinkingEnabled, parserModel, parserMessages, extractMediaToFiles, harvestCurrentTurnMedia, attachMediaToLastMessage, willBeFolded } = require('../utils/chat-helpers.js')
+const { isChatType, isThinkingEnabled, parserModel, parserMessages, extractMediaToFiles, harvestCurrentTurnMedia, attachMediaToLastMessage, willBeFolded, oneAccountForRequest } = require('../utils/chat-helpers.js')
 const { buildToolSystemPrompt, foldToolMessages } = require('../utils/tool-prompt.js')
 const { buildAgentTurnDirective, buildToolHistoryLedger, extractHistoryToolCalls } = require('../utils/agent-turn.js')
 const { logger } = require('../utils/logger')
@@ -229,7 +229,11 @@ const processRequestBody = async (req, res, next) => {
     attachMediaToLastMessage(preparedMessages, currentTurnMedia)
 
     // 处理 messages 参数 : 消息历史（返回 OpenAI 格式消息数组）
-    const parsedMessages = await parserMessages(preparedMessages, thinkingConfig, chatType)
+    // The account this request is made on, taken once for all of it: a picture is uploaded
+    // from its page, and the chat is made on it too (Qwen2API-fjk). Nothing is taken for a
+    // request that uploads nothing.
+    const uploadAccount = oneAccountForRequest()
+    const parsedMessages = await parserMessages(preparedMessages, thinkingConfig, chatType, uploadAccount.get)
 
     // 将解析后的消息填充到 React UI 格式的消息对象中
     // 取最后一条用户消息作为主消息内容，历史消息通过 content 传递
@@ -301,6 +305,9 @@ const processRequestBody = async (req, res, next) => {
     req.parsed_messages = parsedMessages
     req.enable_thinking = thinkingConfig.thinking_enabled
     req.enable_web_search = chatType === 'search' ? true : false
+    // The account the pictures were uploaded on, for the controller to make the chat on it
+    // too (Qwen2API-fjk); null where nothing was uploaded.
+    req.upload_account = uploadAccount.chosen()
 
     // 顶层 chat_type 供路由选择器使用 (selectChatCompletion)
     body.chat_type = chatType

@@ -22,6 +22,40 @@ const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
 
 /**
+ * The one account a request is made on, taken once for the whole of it (Qwen2API-fjk).
+ *
+ * The rotator hands every call its least recently used account and records the use
+ * (account-rotator.js#_selectLeastUsedAccount): a call for the upload and a call for the
+ * chat were two accounts. The picture was uploaded from one account's page, into that
+ * account's store, and the chat was made on another's — which is not told to look there.
+ *
+ * Nothing is taken until `get()` is first asked; from then on every `get()` gives the same.
+ * @returns {{get: () => object|null, chosen: () => object|null}}
+ *   `get()` gives the account to upload on, taking it if it was not taken yet;
+ *   `chosen()` is the account once taken, null if none was — a request that uploaded
+ *   nothing leaves the choice of its chat's account where it always was.
+ */
+const oneAccountForRequest = () => {
+    let account
+    return {
+        get: () => {
+            if (account === undefined) account = accountManager.getAccount()
+            return account
+        },
+        chosen: () => account || null
+    }
+}
+
+/**
+ * The account an upload is made on: the request's, where its caller can give it
+ * (`requestAccount` is what oneAccountForRequest returns); the rotator's, as before,
+ * where it cannot.
+ * @param {(() => object|null)|null} requestAccount
+ * @returns {object|null} Account
+ */
+const uploadAccountOf = (requestAccount) => (requestAccount ? requestAccount() : null) || accountManager.getAccount()
+
+/**
  * 拆分模型后缀
  * @param {string} model - 原始模型名称
  * @returns {{ baseModel: string, suffix: string }} 拆分结果
@@ -135,9 +169,11 @@ const buildNormalizedMediaItem = (mediaType, url) => {
  * 解析并上传媒体内容项
  * @param {object} item - 原始内容项
  * @param {object} imgCacheManager - 图片缓存管理器
+ * @param {(() => object|null)|null} [requestAccount] - 该请求所用的那一个账户（oneAccountForRequest）：
+ *   图片从它的页面传上去，聊天也在它上面建（Qwen2API-fjk）；不带则照旧由轮换器取
  * @returns {Promise<object|null>} 规范化后的媒体内容项
  */
-const normalizeMediaContentItem = async (item, imgCacheManager) => {
+const normalizeMediaContentItem = async (item, imgCacheManager, requestAccount = null) => {
     const mediaDescriptor = getMediaDescriptor(item)
     if (!mediaDescriptor?.url) {
         return null
@@ -177,7 +213,8 @@ const normalizeMediaContentItem = async (item, imgCacheManager) => {
         }
 
         const buffer = Buffer.from(base64Content, 'base64')
-        const uploadAccount = accountManager.getAccount()
+        // On the request's account, that the chat is made on too (Qwen2API-fjk).
+        const uploadAccount = uploadAccountOf(requestAccount)
         const uploadResult = await uploadModule.uploadFileToQwenOss(buffer, filename, uploadAccount ? uploadAccount.token : null, uploadAccount)
 
         if (!uploadResult || uploadResult.status !== 200) {
@@ -383,16 +420,18 @@ const formatHistoryMessages = (messages) => {
  * @param {Array} messages - 原始消息数组
  * @param {object} thinking_config - 思考配置
  * @param {string} chat_type - 聊天类型
+ * @param {(() => object|null)|null} [requestAccount] - 该请求所用的那一个账户（oneAccountForRequest）：
+ *   消息里的图片在它上面上传，聊天也在它上面建（Qwen2API-fjk）；不带则照旧由轮换器取
  * @returns {Promise<Array>} 解析后的消息数组
  */
-const parserMessages = async (messages, thinking_config, chat_type) => {
+const parserMessages = async (messages, thinking_config, chat_type, requestAccount = null) => {
     try {
         const feature_config = thinking_config
 
         // 如果只有一条消息,使用原有逻辑处理（不标注角色）
         if (messages.length <= 1) {
             logger.network('单条消息，使用原格式处理', 'PARSER')
-            return await processOriginalLogic(messages, thinking_config, chat_type, imgCacheManager)
+            return await processOriginalLogic(messages, thinking_config, chat_type, imgCacheManager, requestAccount)
         }
 
         // 多条消息的情况:分离历史消息和最后一条消息
@@ -416,7 +455,7 @@ const parserMessages = async (messages, thinking_config, chat_type) => {
                 if (item.type === 'text') {
                     lastMessageText += item.text || ''
                 } else if (isMediaContentItem(item)) {
-                    const normalizedMediaItem = await normalizeMediaContentItem(item, imgCacheManager)
+                    const normalizedMediaItem = await normalizeMediaContentItem(item, imgCacheManager, requestAccount)
                     if (normalizedMediaItem) {
                         finalContent.push(normalizedMediaItem)
                     }
@@ -495,9 +534,10 @@ const parserMessages = async (messages, thinking_config, chat_type) => {
  * @param {object} thinking_config - 思考配置
  * @param {string} chat_type - 聊天类型
  * @param {object} imgCacheManager - 图片缓存管理器
+ * @param {(() => object|null)|null} [requestAccount] - 该请求所用的那一个账户（oneAccountForRequest），图片在它上面上传
  * @returns {Promise<Array>} 处理后的消息数组
  */
-const processOriginalLogic = async (messages, thinking_config, chat_type, imgCacheManager) => {
+const processOriginalLogic = async (messages, thinking_config, chat_type, imgCacheManager, requestAccount = null) => {
     const feature_config = thinking_config
 
     for (let message of messages) {
@@ -515,7 +555,7 @@ const processOriginalLogic = async (messages, thinking_config, chat_type, imgCac
 
             for (let item of message.content) {
                 if (isMediaContentItem(item)) {
-                    const normalizedMediaItem = await normalizeMediaContentItem(item, imgCacheManager)
+                    const normalizedMediaItem = await normalizeMediaContentItem(item, imgCacheManager, requestAccount)
                     if (normalizedMediaItem) {
                         newContent.push(normalizedMediaItem)
                     }
@@ -891,5 +931,9 @@ module.exports = {
     // Exportado por la misma razon que willBeFolded: el barrido gemelo de
     // anthropic.js#buildInternalRequest lo necesita, y una segunda copia del literal se
     // desincroniza en silencio. Ver el comentario de la declaracion.
-    HARVEST_MEDIA_CAP
+    HARVEST_MEDIA_CAP,
+    // The one account a request is made on (Qwen2API-fjk): the middlewares and the
+    // controllers take it, and whoever uploads asks it for the account.
+    oneAccountForRequest,
+    uploadAccountOf
 }

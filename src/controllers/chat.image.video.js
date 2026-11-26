@@ -5,7 +5,7 @@ const accountManager = require('../utils/account.js')
 const { generateChatID } = require('../utils/request.js')
 const sessionPersistence = require('../utils/v2-session-persistence.js')
 const { uploadFileToQwenOss } = require('../utils/upload.js')
-const { parserModel } = require('../utils/chat-helpers.js')
+const { parserModel, oneAccountForRequest, uploadAccountOf } = require('../utils/chat-helpers.js')
 const { getDefaultModelByChatType } = require('../models/models-map.js')
 const { getSsxmodForAccount } = require('../utils/ssxmod-manager')
 const { applyProxyToAxiosConfig, getChatBaseUrl } = require('../utils/proxy-helper');
@@ -905,16 +905,18 @@ const buildInternalMediaItem = (mediaType, mediaURL) => {
  * 上传 multipart 文件并构造内部媒体内容项
  * @param {object} file - multer 文件对象
  * @param {string} mediaType - 媒体类型
+ * @param {(() => object|null)|null} [requestAccount] - 该请求所用的那一个账户（chat-helpers.js#oneAccountForRequest）：
+ *   图片从它的页面传上去，生成也在它上面建（Qwen2API-fjk）；不带则照旧由轮换器取
  * @returns {Promise<object>} 内部媒体内容项
  */
-const uploadMultipartMediaFile = async (file, mediaType) => {
+const uploadMultipartMediaFile = async (file, mediaType, requestAccount = null) => {
     if (!file?.buffer) {
         throw new Error('上传文件内容为空')
     }
 
     const fallbackExtension = mediaType === 'video' ? 'mp4' : 'png'
     const originalFilename = file.originalname || `upload.${fallbackExtension}`
-    const uploadAccount = accountManager.getAccount()
+    const uploadAccount = uploadAccountOf(requestAccount)
     const uploadResult = await uploadFileToQwenOss(file.buffer, originalFilename, uploadAccount ? uploadAccount.token : null, uploadAccount)
 
     if (!uploadResult || uploadResult.status !== 200) {
@@ -928,9 +930,10 @@ const uploadMultipartMediaFile = async (file, mediaType) => {
  * 将内联媒体参数转换为内部媒体内容项
  * @param {*} value - 原始媒体值
  * @param {string} mediaType - 媒体类型
+ * @param {(() => object|null)|null} [requestAccount] - 该请求所用的那一个账户（Qwen2API-fjk），同 uploadMultipartMediaFile
  * @returns {Promise<object|null>} 内部媒体内容项
  */
-const normalizeInlineMediaItem = async (value, mediaType) => {
+const normalizeInlineMediaItem = async (value, mediaType, requestAccount = null) => {
     const mediaURL = extractInlineMediaURL(value, mediaType)
     if (!mediaURL) {
         return null
@@ -948,7 +951,7 @@ const normalizeInlineMediaItem = async (value, mediaType) => {
     const mimeType = matchedDataURI[1]
     const base64Content = matchedDataURI[2]
     const fileExtension = mimeType?.split('/')[1] || (mediaType === 'video' ? 'mp4' : 'png')
-    const uploadAccount = accountManager.getAccount()
+    const uploadAccount = uploadAccountOf(requestAccount)
     const uploadResult = await uploadFileToQwenOss(Buffer.from(base64Content, 'base64'), `upload.${fileExtension}`, uploadAccount ? uploadAccount.token : null, uploadAccount)
 
     if (!uploadResult || uploadResult.status !== 200) {
@@ -963,18 +966,19 @@ const normalizeInlineMediaItem = async (value, mediaType) => {
  * @param {object} req - Express 请求对象
  * @param {string} fieldName - 字段名
  * @param {string} mediaType - 媒体类型
+ * @param {(() => object|null)|null} [requestAccount] - 该请求所用的那一个账户（Qwen2API-fjk），同 uploadMultipartMediaFile
  * @returns {Promise<Array<object>>} 媒体内容项列表
  */
-const collectRequestMediaItems = async (req, fieldName, mediaType) => {
+const collectRequestMediaItems = async (req, fieldName, mediaType, requestAccount = null) => {
     const mediaItems = []
     const matchedFiles = (req.files || []).filter(file => file.fieldname === fieldName)
 
     for (const file of matchedFiles) {
-        mediaItems.push(await uploadMultipartMediaFile(file, mediaType))
+        mediaItems.push(await uploadMultipartMediaFile(file, mediaType, requestAccount))
     }
 
     for (const value of ensureArray(req.body?.[fieldName])) {
-        const normalizedMediaItem = await normalizeInlineMediaItem(value, mediaType)
+        const normalizedMediaItem = await normalizeInlineMediaItem(value, mediaType, requestAccount)
         if (normalizedMediaItem) {
             mediaItems.push(normalizedMediaItem)
         }
@@ -1513,13 +1517,15 @@ const resolveVideoResultContentUrl = async (responseStream, token, chatID, accou
  * @param {object} payload - 内部请求体
  * @param {object|null} [client] - 该请求客户端的离开信号（utils/client-gone.js#watchClient）：客户端走了，
  *   上游随之关闭，补取与轮询停止，并以 ClientGoneError 结束
+ * @param {object|null} [requestAccount] - 该请求所用的那一个账户（chat-helpers.js#oneAccountForRequest#chosen）：
+ *   请求的图片是从它的页面传上去的，生成也在它上面建（Qwen2API-fjk）；不带（没有上传的请求）则照旧由轮换器取
  * @returns {Promise<{ model: string, chatType: string, contentUrl: string, content: string }>} 执行结果
  * @throws {ClientGoneError} 客户端已离开——不是错误：调用方原样放行
  */
-const generateImageVideoResult = async (payload, client = null) => {
+const generateImageVideoResult = async (payload, client = null, requestAccount = null) => {
     const { model, messages, size, chat_type } = payload
     // 一次取出账户对象，确保 token 与 proxy 走同一个账号
-    const account = accountManager.getAccount()
+    const account = requestAccount || accountManager.getAccount()
     // May move below: the chat can be created on a recovered session.
     let token = account ? account.token : null
     let breakerContext = null
@@ -1843,7 +1849,7 @@ const handleImageVideoCompletion = async (req, res) => {
             }, 15000)
         }
 
-        const result = await generateImageVideoResult(req.body, client)
+        const result = await generateImageVideoResult(req.body, client, req.upload_account)
 
         if (keepAliveTimer) {
             clearInterval(keepAliveTimer)
@@ -2020,8 +2026,11 @@ const handleOpenAIImagesGeneration = async (req, res) => {
 const handleOpenAIImagesEdit = async (req, res) => {
     // Watched until the response is over, as in handleImageVideoCompletion (utils/client-gone.js).
     const client = watchClient(req)
+    // The account this request is made on, taken once for all of it: the picture is uploaded
+    // from its page, and the generation is made on it too (Qwen2API-fjk).
+    const uploadAccount = oneAccountForRequest()
     try {
-        const imageItems = await collectRequestMediaItems(req, 'image', 'image')
+        const imageItems = await collectRequestMediaItems(req, 'image', 'image', uploadAccount.get)
         if (imageItems.length === 0) {
             return sendOpenAIErrorResponse(res, {
                 status: 400,
@@ -2048,7 +2057,7 @@ const handleOpenAIImagesEdit = async (req, res) => {
             size: normalizeOpenAIImageVideoSize(req.body.size),
             chat_type: 'image_edit',
             stream: false
-        }, client)
+        }, client, uploadAccount.chosen())
 
         const imageData = await buildOpenAIImageResultItem(result.contentUrl, req.body.response_format)
 
