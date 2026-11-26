@@ -428,11 +428,14 @@ function createResidents({
      *
      * Caller holds the account lock: the calls of one page wait here for one
      * refresh, and find a young token after it. Throws only `page_closed`, when
-     * the worker stops while the page is waited or asked for its token.
+     * the worker stops while the refresh waits for its turn — the queue of
+     * refreshes ends every wait then. A stop or a death while the page is
+     * asked is seen by the caller as the page being gone, and said as nothing.
      *
      * A refresh that does not get through — the auth host not answering, a
-     * preflight refused — is no page's own trouble: it opens a circuit, and for
-     * `tokenRefreshCircuitMs` no other page tries its own. Without it a host
+     * preflight refused — is no page's own trouble: it opens a circuit for the
+     * proxy the page is behind, and for `tokenRefreshCircuitMs` no other page
+     * behind that proxy tries its own. Without it a host
      * that hangs would cost every page its first call a wait, one after another.
      *
      * @param {object} entry
@@ -461,9 +464,10 @@ function createResidents({
         const answer = await asked(entry, pageRefreshToken, tokenRefreshTimeoutMs + backstopMs, {
             url: `${authRoot}/api/v2/auths/refresh`, timeoutMs: tokenRefreshTimeoutMs, sourceId: 'signin-worker'
         })
-        // The worker stopped while the page was asked: its closing the page is no failure of the refresh, and is not said as one.
-        if (stopped) throw new WorkerError('page_closed', 'The worker is shutting down.')
-        // The page died while it was asked — a crash: its death is said by what closed it, and the refresh is nobody's failure.
+        // The worker stopped while the page was asked — it drops every page it has, at once —
+        // or the page died under the question, a crash: either way it is gone from the registry.
+        // Its closing is no failure of the refresh, and is not said as one; the caller sees that
+        // the page is gone.
         if (pages.get(entry.email) !== entry) return
         const took = Date.now() - started
         if (answer?.ok && Number.isFinite(answer.msLeft) && answer.msLeft > 0) {

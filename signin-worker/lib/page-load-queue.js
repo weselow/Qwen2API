@@ -71,11 +71,12 @@ function createPageLoadQueue({ minIntervalMs = 10000, maxWaitMs = 120000, random
         const newest = line.at(-1)
         if (newest.at - newest.pushed - now <= maxWaitMs) return false
         if (line.length === 1) {
-            // One load in line, and the gap after the load before it alone is longer than the limit.
+            // One load in line, and the gap after the load before it alone is longer than the
+            // limit. What a sign-in held it back by needs no room here: the measure above has left it out.
             const [only] = line
             only.packed = true
             only.gap = Math.min(only.gap, maxWaitMs)
-            arm(only, Math.min(only.at, only.arrived + maxWaitMs + only.pushed))
+            arm(only, Math.min(only.at, only.arrived + maxWaitMs))
             return true
         }
         // No jitter on a packed line: it is as long as it is only because the ordinary spacing did not fit.

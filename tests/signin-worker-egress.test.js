@@ -2604,28 +2604,34 @@ test('Qwen2API-xun: a refresh that does not get through keeps every page behind 
   assert.equal(refreshesOf(asked).length, 3)
 })
 
-test('Qwen2API-xun: the circuit is the road’s — a page behind another proxy tries its own refresh all the same', { timeout: 10000 }, async t => {
+test('Qwen2API-xun: the circuit is the road’s — a page behind another proxy, or behind none, tries its own refresh all the same', { timeout: 10000 }, async t => {
   const signer = fakeBrowser()
   const { post, dataDir } = await start(t, { signer, tokenRefreshCircuitMs: 60000 })
-  const [dead, other] = ['dead-road@example.invalid', 'other-road@example.invalid']
-  for (const email of [dead, other]) withProfile(dataDir, email)
-  // Both pages keep a token with a minute left.
+  // Three roads: a proxy whose way to the auth host is dead, no proxy (that way is dead too), and a proxy whose way is not.
+  const [onDead, onNone, onLive, onDeadAgain] = ['dead-road@example.invalid', 'no-road@example.invalid', 'live-road@example.invalid', 'dead-road-too@example.invalid']
+  for (const email of [onDead, onNone, onLive, onDeadAgain]) withProfile(dataDir, email)
+  // Every page keeps a token with a minute left.
   signer.script.storage = keptToken({ leftMs: 60000 })
   let refreshes = 0
   const asked = []
   signer.script.fetch = (url, init) => {
     asked.push({ url, init, at: Date.now() })
     if (!isRefresh(url)) return jsonResponse({ success: true })
-    // The first page's road to the auth host is dead; the second's is not.
-    return ++refreshes === 1 ? Promise.reject(new TypeError('Failed to fetch'))
+    // The first two roads are dead; the third answers.
+    return ++refreshes <= 2 ? Promise.reject(new TypeError('Failed to fetch'))
       : jsonResponse({ success: true, data: { access_token: RENEWED, expires_at: Math.floor(Date.now() / 1000) + 900 } })
   }
   const call = (email, proxy) => egress(post, email, { proxy })
-  assert.equal((await call(dead, 'http://dead-road.invalid:8080')).status, 200)
-  assert.equal((await call(other, 'http://other-road.invalid:8080')).status, 200)
-  // The second page was asked, and its token renewed.
-  assert.equal(refreshes, 2, 'a page behind another proxy was kept from its refresh by a dead road it is not on')
+  assert.equal((await call(onDead, 'http://dead-road.invalid:8080')).status, 200)
+  assert.equal((await call(onNone)).status, 200)
+  assert.equal((await call(onLive, 'http://live-road.invalid:8080')).status, 200)
+  // Each of the three was asked on its own road — and the last one's token was renewed.
+  assert.equal(refreshes, 3, 'a page was kept from its refresh by a dead road it is not on, or not asked on a dead one')
   assert.equal(asked.at(-1).init.headers.authorization, `Bearer ${RENEWED}`)
+  // A second page on the first road is not asked: that road is known to be dead.
+  assert.equal((await call(onDeadAgain, 'http://dead-road.invalid:8080')).status, 200)
+  assert.equal(refreshes, 3, 'a page was asked on a road known to be dead')
+  assert.equal(signer.contexts[3].page.asked.includes('pageRefreshToken'), false)
 })
 
 test('Qwen2API-nch: a sign-in on a resident page does not wait for the worker’s turn either — the login pacer is what spaces sign-ins', { timeout: 10000 }, async t => {
