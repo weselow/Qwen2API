@@ -358,10 +358,10 @@ describe('an image, /v1/chat/completions: the client leaving takes the generatio
       const req = liveRequest({ body: T2I })
       const res = bunResponse()
       const upstream = held([picture('https://cdn.example.com/never-read.png')])
-      generation = async () => {
+      generation = () => {
+        // Gone by the time the relay answers — by the address alone: whoever asks the
+        // socket from here on is told at once, without waiting for the watch's next ask.
         req.leave()
-        // The watch asks its socket every quarter of a second: the time to learn of it.
-        await new Promise(resolve => setTimeout(resolve, 400))
         return relayed(upstream.stream)
       }
 

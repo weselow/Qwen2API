@@ -210,6 +210,9 @@ async function main() {
     const since = () => `${Date.now() - record.started} ms`
     record.socketState = () => `destroyed=${request.socket.destroyed} readableEnded=${request.socket.readableEnded} ` +
       `writableEnded=${response.writableEnded} bytesWritten=${request.socket.bytesWritten}`
+    // The application keeps one connection to the worker for all its calls: every relay
+    // puts its own listeners on that one socket, which is no leak — and no warning either.
+    request.socket.setMaxListeners(0)
     // The socket: the application closing the relay arrives as its socket closing. (The
     // worker listens to the same, signin-worker/server.js#relayEgress.)
     for (const event of ['close', 'end', 'error']) {
