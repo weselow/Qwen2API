@@ -1639,8 +1639,8 @@ test('Qwen2API-xun: a call on a page whose token is nearly spent renews the toke
 
 test('Qwen2API-xun: what was read of the page’s token stands for a while — a fresh page is not asked again at once, a nearly spent one is renewed before the next call', async t => {
   const signer = fakeBrowser()
-  // Long enough that two calls in a row fall inside it, short enough to wait out.
-  const { post, dataDir } = await start(t, { signer, tokenReadAgainMs: 600 })
+  // Long enough that two calls in a row fall inside it on a loaded machine, short enough to wait out.
+  const { post, dataDir } = await start(t, { signer, tokenReadAgainMs: 1500 })
   const email = 'later@example.invalid'
   withProfile(dataDir, email)
   signer.script.storage = keptToken({ leftMs: 3600000 })
@@ -1655,7 +1655,7 @@ test('Qwen2API-xun: what was read of the page’s token stands for a while — a
   assert.equal(asked.at(-1).init.headers.authorization, 'Bearer page-access-token')
 
   // Time passes as far as the page's token is concerned: its last two minutes.
-  await sleep(700)
+  await sleep(1700)
   signer.script.storage = keptToken({ leftMs: 120000 })
   assert.equal(await callOnce(post, email), 200)
   assert.equal(tokenReads(page), 2)
