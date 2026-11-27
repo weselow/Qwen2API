@@ -983,6 +983,11 @@ class Account {
                 const insertedIndex = this.accountTokens.indexOf(newAccount)
                 if (insertedIndex !== -1) this.accountTokens.splice(insertedIndex, 1)
                 this.accountRotator.setAccounts(this.accountTokens)
+                // The account is not the app's: the session its sign-in published goes with it, from
+                // the store and from storage, so that an account added in vain leaves nothing behind
+                // (Qwen2API-jwh; the guard of Qwen2API-u50 holds for an account added again).
+                v2sessions.deleteSession(email)
+                await this.dataPersistence.deleteV2Session(email).catch(() => {})
                 logger.error(`账户 ${email} 持久化失败，已回滚内存数据`, 'ACCOUNT')
                 return false
             }

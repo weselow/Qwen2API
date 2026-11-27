@@ -137,12 +137,16 @@ async function restoreSessions() {
  * it immediately), then persistence. Never throws — callers may fire and
  * forget; a persist failure costs a re-signin after the next restart, not
  * this request.
+ * @param {Object} [options]
+ * @param {boolean} [options.allowCreate] - The session is the sign-in's that
+ *   adds an account: storage takes it for an account removed and not added
+ *   again yet, whose other sessions it still refuses (Qwen2API-jwh)
  * @returns {Promise<boolean>} whether the session reached storage
  */
-async function publishSession(email, session) {
+async function publishSession(email, session, { allowCreate = false } = {}) {
     if (!store.browser || !email || !session) return false
     store.setSession(email, session)
-    const saved = await persistence.saveV2Session(email, serializeSession(session))
+    const saved = await persistence.saveV2Session(email, serializeSession(session), { allowCreate })
     if (!saved) {
         logger.warn(`v2 会话持久化失败 (${email})——重启后需重新登录`, 'V2SESSION')
     }
