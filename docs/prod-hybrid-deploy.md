@@ -42,6 +42,32 @@ qwen.ai умеют уходить изнутри открытой страниц
 | `MAX_RESIDENT_PAGES` | Воркер: лимит открытых страниц одновременно, по умолчанию `16`; см. «Резидентные страницы» |
 | `SIGNIN_FORGET_DELETES_PROFILE` | Воркер: удалять ли профиль браузера вместе с аккаунтом, когда его удаляют в приложении (`POST /forget`, Qwen2API-2l0). По умолчанию `false` — профиль остаётся, и добавленный заново аккаунт пропускает вход; `true` — cookies удалённого аккаунта уходят вместе с профилем. Включает только точное `true`. Решение за владельцем; см. «Запрос в полёте через удалённый аккаунт» в `docs/signin-worker.md` |
 
+**Флаги новых переменных в Coolify (Qwen2API-9x1).** Coolify 4.7.6 заводит
+переменную, которую деплой впервые встретил в compose-файле, с флагом «Build
+time» (`is_buildtime=true`); тот же флаг ставит `POST /api/v1/applications/<uuid>/envs`
+без явного `is_buildtime`. Заполненная build-time переменная при каждой смене
+значения стоит полной пересборки с загрузкой Chromium. Поэтому **после каждого
+деплоя, добавившего переменные в compose, проверять флаги production-переменных
+и снимать build time у новых**: со build time остаются только
+`SERVICE_URL_QWEN2API` и `SERVICE_FQDN_QWEN2API` — они постоянные, их не трогать.
+
+```sh
+# $CT — токен API из приватного connections.md, $CB — адрес API Coolify (…/api/v1),
+# <uuid> — ресурс приложения
+curl -s -H "Authorization: Bearer $CT" "$CB/applications/<uuid>/envs" \
+  | jq -r '.[] | select(.is_preview == false and .is_buildtime == true) | "\(.key) buildtime=\(.is_buildtime | tostring) runtime=\(.is_runtime | tostring)"'
+# всё, кроме двух SERVICE_*, — runtime-only. Снять флаг по существующей переменной
+# (значение можно не слать) — Coolify отвечает 201:
+curl -s -o /dev/null -w '%{http_code}\n' -X PATCH -H "Authorization: Bearer $CT" -H 'Content-Type: application/json' \
+  "$CB/applications/<uuid>/envs" \
+  -d '{"key":"<KEY>","is_preview":false,"is_runtime":true,"is_buildtime":false}'
+```
+
+Флаг читать как `(.is_buildtime | tostring)`: запись `.is_buildtime // "null"`
+печатает `null` и для `false`. Preview-записей (`is_preview=true`) это не
+касается. После снятия — перечитать список тем же `GET`: у переменной
+`buildtime=false runtime=true`.
+
 Вторая копия стека на том же хосте (превью/тест) обязана взять **другую**
 `DNS_SUBNET` + `DNS_SIDECAR_IP`: dnsproxy пинит статический IP в своей сети.
 
@@ -1003,6 +1029,11 @@ docker logs <qwen2api-контейнер> 2>&1 | grep -A12 服务器启动成功
 # … completionsTransport: "auto",
 ```
 
+Если этот деплой добавил в compose переменные — проверить их флаги и снять
+build time у новых: команда и ожидаемый список — «Переменные», «Флаги новых переменных
+в Coolify». 27.11 два деплоя без новых переменных в compose ничего с build time не
+завели.
+
 Ожидание: поведение как до выкатки — но только если прод никто не вызывает.
 Генерации по-прежнему падают: их запросы идут из Node и curl-impersonate, которые
 этот IP не пропускает; флаги выключены. Уже действует новое, не зависящее от
@@ -1163,8 +1194,9 @@ to add to Dockerfiles» и команда сборки без `--build-arg`. Е�
   `SIGNIN_PAGE_TOKEN_REFRESH`, `SIGNIN_TOKEN_REFRESH_MIN_INTERVAL_MS`); в 02:35 UTC
   флаг снят (`PATCH /applications/<uuid>/envs` с `is_buildtime=false,
   is_runtime=true`, значения не менялись). После каждого деплоя с новой
-  переменной — проверять список переменных; хелпер, создающий переменную без
-  явного флага, для стека не годится.
+  переменной — проверять список переменных (команда — «Переменные», «Флаги новых
+  переменных в Coolify»); хелпер, создающий переменную без явного флага, для
+  стека не годится.
 
 1. **Выключить egress** — `CHAT_CREATION_TRANSPORT=direct`,
    `COMPLETIONS_TRANSPORT=auto` (если меняли — и `SIGNIN_HEADLESS_MODE=shell`).

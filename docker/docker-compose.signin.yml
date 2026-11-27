@@ -39,7 +39,7 @@ services:
       - V2_SESSION_RELOGIN_MIN_INTERVAL_MS=${V2_SESSION_RELOGIN_MIN_INTERVAL_MS:-60000}
       - SIGNIN_WORKER_URL=http://signin-worker:3100
       - SIGNIN_WORKER_TOKEN=${SIGNIN_WORKER_TOKEN:-}
-      # Must stay above the worker's SIGNIN_LOGIN_MAX_WAIT_MS + SIGNIN_TIMEOUT_MS, and above a renewal's
+      # Must be at least the worker's SIGNIN_LOGIN_MAX_WAIT_MS + SIGNIN_TIMEOUT_MS, and at least a renewal's
       # worst wait: RESIDENT_STREAM_WAIT_MS + RESIDENT_LOAD_MAX_WAIT_MS + 2 x RESIDENT_LOAD_MIN_INTERVAL_MS
       # + 25000 (the calls in flight, the token settling after the reload) + the reload itself: about 200000 by default.
       - SIGNIN_WORKER_TIMEOUT_MS=${SIGNIN_WORKER_TIMEOUT_MS:-240000}

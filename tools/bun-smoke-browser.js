@@ -555,11 +555,15 @@ async function run({ startApplication, stopApplication, disposeApplication, bina
         // 2. The first chats/new is refused as a session: reload, retry, and the answer through the relay.
         worker.state.chatsNew.push('refused')
         const first = await whole(await chat(false))
-        // What the binary did on 2026-11-24, said by itself: the recovery failed inside it (MODULE_NOT_FOUND).
-        assert.ok(!log().includes('MODULE_NOT_FOUND'), `a session recovery failed in the application:\n${evidence(application.logs)}`)
         assert.equal(first.status, 200, `${first.text}\n${evidence(application.logs)}`)
         assert.equal(JSON.parse(first.text).choices[0].message.content, ANSWER, first.text)
-        await wait(() => (log().match(/v2 会话已续期/g) || []).length === 1, 'the log does not say the session was renewed')
+        // The application's last lines of a request can reach this pipe after its response reached the
+        // client (the Windows runner of CI — step 12). Before the log is asked what it does NOT say,
+        // it is waited for to say how the recovery ended.
+        await wait(() => (log().match(/v2 会话已续期/g) || []).length === 1 || log().includes('MODULE_NOT_FOUND'),
+            'the log does not say the session was renewed')
+        // What the binary did on 2026-11-24, said by itself: the recovery failed inside it (MODULE_NOT_FOUND).
+        assert.ok(!log().includes('MODULE_NOT_FOUND'), `a session recovery failed in the application:\n${evidence(application.logs)}`)
         assert.deepEqual(worker.routes(), ['/session', '/egress', '/renew', '/egress', '/egress'])
         assert.deepEqual(worker.to('/renew')[0], { email: EMAIL, proxy: null, force: true }, 'a refused session is a forced reload')
         // What the page is asked for: the application builds it on QWEN_CHAT_PROXY_URL, which is the
@@ -614,8 +618,11 @@ async function run({ startApplication, stopApplication, disposeApplication, bina
         assert.deepEqual(worker.routes().slice(callsBeforeFailure), ['/egress', '/egress', '/egress'],
             'one chats/new, the relay that failed, and one more completions call')
         assert.ok(!retried.text.includes('In-page fetch failed'), 'the relay\'s failure is not the client\'s answer')
-        // What the application made of it: a timed-out transport, worth one more try.
-        assert.match(log(), /聊天请求传输错误 \(尝试 1\/2, code=ETIMEDOUT\): signin-worker egress: egress_timeout/)
+        // What the application made of it: a timed-out transport, worth one more try. Its last lines of a
+        // request can reach this pipe after its response reached the client (the Windows runner of CI —
+        // step 12): the log is waited for, not read at once.
+        await wait(() => /聊天请求传输错误 \(尝试 1\/2, code=ETIMEDOUT\): signin-worker egress: egress_timeout/.test(log()),
+            'the log does not say what the application made of the relay\'s failure')
         console.log('PASS: browser mode — a relay that fails is retried, and the client gets the answer')
 
         // What the worker was asked since `from`: the route — and for a call of the page, its method and address.
@@ -741,7 +748,9 @@ async function run({ startApplication, stopApplication, disposeApplication, bina
             'POST /api/v2/chat/completions (stream)'
         ], 'the chat, the token of the page, the parse — challenged once, asked once more after a reload — its status until done, the answer through the relay')
         assert.equal(worker.to('/renew').at(-1).force, true, 'a challenge page is a forced reload')
-        assert.match(log(), /v2 会话已续期 \([^)]*触发原因: upstream_waf_challenge\)/, 'the log does not say why the page was reloaded')
+        // Waited for like the lines of step 12: they can reach this pipe after the response reached the client.
+        await wait(() => /v2 会话已续期 \([^)]*触发原因: upstream_waf_challenge\)/.test(log()),
+            'the log does not say why the page was reloaded')
         // The bytes went to the storage the answer named — straight from the application, signed as
         // the page signs (Qwen2API-3ue.12): V4, in the region of the answer. The context is the one
         // the application builds for a request with tools: the prompt, under the protocol's own head.
