@@ -18,7 +18,7 @@ jobs:
     outputs:
       binaries: ${{ steps.plan.outputs.binaries }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: inputs.filter-builds
         continue-on-error: true
         with:
@@ -56,16 +56,19 @@ jobs:
     # The gate may consume 2 x 300s; leave time for installation and lint.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '24'
+          # package.json names bun in packageManager, and v5 caches on its own from that
+          # field: off, so that the step does what it did on v4.
+          package-manager-cache: false
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version-file: package.json
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: ~/.bun/install/cache
           key: bun-regression-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
@@ -83,25 +86,58 @@ jobs:
           TEST_GATE_TIMEOUT_MS: 300000
           TEST_GATE_ATTEMPTS: 2
 
+  worker-node20:
+    name: Sign-in worker on its production Node (20)
+    # The worker of prod is built FROM node:20-slim, while everything else here
+    # runs on Node 24: its own test files once on the Node it runs on in
+    # production (Qwen2API-25q). The gate script does not run on Node 20
+    # (--test-isolation needs Node 22) — one process per file instead, over the
+    # list tools/gate-image/run-worker-tests.js names, which sets the gate's
+    # environment itself. No count is compared: the number of tests these files
+    # generate varies with the Node version. A file gets WORKER_TESTS_TIMEOUT_MS,
+    # and the job is given room for every file to run to the end of it.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - uses: actions/cache@v5
+        with:
+          path: ~/.bun/install/cache
+          key: bun-node20-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
+      - run: bun install --frozen-lockfile
+      - name: Build the Node 20 image from the recipe in the repository
+        run: docker build -t qwen2api-gate-node20 -f tools/gate-image/Dockerfile.node20 tools/gate-image
+      - name: The Node the worker's tests are about to run on
+        run: docker run --rm qwen2api-gate-node20 node --version
+      - name: The worker's test files, one process per file, on Node 20
+        run: |
+          docker run --rm -v "$PWD:/work:ro" -w /work -e WORKER_TESTS_TIMEOUT_MS=150000 \
+            qwen2api-gate-node20 node tools/gate-image/run-worker-tests.js
+
   frontend:
     needs: changes
     if: needs.changes.outputs.binaries == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version-file: package.json
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: ~/.bun/install/cache
           key: bun-frontend-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('public/bun.lock') }}
       - run: bun install --cwd public --frozen-lockfile
       - run: bun run build:frontend
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: frontend-dist
           path: public/dist/
@@ -109,7 +145,9 @@ jobs:
           retention-days: 7
 
   binaries:
-    needs: [regression, frontend]
+    # The worker's tests on the Node of prod come first too: nothing is built
+    # around a worker that failed there.
+    needs: [regression, frontend, worker-node20]
     name: Binary and container (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
@@ -130,17 +168,17 @@ jobs:
             docker_arch: ''
             extension: .exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version-file: package.json
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: ~/.bun/install/cache
           key: bun-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: frontend-dist
           path: public/dist
@@ -154,7 +192,7 @@ jobs:
         run: bun run test:bun --binary pkg_dist/qwen2api-${{ matrix.platform }}${{ matrix.extension }}
       - name: Package executable and checksum
         run: bun --no-env-file tools/package-binary.mjs --platform ${{ matrix.platform }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: binary-${{ matrix.platform }}
           path: pkg_dist/releases/*
@@ -164,11 +202,11 @@ jobs:
       - name: Compile Debian (glibc) executable
         if: runner.os == 'Linux'
         run: bun --no-env-file tools/build-binary.mjs --target bun-${{ matrix.platform }} --outfile pkg_dist/docker/${{ matrix.docker_arch }}/qwen2api
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
         if: runner.os == 'Linux'
       - name: Build container from the compiled executable
         if: runner.os == 'Linux'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
@@ -188,7 +226,7 @@ jobs:
       - name: Export the tested image without rebuilding it
         if: runner.os == 'Linux'
         run: docker save --output pkg_dist/docker-image-${{ matrix.docker_arch }}.tar qwen2api:ci-${{ matrix.docker_arch }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: runner.os == 'Linux'
         with:
           name: docker-image-${{ matrix.docker_arch }}

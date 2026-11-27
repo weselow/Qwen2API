@@ -1,7 +1,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 
-const { parseSummary, sumSummaries, evaluate, formatVerdict, computeBlessed, PER_FILE_SUM } = require('../tools/test-gate.js')
+const { parseSummary, sumSummaries, evaluate, formatVerdict, blessAborted, computeBlessed, PER_FILE_SUM } = require('../tools/test-gate.js')
 
 const SPEC_TAIL = [
   '✔ some passing test (1.2ms)',
@@ -241,6 +241,31 @@ test('DEFECT 2: computeBlessed cannot be handed a baseline to be floored by', ()
 
 test('DEFECT 2: blessing zero attempts is refused rather than writing garbage', () => {
   assert.throws(() => computeBlessed([]), /attempt/i)
+})
+
+/* ---------------------------------------------------------------------------
+ * Qwen2API-288 — `--bless` stopped on an unclean attempt with a line about the
+ * run alone. Nothing said that tests/expected-counts.json had not been
+ * touched, and the old file, copied out by the usual recipe, passed for a new
+ * one.
+ * ------------------------------------------------------------------------- */
+
+test('bless says outright that an unclean attempt left the baseline file untouched', () => {
+  // What bless hands an attempt: the -1 baseline, so only genuine health problems refuse.
+  const failing = evaluate({ summary: skewed({ tests: 900, pass: 897, fail: 3 }), exitCode: 1, expected: { tests: -1, suites: -1 } })
+  assert.equal(failing.reason, 'TEST_FAILURES')
+  const text = blessAborted(failing, { tests: 972, suites: 122 })
+  assert.match(text, /BLESS ABORTED \[TEST_FAILURES\]: tests\/expected-counts\.json was NOT updated/)
+  assert.match(text, /3 test\(s\) failed/)
+  assert.match(text, /left as it was \(972 tests \/ 122 suites\)/)
+  assert.doesNotMatch(text, /\bPASS\b/)
+})
+
+test('bless names the reason of every unclean attempt and what is on disk when there is no baseline', () => {
+  const hung = evaluate({ summary: null, exitCode: null, expected: { tests: -1, suites: -1 }, timedOut: true })
+  assert.equal(hung.reason, 'TIMEOUT')
+  assert.match(blessAborted(hung, null), /BLESS ABORTED \[TIMEOUT\]: tests\/expected-counts\.json was NOT updated/)
+  assert.match(blessAborted(hung, null), /left as it was \(no readable baseline file\)/)
 })
 
 /* ---------------------------------------------------------------------------

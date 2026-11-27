@@ -50,6 +50,9 @@ const path = require('node:path')
 const ROOT = path.resolve(__dirname, '..')
 const TESTS_DIR = path.join(ROOT, 'tests')
 const BASELINE_FILE = path.join(TESTS_DIR, 'expected-counts.json')
+// The same path as the repository spells it, for messages: on Windows the
+// joined one comes out with backslashes.
+const BASELINE_NAME = 'tests/expected-counts.json'
 
 const SUMMARY_KEYS = ['tests', 'suites', 'pass', 'fail', 'cancelled', 'skipped', 'todo']
 
@@ -190,6 +193,21 @@ function computeBlessed (attempts) {
 
 const BAR = '='.repeat(72)
 
+/**
+ * What bless says when an attempt was not clean. It says outright that the
+ * baseline file was not touched: bless used to stop with a line about the run
+ * alone, and the old file, copied out by the usual recipe, passed for a new
+ * one (Qwen2API-288).
+ * @param {ReturnType<typeof evaluate>} health the attempt's verdict
+ * @param {{tests:number,suites:number}|null} baseline what is on disk right now
+ */
+function blessAborted (health, baseline) {
+  const onDisk = baseline ? `${baseline.tests} tests / ${baseline.suites} suites` : 'no readable baseline file'
+  return `${BAR}\nBLESS ABORTED [${health.reason}]: ${BASELINE_NAME} was NOT updated.\n` +
+    `The attempt was not clean, so nothing is blessed: ${health.message}\n` +
+    `The baseline on disk is left as it was (${onDisk}). Fix the run, then bless again.\n${BAR}`
+}
+
 function formatVerdict (v) {
   if (v.ok) return `${BAR}\nTEST GATE: PASS — ${v.message}\n${BAR}`
   return `${BAR}\nTEST GATE: FAIL [${v.reason}]\n${v.message}\n${BAR}`
@@ -313,7 +331,7 @@ async function main () {
 
   if (!expected && !bless) {
     console.error(`${BAR}\nTEST GATE: FAIL [NO_BASELINE]\n` +
-      `${BASELINE_FILE} is missing or malformed. Create it with: npm run test:bless\n${BAR}`)
+      `${BASELINE_NAME} is missing or malformed. Create it with: npm run test:bless\n${BAR}`)
     process.exit(7)
   }
 
@@ -330,8 +348,7 @@ async function main () {
     if (bless) {
       const health = evaluate({ summary, exitCode, expected: NO_BASELINE, timedOut })
       if (!health.ok && health.reason !== 'BASELINE_STALE') {
-        console.error(`${BAR}\nREFUSING TO BLESS [${health.reason}]: the run was not clean.\n` +
-          `${health.message}\n${BAR}`)
+        console.error(blessAborted(health, expected))
         process.exit(1)
       }
       blessAttempts.push({ tests: summary.tests, suites: summary.suites })
@@ -387,7 +404,7 @@ async function main () {
   process.exit(last.code)
 }
 
-module.exports = { parseSummary, sumSummaries, evaluate, formatVerdict, computeBlessed, PER_FILE_SUM }
+module.exports = { parseSummary, sumSummaries, evaluate, formatVerdict, blessAborted, computeBlessed, PER_FILE_SUM }
 
 if (require.main === module) {
   main().catch((err) => {

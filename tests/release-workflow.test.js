@@ -149,7 +149,23 @@ test('build filtering is opt-in for CI and preserves all Release checks', () => 
   assert.equal(verification.jobs.frontend.if, "needs.changes.outputs.binaries == 'true'")
 })
 
+// The one test here that needs git makes a scratch repository. Where there is
+// none — a bare node image without the gate recipe's git
+// (tools/gate-image/Dockerfile) — it says so and skips itself; the gate then
+// counts the skipped test and fails NOT_ALL_RAN: a missing tool must not pass
+// for a passed test (Qwen2API-288).
+const hasGit = () => {
+  try {
+    execFileSync('git', ['--version'], { stdio: 'ignore' })
+    return true
+  } catch { return false }
+}
+
 test('build detection uses the event diff and defaults to building if the diff is unavailable', t => {
+  if (!hasGit()) {
+    t.diagnostic('SKIP: git is not installed, and this test makes a scratch repository. Build it into the image (tools/gate-image/Dockerfile).')
+    return t.skip('git is not installed')
+  }
   const plan = readWorkflow('verify.yml').jobs.changes.steps.find(step => step.id === 'plan')
   assert.deepEqual(plan.env, {
     FILTER_BUILDS: '${{ inputs.filter-builds }}',
@@ -228,7 +244,8 @@ test('build detection uses the event diff and defaults to building if the diff i
 
 test('native executables and Alpine images are tested before artifact export', () => {
   const binaries = readWorkflow('verify.yml').jobs.binaries
-  assert.deepEqual(binaries.needs, ['regression', 'frontend'])
+  // After the gate, and after the worker's tests on the Node of its production image (Qwen2API-25q).
+  assert.deepEqual(binaries.needs, ['regression', 'frontend', 'worker-node20'])
   assert.deepEqual(binaries.strategy.matrix.include.map(entry => entry.platform), ['linux-x64', 'linux-arm64', 'windows-x64'])
   assert.equal(binaries.strategy.matrix.include.find(entry => entry.platform === 'linux-arm64').runner, 'ubuntu-24.04-arm')
   const steps = binaries.steps
