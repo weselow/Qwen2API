@@ -210,6 +210,16 @@ function startStandIn() {
                 'access-control-allow-credentials': 'true',
                 'content-type': 'application/json'
             }
+            // The page names itself in x-request-origin — the interceptor sets it on what goes to
+            // /auths/* (main.js of 0.3.50–0.3.54). Without it the refresh is refused as qwen.ai
+            // refused the worker's own on 2026-11-27: under a 200, with the code Bad_Request.
+            // `auth.refresh = 'bad_request'` gets the same answer for a request that does name
+            // the page, to see the worker say the refusal.
+            const pageOrigin = `http://127.0.0.1:${server.address().port}`
+            if (req.headers['x-request-origin'] !== pageOrigin || auth.refresh === 'bad_request') {
+                res.writeHead(200, allowed)
+                return res.end(JSON.stringify({ success: false, code: 'Bad_Request' }))
+            }
             // qwen.ai refusing the session: as the front end is refused, under 401.
             if (auth.refresh === 'refused') {
                 res.writeHead(401, allowed)
@@ -877,11 +887,14 @@ async function main() {
         // ...and the page's request hook signed it as one of the page's own.
         assert.equal(refresh.headers['x-stub-v'], '2.5.37')
         // No Bearer — the front end's interceptor sets none for /auths/refresh —
-        // no Content-Type, which axios drops from a request without a body, and
-        // no origin, which the front end sets for everything but /auths/*.
-        for (const name of ['authorization', 'content-type', 'x-request-origin']) {
+        // and no Content-Type, which axios drops from a request without a body.
+        // The page names itself in x-request-origin: the interceptor sets it on
+        // what goes to /auths/* (and three other auth paths), on nothing else
+        // (main.js of 0.3.50–0.3.54).
+        for (const name of ['authorization', 'content-type']) {
             assert.equal(refresh.headers[name], undefined, `${name} was sent`)
         }
+        assert.equal(refresh.headers['x-request-origin'], standIn.origin, tokenLines.join('\n'))
         assert.equal(refresh.headers.accept, 'application/json')
         assert.equal(refresh.headers['accept-language'], 'en-US,en;q=0.9')
         assert.equal(refresh.headers.source, 'web')
@@ -916,13 +929,28 @@ async function main() {
         assert.equal(JSON.parse(unrenewed.body.body).authorization, `Bearer ${standIn.state.pageToken}`)
         assert.ok(unrenewedLines.some(line => /token-refresh failed \(refused, status 401, code unauthorized, \d+ ms\)$/.test(line)), unrenewedLines.join('\n'))
         console.log('ok page token refused: the call went out all the same, on the token the page had')
+
+        // Refused the way qwen.ai refused the worker's own refresh on 2026-11-27 — under a 200,
+        // with Bad_Request: said so on the worker's line, and the call goes out all the same.
+        standIn.state.tokenSeconds = 60
+        assert.equal((await call('/renew', { email, force: true })).status, 200)
+        standIn.auth.refresh = 'bad_request'
+        const { answer: badRequest, lines: badRequestLines } = await logged(async lines => ({
+            lines, answer: await egress({ headers: { 'content-type': 'application/json' } })
+        }))
+        assert.equal(badRequest.status, 200, JSON.stringify(badRequest.body))
+        assert.equal(standIn.auth.asked.length, 3)
+        assert.equal(standIn.auth.asked[2].headers['x-request-origin'], standIn.origin)
+        assert.equal(JSON.parse(badRequest.body.body).authorization, `Bearer ${standIn.state.pageToken}`)
+        assert.ok(badRequestLines.some(line => /token-refresh failed \(refused, status 200, code Bad_Request, \d+ ms\)$/.test(line)), badRequestLines.join('\n'))
+        console.log('ok page token refused under a 200 with Bad_Request (as on 2026-11-27): said so, and the call went out all the same')
         standIn.auth.refresh = 'ok'
 
         // A token with its margin left is left alone: no refresh call.
         standIn.state.tokenSeconds = 3600
         assert.equal((await call('/renew', { email, force: true })).status, 200)
         assert.equal((await egress({ headers: { 'content-type': 'application/json' } })).status, 200)
-        assert.equal(standIn.auth.asked.length, 2, 'a token with its margin left was renewed')
+        assert.equal(standIn.auth.asked.length, 3, 'a token with its margin left was renewed')
         console.log('ok page token young: not renewed')
 
         // A clean stop closes the browser, which flushes the profile.
