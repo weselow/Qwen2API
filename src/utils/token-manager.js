@@ -32,6 +32,9 @@ class TokenManager {
      * @param {string} email - 邮箱
      * @param {string} password - 密码
      * @param {Object} [account] - 账户对象（用于解析账号级代理；为空时回退到全局 PROXY_URL）
+     * @param {Object} [options]
+     * @param {boolean} [options.allowCreate] - The sign-in adds the account: in browser
+     *   mode its session is stored for an account added again too, before its record is (Qwen2API-jwh)
      * @returns {Promise<string|null>} 令牌或null
      */
     async login(email, password, account, options = {}) {
@@ -39,7 +42,7 @@ class TokenManager {
         // signin worker signs in inside real Chromium and hands back the jar.
         if (v2sessions.browser) {
             try {
-                return await this.loginBrowserSession(email, password, account)
+                return await this.loginBrowserSession(email, password, account, options)
             } catch (error) {
                 const failure = error instanceof SigninError ? error : SigninError.fromError(error)
                 logger.error(`Qwen signin: ${failure.code} (upstream HTTP ${failure.upstreamStatus ?? 'none'})`, 'AUTH')
@@ -89,18 +92,22 @@ class TokenManager {
 
     /**
      * Browser-режим: вход через signin-worker и сохранение сессии (token + jar).
+     * @param {Object} [options] - As login(): `allowCreate` is the sign-in that adds an account
      * @returns {Promise<string>} 令牌
      */
-    async loginBrowserSession(email, password, account) {
+    async loginBrowserSession(email, password, account, options = {}) {
         const harvested = await signinWorker.acquireSession(email, password, account)
         const decoded = this.validateToken(harvested.token)
         if (!decoded) throw new SigninError('signin_upstream_error', 502, 'Signin worker returned an invalid token.')
         // publishSession = setSession + 持久化（jik.4）：重启后无需重新登录
+        // An account added again publishes before its new record is saved, while
+        // storage still refuses the removed one's sessions: the sign-in's own is
+        // taken (Qwen2API-jwh).
         await sessionPersistence.publishSession(email, {
             token: harvested.token,
             expiresAt: decoded.exp,
             jar: harvested.jar
-        })
+        }, { allowCreate: options.allowCreate === true })
         // 不记录令牌本身：日志可能落盘或被采集，令牌可直接冒充该账户
         logger.success(`${email} 登录成功`, 'AUTH')
         return harvested.token
@@ -204,6 +211,13 @@ class TokenManager {
      * (sessionLost) откатывается на полный вход с паролем.
      */
     async refreshBrowserSession(account, options = {}) {
+        // Taken before the worker is asked, as refreshLabSession takes it: a
+        // session published while the worker was out (a recovery, a sign-in)
+        // is not displaced in the store by what this ends with — which may be
+        // the worker's cached, refused token still (Qwen2API-cke). The record
+        // takes this token all the same; the recovery's adoption, in the account's
+        // queue behind this one, puts its own back (account.js#adoptSessionToken).
+        const previous = v2sessions.sessions.get(account.email)
         try {
             let harvested
             try {
@@ -215,7 +229,6 @@ class TokenManager {
             const decoded = this.validateToken(harvested.token)
             if (!decoded) throw new SigninError('signin_upstream_error', 502, 'Signin worker returned an invalid token.')
             const next = { token: harvested.token, expiresAt: decoded.exp, jar: harvested.jar }
-            const previous = v2sessions.sessions.get(account.email)
             const publish = () => {
                 const current = v2sessions.sessions.get(account.email)
                 // publishSession 同时写 store 与持久层（jik.4）；

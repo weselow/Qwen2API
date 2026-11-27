@@ -716,7 +716,7 @@ test('a streaming /egress relays the answer as it arrives: the head, every chunk
     ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell',
     // Reported where a flip is verified, as the headless mode is (Qwen2API-xun, Qwen2API-nch); the queue of page loads is off in these tests.
     pageTokenRefresh: true, streamWaitMs: 20000, loadMinIntervalMs: 1, loadMaxWaitMs: 120000,
-    pageLoadQueue: { waiting: 0, nextInMs: 0 }, forgetDeletesProfile: false
+    pageLoadQueue: { waiting: 0, nextInMs: 0 }, forgetDeletesProfile: false, forgetGraceMs: 120000
   })
 })
 

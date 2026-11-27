@@ -279,7 +279,7 @@ test('egress opens a resident page on first use and runs the call from inside it
     ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell',
     // Reported where a flip is verified, as the headless mode is (Qwen2API-xun, Qwen2API-nch); the queue of page loads is off in these tests.
     pageTokenRefresh: true, streamWaitMs: 20000, loadMinIntervalMs: 1, loadMaxWaitMs: 120000,
-    pageLoadQueue: { waiting: 0, nextInMs: 0 }, forgetDeletesProfile: false
+    pageLoadQueue: { waiting: 0, nextInMs: 0 }, forgetDeletesProfile: false, forgetGraceMs: 120000
   })
 
   // Opening the page IS a renewal: the session cache holds what it settled on.
@@ -1134,7 +1134,7 @@ test('an explicit invalidation (/renew with force) is answered live although the
     ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell',
     // Reported where a flip is verified, as the headless mode is (Qwen2API-xun, Qwen2API-nch); the queue of page loads is off in these tests.
     pageTokenRefresh: true, streamWaitMs: 20000, loadMinIntervalMs: 1, loadMaxWaitMs: 120000,
-    pageLoadQueue: { waiting: 0, nextInMs: 0 }, forgetDeletesProfile: false
+    pageLoadQueue: { waiting: 0, nextInMs: 0 }, forgetDeletesProfile: false, forgetGraceMs: 120000
   })
 
   // Another explicit invalidation is another reload; an explicit false is a plain renew.

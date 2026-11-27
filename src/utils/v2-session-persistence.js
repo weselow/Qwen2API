@@ -137,12 +137,16 @@ async function restoreSessions() {
  * it immediately), then persistence. Never throws — callers may fire and
  * forget; a persist failure costs a re-signin after the next restart, not
  * this request.
+ * @param {Object} [options]
+ * @param {boolean} [options.allowCreate] - The session is the sign-in's that
+ *   adds an account: storage takes it for an account removed and not added
+ *   again yet, whose other sessions it still refuses (Qwen2API-jwh)
  * @returns {Promise<boolean>} whether the session reached storage
  */
-async function publishSession(email, session) {
+async function publishSession(email, session, { allowCreate = false } = {}) {
     if (!store.browser || !email || !session) return false
     store.setSession(email, session)
-    const saved = await persistence.saveV2Session(email, serializeSession(session))
+    const saved = await persistence.saveV2Session(email, serializeSession(session), { allowCreate })
     if (!saved) {
         logger.warn(`v2 会话持久化失败 (${email})——重启后需重新登录`, 'V2SESSION')
     }
@@ -206,8 +210,8 @@ async function relogin(email, account) {
  * @param {Object} [account]
  * @param {*} reason - What the upstream said; a WAF challenge never earns a sign-in
  * @param {Object} [refused] - The session that was refused, if it is still in
- *   the store. A different one published meanwhile (a login, the periodic
- *   refresh) is newer and is not displaced.
+ *   the store. A session published meanwhile with a token of its own (a
+ *   login, the periodic refresh) is newer and is not displaced.
  * @returns {Promise<Object|null>} the published session, or null
  */
 async function renew(email, account, reason, refused) {
@@ -240,9 +244,13 @@ async function renew(email, account, reason, refused) {
             throw new Error('renewed token has no live expiry')
         }
         // Пока шло продление, кто-то мог опубликовать более свежую сессию
-        // (вход или авто-refresh) — существующую не вытесняем.
+        // (вход или авто-refresh) — сессию с другим токеном не вытесняем. Said by the
+        // token, not by the object: the periodic refresh publishes what the
+        // worker still holds as a new object, and while a sign-in is out that
+        // is the refused token still — dropping the sign-in's result for it
+        // spent a password sign-in for nothing (Qwen2API-cke).
         const current = store.sessions.get(email)
-        if (current && current !== refused) {
+        if (current && current.token !== refused?.token) {
             logger.info(`v2 会话续期完成但已有更新会话 (${email})，丢弃续期结果`, 'V2SESSION')
             return null
         }
