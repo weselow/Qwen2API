@@ -655,7 +655,7 @@ const flattenAnthropicMessages = (messages) => {
  * @param {Object} anthropicReq - Anthropic 风格请求体
  * @returns {Promise<{body: Object, hasTools: boolean, toolChoice: any, allowedToolNames: string[], enable_thinking: boolean, model: string}>} 转换结果
  */
-const buildInternalRequest = async (anthropicReq) => {
+const buildInternalRequest = async (anthropicReq, client = null) => {
   const { messages, system, tools, tool_choice, stream, thinking } = anthropicReq;
   // 先做 MODEL_MAP 映射，再判定 thinking / chat_type：目标 id 的 -thinking 后缀要照常生效
   const model = await mapIncomingModel(anthropicReq.model);
@@ -809,11 +809,12 @@ const buildInternalRequest = async (anthropicReq) => {
   const enable_thinking = !!(thinking && thinking.type === 'enabled');
   const thinkingCfg = await isThinkingEnabled(model, enable_thinking, thinking?.budget_tokens);
   const chatType = isChatType(model);
-  // The account this request is made on, taken once for all of it (Qwen2API-fjk): a picture
-  // is uploaded from its page, and the chat is made on it too. Nothing is taken for a
-  // request that uploads nothing.
-  const uploadAccount = oneAccountForRequest();
-  const parsedMessages = await parserMessages(flat, thinkingCfg, chatType, uploadAccount.get);
+   // The account this request is made on, taken once for all of it (Qwen2API-fjk): a picture
+   // is uploaded from its page, and the chat is made on it too. Nothing is taken for a
+   // request that uploads nothing.
+   // `client`: a client that goes away takes the upload of its pictures with it (Qwen2API-4l1).
+   const uploadAccount = oneAccountForRequest();
+   const parsedMessages = await parserMessages(flat, thinkingCfg, chatType, uploadAccount.get, client);
   const parsedModel = await parserModel(model);
 
   // 4. 合并 system 文本与工具提示词到最终用户消息开头
@@ -1753,6 +1754,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
           });
         });
       } catch (retryError) {
+        // The client went away and its request was ended for it: nothing failed (Qwen2API-4l1).
+        if (isClientGone(retryError)) throw retryError;
         logger.error('Anthropic 流式 failover 重试失败', 'ANTHROPIC', '', retryError);
         const failure = retryError.publicMessage ? retryError : e;
         if (!isWafChallengeError(failure) && !isRateLimitError(failure)) ensureMessageStart();
@@ -1946,6 +1949,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
         );
       });
     } catch (e) {
+      // The client went away and its request was ended for it: nothing failed (Qwen2API-4l1).
+      if (isClientGone(e)) throw e;
       logger.error('Anthropic 流式重试失败', 'ANTHROPIC', '', e);
       if (e.publicMessage) throw e;
       break;
@@ -2489,6 +2494,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
         upstreamOptions
       );
     } catch (e) {
+      // The client went away and its request was ended for it: nothing failed (Qwen2API-4l1).
+      if (isClientGone(e)) throw e;
       logger.error('Anthropic 非流式重试失败', 'ANTHROPIC', '', e);
       if (e.publicMessage) throw e;
       break;
@@ -2739,7 +2746,7 @@ const handleAnthropicMessages = async (req, res) => {
       );
     }
 
-    const built = await buildInternalRequest(req.body || {});
+    const built = await buildInternalRequest(req.body || {}, client);
     const { body, hasTools, historyToolCalls, toolChoice, allowedToolNames, toolSchemas, model } = built;
     contextPrefixKey = built.contextPrefixKey || null;
 
@@ -2748,7 +2755,10 @@ const handleAnthropicMessages = async (req, res) => {
     // Las MISMAS opciones viajan en los reenvios de correccion (ctx.upstreamOptions): con
     // la clave de sesion el reintento reutiliza el prefijo de historial ya subido en vez
     // de subir y parsear el historial entero otra vez (hasta 3 parses por turno HTTP).
-    const upstreamOptions = { allowContextCompaction: !hasTools, contextPrefixKey };
+    // `client`: a client that goes away ends the chat's creation and the attachment of a
+    // context too, before the completions call — on every send of the request: the turns
+    // of its agent and its retries take these same options (Qwen2API-4l1).
+    const upstreamOptions = { allowContextCompaction: !hasTools, contextPrefixKey, client };
     // One request as the client made it: the first, and the whole retry after it — the same body and the
     // same options again (Qwen2API-jk9).
     // The request's pictures were uploaded from this account's page: its chat is made on
