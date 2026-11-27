@@ -9,12 +9,13 @@ const { spawn, spawnSync } = require('node:child_process')
 const { randomUUID } = require('node:crypto')
 const { createServer } = require('node:http')
 const { constants } = require('node:fs')
-const { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } = require('node:fs/promises')
+const { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, stat, writeFile } = require('node:fs/promises')
 const { tmpdir } = require('node:os')
 const path = require('node:path')
 const { parseArgs } = require('node:util')
 const { setTimeout: delay } = require('node:timers/promises')
 const { countTokens } = require('../src/utils/precise-tokenizer')
+const { discardTemporaryDirectory } = require('./remove-directory')
 
 const API_KEY = 'bun-smoke-key'
 const MODEL = 'qwen-smoke-test'
@@ -480,7 +481,8 @@ async function main() {
   } finally {
     if (application) await disposeApplication(application)
     await closeListener(upstreamServer)
-    await rm(temporaryDirectory, { recursive: true, force: true })
+    // Not a check: a directory Windows still holds is left, and said — not failed over (Qwen2API-3ue.13).
+    await discardTemporaryDirectory(temporaryDirectory)
   }
 
   // Then the application as prod runs it (Qwen2API-3ue.7): browser sessions and

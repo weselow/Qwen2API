@@ -6,7 +6,9 @@
  *
  *   POST /session {email, password, proxy?, force?} -> {token, expiresAt, cookies[]}
  *   POST /renew   {email, proxy?, force?}   -> {token, expiresAt, cookies[]}
- *   GET  /health                             -> {ok, sessions, residentPages, headlessMode}
+ *   GET  /health                             -> {ok, sessions, residentPages, headlessMode,
+ *                                                pageTokenRefresh, streamWaitMs, loadMinIntervalMs,
+ *                                                loadMaxWaitMs, pageLoadQueue}
  *
  * One persistent context (userDataDir) per account on the SIGNIN_DATA_DIR
  * volume: auth cookies survive restarts and renewal is a silent reload.
@@ -35,10 +37,42 @@
  * one JSON event per line while qwen.ai's answer arrives, and the app cutting
  * its connection cuts the request inside the page (relayEgress).
  *
+ * Since Qwen2API-2l0 the app says when it drops an account, and the worker
+ * drops it too — the cached session with its silent-renew timer, and the
+ * resident page:
+ *
+ *   POST /forget  {email}                 -> {ok, session, page, profile[, pending]}
+ *
+ * The profile stays unless SIGNIN_FORGET_DELETES_PROFILE is set; `pending`
+ * names a sign-in or renewal the route gave up waiting for (handleForget).
+ *
  * qwen.ai's status and body always travel inside a 200: a WAF challenge page
  * too, under whatever status it came. The worker names it in its log (and
  * hands it on whether the page's scripts did or kept it back,
  * Qwen2API-3ue.6); what it means is the app's to say.
+ *
+ * Since Qwen2API-0c6 (2026-11-26) the log says more of a whole answer than
+ * its status: a refusal qwen.ai puts in the body of a 200 by its code, and an
+ * answer that is no 2xx by its code, its headers and the start of its body
+ * (egress-fetch.js#answerNote) — none that could hold a credential.
+ *
+ * Since Qwen2API-nch, Qwen2API-ops and Qwen2API-xun (2026-11-26), for many
+ * accounts:
+ *
+ *   - the page loads of every account — a lazy open, a renewal — take turns
+ *     in one queue (lib/page-load-queue.js), so that a burst of openings after
+ *     a restart, or of renewals in one tick of the app's timer, is not a burst
+ *     of page loads from one address; a sign-in does not wait in that queue
+ *     (the login pacer spaces sign-ins), it only tells it when it begins;
+ *   - a navigation on a live page waits first for the streams running on it
+ *     (RESIDENT_STREAM_WAIT_MS), which a reload cuts otherwise;
+ *   - a page's token is renewed in place before a call that finds it nearly
+ *     spent — the front end's own refresh call, no reload (SIGNIN_PAGE_TOKEN_REFRESH).
+ *
+ *   token-refresh ok (…), token-refresh failed (…)          the page's token, renewed in place
+ *   resident-wait ended (…), resident-wait N still running (…)   what a navigation waited for
+ *   page-load waited (…[, a long line packed])             how long a load waited for its turn
+ *   renew no reload (…)                                      a renewal answered by a session that turned live meanwhile
  *
  * Design: docs/browser-egress-design.md.
  */
@@ -47,18 +81,28 @@ const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const { WorkerError, STATUS_FOR_CODE } = require('./lib/worker-errors')
-const { normalizeEgress } = require('./lib/egress-fetch')
+const { normalizeEgress, answerNote } = require('./lib/egress-fetch')
 const { createResidents } = require('./lib/resident-pages')
 const { createLoginPacer } = require('./lib/login-pacer')
+const { createPageLoadQueue } = require('./lib/page-load-queue')
 const { parseHeadlessMode } = require('./lib/browser-identity')
 
 const envInt = (name, fallback) => {
     const raw = parseInt(process.env[name], 10)
     return Number.isFinite(raw) && raw > 0 ? raw : fallback
 }
+// Like envInt, where 0 is a value of its own and not "unset".
+const envCount = (name, fallback) => {
+    const raw = parseInt(process.env[name], 10)
+    return Number.isFinite(raw) && raw >= 0 ? raw : fallback
+}
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 const REQUEST_BODY_LIMIT = 131072
+// How many times /forget waits for a sign-in or renewal that started for the
+// account while it was already at work (handleForget). A bound: requests that
+// keep coming for a removed account must not keep /forget here forever.
+const FORGET_ROUNDS = 5
 
 /**
  * Write one event of a relay, and say when the app has taken it: at once, or
@@ -137,7 +181,49 @@ function createServer(overrides = {}) {
         drainMs: overrides.drainMs ?? 5000,
         backstopMs: overrides.backstopMs ?? 5000,
         closeMs: overrides.closeMs ?? 5000,
-        shutdownMs: overrides.shutdownMs ?? 8000
+        shutdownMs: overrides.shutdownMs ?? 8000,
+        // The page's token is renewed in place before a call that finds it
+        // nearly spent (Qwen2API-xun): by the front end's own refresh call to
+        // the auth host, not by a reload of the page. Off — and a refused call
+        // is the app's recovery's alone, as before: a reload, a retry.
+        pageTokenRefresh: overrides.pageTokenRefresh ?? process.env.SIGNIN_PAGE_TOKEN_REFRESH !== 'false',
+        authOrigin: overrides.authOrigin || process.env.SIGNIN_AUTH_ORIGIN || 'https://auth.qwen.ai',
+        // The front end's own margin: a token with less than this left is renewed.
+        tokenRefreshMarginMs: overrides.tokenRefreshMarginMs ?? 180000,
+        tokenRefreshTimeoutMs: overrides.tokenRefreshTimeoutMs ?? 10000,
+        // After a refresh that failed, none is tried for this long.
+        tokenRetryMs: overrides.tokenRetryMs ?? 30000,
+        // What was read of a page's token stands this long at most before it is read again.
+        tokenReadAgainMs: overrides.tokenReadAgainMs ?? 60000,
+        // After a refresh that did not get through (the auth host not
+        // answering), no other page tries its own for this long.
+        tokenRefreshCircuitMs: overrides.tokenRefreshCircuitMs ?? 60000,
+        // Token refreshes of every page together are kept this far apart; 1 turns that off.
+        tokenRefreshMinIntervalMs: overrides.tokenRefreshMinIntervalMs ?? envInt('SIGNIN_TOKEN_REFRESH_MIN_INTERVAL_MS', 2000),
+        // A navigation on a live page waits this long for the streams running
+        // on it (Qwen2API-nch); 0 = it does not wait, and cuts them.
+        streamWaitMs: overrides.streamWaitMs ?? envCount('RESIDENT_STREAM_WAIT_MS', 20000),
+        // Every page load of every account starts at least this far from the
+        // previous one, plus up to the same again as jitter (Qwen2API-nch,
+        // Qwen2API-ops); 1 turns the queue off. Sign-ins are not in that line:
+        // the login pacer spaces them.
+        loadMinIntervalMs: overrides.loadMinIntervalMs ?? envInt('RESIDENT_LOAD_MIN_INTERVAL_MS', 10000),
+        // No page load waits longer than this for its turn; a longer line is
+        // packed closer instead. One exception: a sign-in that begins just
+        // before a load's turn holds it back by up to one interval more — one
+        // interval in all, however many begin. A renewal waits, inside the
+        // application's budget for /renew (SIGNIN_WORKER_TIMEOUT_MS), for the
+        // streams on its page (streamWaitMs), for the calls in flight
+        // (drainMs), then here, then for the reload and for the token to
+        // settle after it: this must leave all of them room.
+        // 0 = no limit.
+        loadMaxWaitMs: overrides.loadMaxWaitMs ?? envCount('RESIDENT_LOAD_MAX_WAIT_MS', 120000),
+        // Whether /forget deletes the account's browser profile as well
+        // (Qwen2API-2l0). Off, a profile kept lets an account added again
+        // skip the sign-in. Only an exact "true" turns it on.
+        forgetDeletesProfile: overrides.forgetDeletesProfile ?? process.env.SIGNIN_FORGET_DELETES_PROFILE === 'true',
+        // How many rounds /forget takes (handleForget); tests make it one.
+        forgetRounds: overrides.forgetRounds ?? FORGET_ROUNDS
     }
 
     fs.mkdirSync(config.dataDir, { recursive: true })
@@ -147,6 +233,11 @@ function createServer(overrides = {}) {
     // email -> the live renewal in flight; every caller of one moment shares
     // one page reload.
     const renewing = new Map()
+    // The accounts whose renewal in flight has a caller that insists on a live
+    // reload: for these the cache answers nothing, whoever started the renewal.
+    const insisting = new Set()
+    // Set when the worker begins to stop: no browser is launched for a request that lands after it.
+    let halting = false
     // Chromium locks a profile directory: serialize every launch per account.
     const locks = new Map()
     // email -> the full sign-in now running for it. A /session that lands on
@@ -160,6 +251,18 @@ function createServer(overrides = {}) {
     })
 
     const log = (event, extra) => console.log(`${new Date().toISOString()} ${event}${extra ? ' ' + extra : ''}`)
+    // Every page qwen.ai is asked to serve the worker, from whatever account,
+    // takes a turn (lib/page-load-queue.js): a burst of openings after a
+    // restart, or of renewals in one tick of the app's timer, would be a burst
+    // of page loads from one address. A sign-in does not wait in that line —
+    // the login pacer spaces sign-ins, and the application's budget for one
+    // accounts for that pacer alone — it only tells the queue when it begins.
+    // The pages' token refreshes take turns of their own, closer together —
+    // they are no page loads.
+    const pageLoads = createPageLoadQueue({ minIntervalMs: config.loadMinIntervalMs, maxWaitMs: config.loadMaxWaitMs, log })
+    // The refreshes take the queue's default limit of two minutes: with a gap of two to four
+    // seconds it would take more than sixty pages in one moment for a line to be packed.
+    const tokenRefreshes = createPageLoadQueue({ minIntervalMs: config.tokenRefreshMinIntervalMs })
     const profileDir = email => path.join(config.dataDir,
         'account-' + crypto.createHash('sha256').update(email).digest('hex').slice(0, 32))
     const now = () => Math.floor(Date.now() / 1000)
@@ -248,7 +351,18 @@ function createServer(overrides = {}) {
         closeMs: config.closeMs,
         log,
         onHarvest: remember,
-        onCookies: syncCookies
+        onCookies: syncCookies,
+        pageTokenRefresh: config.pageTokenRefresh,
+        authOrigin: config.authOrigin,
+        tokenRefreshMarginMs: config.tokenRefreshMarginMs,
+        tokenRefreshTimeoutMs: config.tokenRefreshTimeoutMs,
+        tokenRetryMs: config.tokenRetryMs,
+        tokenReadAgainMs: config.tokenReadAgainMs,
+        tokenRefreshCircuitMs: config.tokenRefreshCircuitMs,
+        streamWaitMs: config.streamWaitMs,
+        beforeTokenRefresh: tokenRefreshes.wait,
+        // A sign-in on a resident page tells the queue itself, when it begins (fullLogin).
+        beforeLoad: ({ turn } = {}) => (turn === false ? undefined : pageLoads.wait())
     })
 
     async function silentRenew(email) {
@@ -272,22 +386,47 @@ function createServer(overrides = {}) {
         if (!cached && !fs.existsSync(profileDir(email))) {
             throw new WorkerError('no_profile', 'No persisted profile for this account.')
         }
-        return withBrowserContext(email, effectiveProxy,
-            context => signer.renew(context, { chatOrigin: config.chatOrigin, timeoutMs: config.timeoutMs }))
+        // Asked once the account is this renewal's, before any turn is taken or page
+        // touched: the session may have turned live while it waited for the account's
+        // page — another load of it settled a fresh one. A renewal that stood in the
+        // line of page loads behind the page's own opening, for one, has nothing left
+        // to reload for: it answers that session, and loads no page. A caller whose
+        // session was refused gets its reload, whoever joined the renewal.
+        const outcome = await withBrowserContext(email, effectiveProxy,
+            async context => ({ reloaded: await signer.renew(context, { chatOrigin: config.chatOrigin, timeoutMs: config.timeoutMs }) }),
+            { unless: () => (insisting.has(email) ? undefined : fresh(email)) })
+        // The cache answered: its entry. Else what the reload harvested.
+        return outcome.reloaded ? outcome : { answered: outcome }
     }
 
-    async function withBrowserContext(email, proxy, operation) {
+    /**
+     * `turn` false: the operation is a sign-in, which does not wait in the
+     * line of page loads (lib/page-load-queue.js) — the login pacer spaces
+     * sign-ins — and tells the queue itself when it begins.
+     *
+     * `unless` is asked under the account's lock, before anything else: when it
+     * returns something other than undefined, that is the operation's answer, and
+     * no turn is taken and no page touched.
+     */
+    async function withBrowserContext(email, proxy, operation, { turn = true, unless } = {}) {
         return serialized(email, async () => {
+            // The worker is stopping: a request that reached it late launches and reloads nothing.
+            if (halting) throw new WorkerError('page_closed', 'The worker is shutting down.')
+            const instead = unless?.()
+            if (instead !== undefined) return instead
             // A resident page owns the profile directory (Chromium locks it):
             // sign-in and renewal run on that page instead of a second launch.
             // A null proxy means "whatever the account already uses".
             const resident = residents.get(email)
             const wanted = proxy ?? resident?.proxy ?? null
-            if (resident && resident.proxy === wanted) return residents.exclusive(resident, operation)
+            if (resident && resident.proxy === wanted) return residents.exclusive(resident, operation, { turn })
             if (resident) await residents.close(resident, 'proxy_changed')
             // The page may still be closing (crash, eviction): its browser
             // holds the profile lock until it is gone.
             await residents.whenClosed(email)
+            // No page to run on: one is opened for the operation. That is a
+            // page load, and waits for the worker's turn like every other.
+            if (turn) await pageLoads.wait()
             return withBrowser(email, proxy, operation)
         })
     }
@@ -325,8 +464,13 @@ function createServer(overrides = {}) {
             // renewal to have produced the session asked for here.
             if (!force && fresh(email)) return null
             await pacer.enter(slot)
+            // A sign-in is a page load too, but not one in line for a turn:
+            // the login pacer spaces sign-ins, and the app's budget for one
+            // accounts for it alone. The queue is told right here, as late as
+            // may be, so that what follows keeps a gap away from this load.
+            pageLoads.note()
             return signer.signin(context, { email, password, chatOrigin: config.chatOrigin, timeoutMs: config.timeoutMs })
-        })
+        }, { turn: false })
         if (!harvested) {
             log('session', 'cached')
             return shape(sessions.get(email))
@@ -382,15 +526,21 @@ function createServer(overrides = {}) {
      */
     function liveRenewShared(email, proxy, forced = false, quiet = false) {
         if (!renewing.has(email)) {
-            const task = liveRenew(email, proxy).then(harvested => {
-                remember(email, harvested, proxy)
+            const task = liveRenew(email, proxy).then(outcome => {
+                // Nothing reloaded: the session turned live while the renewal waited (liveRenew).
+                if (outcome.reloaded) remember(email, outcome.reloaded, proxy)
                 // One line per reload: the callers that joined it do not log
                 // their own, or a burst would read as a burst of reloads.
-                if (!quiet) log('renew', `ok${forced ? ' (forced)' : ''} (${sessions.size} sessions)`)
+                if (!quiet) log('renew', `${outcome.reloaded ? `ok${forced ? ' (forced)' : ''}` : 'no reload'} (${sessions.size} sessions)`)
                 return shape(sessions.get(email))
-            }).finally(() => { renewing.delete(email) })
+            }).finally(() => {
+                renewing.delete(email)
+                insisting.delete(email)
+            })
             renewing.set(email, task)
         }
+        // A caller whose session was refused needs the reload, whoever started the renewal it joins.
+        if (forced) insisting.add(email)
         return renewing.get(email)
     }
 
@@ -425,8 +575,9 @@ function createServer(overrides = {}) {
             proxy ?? residents.get(email)?.proxy ?? sessions.get(email)?.proxy ?? null))
         if (request.stream) return relayEgress(req, res, entry, request)
         const result = await residents.fetch(entry, request)
+        // What qwen.ai answered, beyond the status (Qwen2API-0c6): a challenge page, a refusal in the body, the headers and the start of a body that is no 2xx.
         log('egress', `${new URL(request.url).pathname} -> ${result.status} (${residents.stats().residentPages}/${config.maxPages} pages)` +
-            (CHALLENGE_NOTE[result.challenge] || ''))
+            (CHALLENGE_NOTE[result.challenge] || '') + answerNote(result))
         return result
     }
 
@@ -509,6 +660,81 @@ function createServer(overrides = {}) {
         }
     }
 
+    /**
+     * The app dropped the account (Qwen2API-2l0): nothing here may keep it
+     * alive — not the cached session with its silent-renew timer, not the
+     * resident page with its background traffic. An account the worker never
+     * saw is forgotten all the same.
+     *
+     * A sign-in or renewal running for the account ends in remember(), and so
+     * does the lazy opening of its page: left alone, they would put the
+     * session — and with it a new timer — back the moment this was done. So
+     * each round here waits for what is running — a renewal may be standing
+     * in the line of page loads meanwhile, holding the account's lock until
+     * its turn — then takes the account lock (which a renewal needs itself:
+     * waiting for one under it would never end), closes the page (its streams
+     * get their moment to finish first, as with any close) and drops the
+     * session — and goes round again if something started for the account
+     * meanwhile. /forget itself takes no turn: it loads no page.
+     *
+     * The profile stays, so that an account added again skips the sign-in —
+     * unless the worker is told to delete profiles (forgetDeletesProfile): a
+     * removed account's auth cookies go with it. It is deleted once every
+     * browser of the account is closed — its own, and one an eviction began
+     * closing under another account's lock — bounded, like every close
+     * (closeMs): a browser that would not close in time may keep pieces of its
+     * profile. A profile that could not be removed is said so (`profile:
+     * "left"`), not failed over: the session and the page are gone by then,
+     * which is what was asked.
+     *
+     * A sign-in or renewal that keeps starting for the account for all the
+     * rounds outlives this: the answer says so (`pending`). It is not a
+     * refusal — the session and the page are dropped — but what is still
+     * running ends in remember(), and may leave a session behind.
+     */
+    async function handleForget(body) {
+        const email = parseEmail(body)
+        // First of all: no timer may start a reload of this account from here
+        // on, and nothing hands its session out while this waits.
+        clearTimeout(sessions.get(email)?.timer)
+        let session = sessions.delete(email)
+        let page = false
+        for (let round = 0; round < config.forgetRounds; round++) {
+            await Promise.allSettled([logins.get(email), renewing.get(email)])
+            const found = await serialized(email, async () => {
+                const resident = residents.get(email)
+                if (resident) await residents.close(resident, 'forgotten')
+                const cached = sessions.has(email)
+                forget(email)
+                return { page: Boolean(resident), session: cached }
+            })
+            page ||= found.page
+            session ||= found.session
+            if (!logins.has(email) && !renewing.has(email)) break
+        }
+        const pending = logins.has(email) ? 'login' : renewing.has(email) ? 'renewal' : undefined
+        let profile = 'kept'
+        if (config.forgetDeletesProfile) {
+            const dir = profileDir(email)
+            profile = fs.existsSync(dir) ? 'deleted' : 'absent'
+            if (profile === 'deleted') {
+                try {
+                    // No page of the account is left to close here; a browser of
+                    // its that is closing still (an eviction, under another
+                    // account's lock) holds the directory till it is gone.
+                    await residents.whenClosed(email)
+                    await fs.promises.rm(dir, { recursive: true, force: true })
+                } catch (error) {
+                    profile = 'left'
+                    log('forget', `profile not removed (${error.code || 'error'})`)
+                }
+            }
+        }
+        log('forget', `${session ? 'session' : 'no session'}, ${page ? 'page' : 'no page'}, profile ${profile}` +
+            `${pending ? `, a ${pending} still running` : ''} (${sessions.size} sessions)`)
+        return { ok: true, session, page, profile, ...(pending ? { pending } : {}) }
+    }
+
     function authorized(req) {
         if (!config.token) return true
         const header = Buffer.from(String(req.headers.authorization || ''))
@@ -564,11 +790,23 @@ function createServer(overrides = {}) {
     async function handle(req, res) {
         if (req.method === 'GET' && req.url === '/health') {
             // The headless mode is here to be checked after a flip, before the
-            // first request that depends on it.
+            // first request that depends on it. So are the settings of
+            // 2026-11-26 (Qwen2API-xun, Qwen2API-nch, Qwen2API-ops), how
+            // long the line of page loads is, and whether removing an account
+            // in the app deletes its profile (Qwen2API-2l0).
             return send(res, 200, {
                 ok: true, sessions: sessions.size, ...residents.stats(),
-                headless: config.headless, headlessMode: config.headless ? config.headlessMode : null
+                headless: config.headless, headlessMode: config.headless ? config.headlessMode : null,
+                pageTokenRefresh: config.pageTokenRefresh, streamWaitMs: config.streamWaitMs,
+                loadMinIntervalMs: config.loadMinIntervalMs, loadMaxWaitMs: config.loadMaxWaitMs,
+                pageLoadQueue: pageLoads.stats(),
+                forgetDeletesProfile: config.forgetDeletesProfile
             })
+        }
+        if (req.method === 'POST' && req.url === '/forget') {
+            if (!authorized(req)) throw new WorkerError('unauthorized', 'Invalid worker token.')
+            const body = await readJson(req, REQUEST_BODY_LIMIT)
+            return send(res, 200, await handleForget(body))
         }
         if ((req.method === 'POST' && req.url === '/session') || (req.method === 'POST' && req.url === '/renew')) {
             if (!authorized(req)) throw new WorkerError('unauthorized', 'Invalid worker token.')
@@ -586,7 +824,13 @@ function createServer(overrides = {}) {
     }
 
     server.workerConfig = config
-    server.workerShutdown = () => residents.shutdown(config.shutdownMs)
+    server.workerShutdown = () => {
+        // Nobody waits for a turn any more: a page that was to load is closed instead.
+        halting = true
+        pageLoads.stop()
+        tokenRefreshes.stop()
+        return residents.shutdown(config.shutdownMs)
+    }
     return server
 }
 

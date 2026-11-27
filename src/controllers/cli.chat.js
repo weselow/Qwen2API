@@ -2,7 +2,8 @@ const axios = require('axios')
 const { logger } = require('../utils/logger')
 const accountManager = require('../utils/account')
 const { applyProxyToAxiosConfig, getCliBaseUrl } = require('../utils/proxy-helper');
-const { consumeSSEStream, formatSSEFrame } = require('../utils/sse')
+const { consumeWhileClientStays, isClientGone, watchClient } = require('../utils/client-gone')
+const { formatSSEFrame } = require('../utils/sse')
 
 /**
  * 静默累计 CLI daily stats——异常不影响响应
@@ -278,11 +279,24 @@ function formatCliJsonResponse(data, fallbackModel) {
 
 /**
  * 处理CLI聊天完成请求（支持OpenAI格式的流式和JSON响应）
+ *
+ * 客户端离开时上游随之关闭（Qwen2API-3ue.10，机制同 utils/client-gone.js）：流式响应读到一半，
+ * 上游流立刻销毁；请求还在等上游开口（不论流式与否）时，调用本身被取消。关闭不是错误——
+ * 不写错误日志、不记账号失败、不给已离开的客户端写帧。
+ *
  * @param {Object} req - Express请求对象
  * @param {Object} res - Express响应对象
  */
 const handleCliChatCompletion = async (req, res) => {
     let body = {}
+    // Watched until the response is over: a client that goes away takes its upstream
+    // with it, on the signal of req and its socket (utils/client-gone.js).
+    const client = watchClient(req)
+    // The CLI upstream has no relay to close: the call itself is cancelled — from the
+    // moment it is made, so that a client leaving while the upstream has not answered yet
+    // does not leave a call open for the ten minutes of its timeout.
+    const upstreamCall = new AbortController()
+    client.onGone(() => upstreamCall.abort())
     try {
         const access_token = req.account.cli_info.access_token
         body = preprocessCliRequestBody(req.body)
@@ -325,6 +339,7 @@ const handleCliChatCompletion = async (req, res) => {
         }
 
         applyProxyToAxiosConfig(axiosConfig, req.account);
+        axiosConfig.signal = upstreamCall.signal
 
         // 如果是流式请求，设置响应类型为流
         if (isStream) {
@@ -365,7 +380,7 @@ const handleCliChatCompletion = async (req, res) => {
         if (isStream) {
             let cliUsage = null
             let upstreamFinishReason = null
-            const streamResult = await consumeSSEStream(response.data, async (frame) => {
+            const streamResult = await consumeWhileClientStays(response.data, async (frame) => {
                 const payload = frame.data.trim()
                 if (payload && payload !== '[DONE]') {
                     try {
@@ -378,7 +393,7 @@ const handleCliChatCompletion = async (req, res) => {
                     }
                 }
                 res.write(formatSSEFrame(frame))
-            })
+            }, { client })
 
             if (!streamResult.sawDone && !upstreamFinishReason) {
                 res.write(formatSSEFrame({
@@ -408,6 +423,9 @@ const handleCliChatCompletion = async (req, res) => {
             attributeCliUsage(req.account.email, cliUsage)
         }
     } catch (error) {
+        // The client went away: the call was cancelled for it, or the stream closed — not a
+        // failure of the upstream, the account or the request. Nothing is logged, charged or written.
+        if (isClientGone(error) || upstreamCall.signal.aborted) return
         logger.error(`CLI请求使用账号[${req.account.email}]处理异常 - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI', '💥', {
             requestBody: body,
             ...(await buildCliAxiosErrorLog(error))
@@ -464,6 +482,9 @@ const handleCliChatCompletion = async (req, res) => {
                 }
             })
         }
+    } finally {
+        // The socket outlives the request on keep-alive: its closing later is not this client leaving.
+        client.dispose()
     }
 }
 

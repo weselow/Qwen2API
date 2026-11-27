@@ -361,7 +361,8 @@ async function startWorker(t, options) {
     // The lazy open ends here: what the tests read is the launch before it.
     async renew() { throw new BrowserSigninError('session_expired', 'no session') }
   }
-  const server = createServer({ dataDir, token: 'secret', signer, minLoginIntervalMs: 1, ...options })
+  // The queue that keeps the page loads of every account apart (Qwen2API-nch) is off: signin-worker-pacing.test.js measures it.
+  const server = createServer({ dataDir, token: 'secret', signer, minLoginIntervalMs: 1, loadMinIntervalMs: 1, ...options })
   t.after(async () => {
     await server.workerShutdown()
     await new Promise(resolve => server.close(resolve))
@@ -399,7 +400,10 @@ test('the worker hands the headless mode to every launch it makes', async t => {
   await bothLaunches(shell)
   assert.deepEqual(shell.opens.map(options => [options.headless, options.headlessMode]), [[true, 'shell'], [true, 'shell']])
   assert.deepEqual(await shell.health(), {
-    ok: true, sessions: 1, residentPages: 0, maxResidentPages: 16, headless: true, headlessMode: 'shell'
+    ok: true, sessions: 1, residentPages: 0, maxResidentPages: 16, headless: true, headlessMode: 'shell',
+    // Reported where a flip is verified, as the mode is (Qwen2API-xun, Qwen2API-nch); the queue of page loads is off in these tests.
+    pageTokenRefresh: true, streamWaitMs: 20000, loadMinIntervalMs: 1, loadMaxWaitMs: 120000,
+    pageLoadQueue: { waiting: 0, nextInMs: 0 }, forgetDeletesProfile: false
   })
 
   // Chrome by override, and reported where a flip is verified.
@@ -426,7 +430,9 @@ test('a browser with a window has no headless mode to report', async t => {
   assert.equal((await headed.post('/session', { email: EMAIL, password: 'pw' })).status, 200)
   assert.equal(headed.opens[0].headless, false)
   assert.deepEqual(await headed.health(), {
-    ok: true, sessions: 1, residentPages: 0, maxResidentPages: 16, headless: false, headlessMode: null
+    ok: true, sessions: 1, residentPages: 0, maxResidentPages: 16, headless: false, headlessMode: null,
+    pageTokenRefresh: true, streamWaitMs: 20000, loadMinIntervalMs: 1, loadMaxWaitMs: 120000,
+    pageLoadQueue: { waiting: 0, nextInMs: 0 }, forgetDeletesProfile: false
   })
 })
 

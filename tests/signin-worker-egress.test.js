@@ -10,7 +10,7 @@ const { createServer, shutdownHandler } = require('../signin-worker/server')
 const { createResidents } = require('../signin-worker/lib/resident-pages')
 const {
     pageCall, normalizeEgress, isChallengePage, isHtmlAnswer, readFrontEndVersion, PAGE_HEADERS, ABORT_REASON,
-    STREAM_CHANNEL, STREAM_ABORTS
+    STREAM_CHANNEL, STREAM_ABORTS, pageTokenState, pageRefreshToken, answerNote
 } = require('../signin-worker/lib/egress-fetch')
 const { pageGlobals } = require('./helpers/fake-xml-http-request')
 
@@ -67,17 +67,33 @@ function fakeBrowser() {
     calls, contexts, script,
     async openContext(options) {
       calls.push({ op: 'open', ...options })
-      const page = { ...emitter(), evaluations: [], pending: new Set(), bindings: {} }
+      // `page.storage`: a localStorage of the page's own, when a test gives it
+      // one (Qwen2API-xun); by default the page keeps the script's.
+      const page = { ...emitter(), evaluations: [], asked: [], pending: new Set(), bindings: {}, storage: null }
+      // What the page reads of the script: the script itself, at call time —
+      // what the page's requests record goes to it — but for its localStorage.
+      const pageScript = new Proxy(script, {
+        get: (target, name) => (name === 'storage' ? page.storage ?? (target.storage ??= {}) : Reflect.get(target, name)),
+        set: (target, name, value) => {
+          if (name === 'storage') page.storage = value
+          else Reflect.set(target, name, value)
+          return true
+        }
+      })
       // What exposeFunction puts on the page: its streams report through it.
       page.exposeFunction = async (name, handler) => { page.bindings[name] = handler }
+      const inSandbox = (fn, arg) => {
+        page.evaluations.push(arg)
+        // Which function the page was asked to run, by name: what a test counts (Qwen2API-xun).
+        page.asked.push(fn.name)
+        // Only what a page can see: no module scope leaks in.
+        const sandbox = { AbortController, setTimeout, clearTimeout, Blob, ...page.bindings, ...pageGlobals(pageScript, page) }
+        return vm.runInNewContext(`(${fn.toString()})`, sandbox)(arg)
+      }
       page.evaluate = (fn, arg) => new Promise((resolve, reject) => {
         page.pending.add(reject)
-        const run = script.evaluate || ((fn, arg) => {
-          page.evaluations.push(arg)
-          // Only what a page can see: no module scope leaks in.
-          const sandbox = { AbortController, setTimeout, clearTimeout, Blob, ...page.bindings, ...pageGlobals(script, page) }
-          return vm.runInNewContext(`(${fn.toString()})`, sandbox)(arg)
-        })
+        // A test may take a question over, and still run it in the page itself.
+        const run = (fn, arg) => (script.evaluate ? script.evaluate(fn, arg, inSandbox) : inSandbox(fn, arg))
         Promise.resolve().then(() => run(fn, arg)).then(resolve, reject)
           .finally(() => { page.pending.delete(reject) })
       })
@@ -122,8 +138,9 @@ async function start(t, options) {
   const server = createServer({
     dataDir, token: 'secret', timeoutMs: 120000, maxPages: 16,
     minRenewDelayMs: 60000, keepAliveMs: 60000, drainMs: 1000, backstopMs: 5000, frontEndMs: 100, settleStableMs: 40, settlePollMs: 10, settleTimeoutMs: 300,
-    // Login pacing is signin-worker-pacing.test.js's subject.
-    minLoginIntervalMs: 1,
+    // Login pacing is signin-worker-pacing.test.js's subject. So is the queue
+    // that keeps the page loads of every account apart (Qwen2API-nch, Qwen2API-ops).
+    minLoginIntervalMs: 1, loadMinIntervalMs: 1, tokenRefreshMinIntervalMs: 1,
     ...options
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -259,7 +276,10 @@ test('egress opens a resident page on first use and runs the call from inside it
     /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
 
   assert.deepEqual(await health(), {
-    ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell'
+    ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell',
+    // Reported where a flip is verified, as the headless mode is (Qwen2API-xun, Qwen2API-nch); the queue of page loads is off in these tests.
+    pageTokenRefresh: true, streamWaitMs: 20000, loadMinIntervalMs: 1, loadMaxWaitMs: 120000,
+    pageLoadQueue: { waiting: 0, nextInMs: 0 }, forgetDeletesProfile: false
   })
 
   // Opening the page IS a renewal: the session cache holds what it settled on.
@@ -1111,7 +1131,10 @@ test('an explicit invalidation (/renew with force) is answered live although the
   // On the resident page: no second launch on the locked profile.
   assert.equal(signer.calls.filter(call => call.op === 'open').length, 1)
   assert.deepEqual(await health(), {
-    ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell'
+    ok: true, sessions: 1, residentPages: 1, maxResidentPages: 16, headless: true, headlessMode: 'shell',
+    // Reported where a flip is verified, as the headless mode is (Qwen2API-xun, Qwen2API-nch); the queue of page loads is off in these tests.
+    pageTokenRefresh: true, streamWaitMs: 20000, loadMinIntervalMs: 1, loadMaxWaitMs: 120000,
+    pageLoadQueue: { waiting: 0, nextInMs: 0 }, forgetDeletesProfile: false
   })
 
   // Another explicit invalidation is another reload; an explicit false is a plain renew.
@@ -1490,4 +1513,1223 @@ test('a stop signal exits only after the resident browsers are closed; a second 
   await until(() => exits.length === 2)
   assert.deepEqual(exits, [0, 0])
   await until(() => signer.calls.filter(call => call.op === 'closed').length === 2)
+})
+
+// Since Qwen2API-xun (2026-11-26): the page's token, renewed in place. Read off
+// the front end of 0.3.50 (NOTES Qwen2API-xun, "26.11, 09:45 UTC"): the Bearer of
+// a call is the token the page keeps, an access token of fifteen minutes, which
+// the page's own code trades for a new one — GET /api/v2/auths/refresh on the
+// auth host, by XMLHttpRequest with the session's cookies and no Bearer — only
+// for a request of its own, never on a timer. So a page only the worker talks to
+// kept an expired token, and qwen.ai refused the first call after fifteen idle
+// minutes for it (seen live, 2026-11-26), and the app's recovery reloaded the
+// page. Here the worker makes the front end's call for the page instead. That
+// qwen.ai takes it from the worker, and a call made on the token it brings, is
+// to be verified live (the session of the rollout).
+
+const AUTH_HOST = 'https://auth.qwen.ai'
+const REFRESH_PATH = '/api/v2/auths/refresh'
+const REFRESH = `${AUTH_HOST}${REFRESH_PATH}`
+const RENEWED = 'renewed-access-token'
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+const b64url = value => Buffer.from(JSON.stringify(value)).toString('base64url')
+// An access token in the shape qwen.ai issues one: a JWT, which says when it ends.
+const accessTokenExpiringIn = seconds => `${b64url({ alg: 'HS256', type: 'JWT' })}.${b64url({ exp: Math.floor(Date.now() / 1000) + seconds })}.signature`
+const isRefresh = url => new URL(url).pathname === REFRESH_PATH
+
+// What the front end keeps of its token once its refresh wrote it (main.js, IC):
+// the state it reads first, and the two keys it falls back on.
+const keptToken = ({ leftMs, token = 'page-access-token' }) => {
+  const expiresAt = Date.now() + leftMs
+  return {
+    qwen_access_token_state: JSON.stringify({ version: 1, stateId: 'the-page', token, expiresAt, updatedAt: 0, sourceId: 'page' }),
+    token,
+    at_expire_time: String(expiresAt)
+  }
+}
+// qwen.ai for these tests: the auth host answers the refresh, the chat host
+// answers an ordinary call — each written down, with its time.
+function qwenAi(script, refresh = () => jsonResponse({
+  success: true, data: { access_token: RENEWED, expires_at: Math.floor(Date.now() / 1000) + 900 }
+})) {
+  const asked = []
+  script.fetch = (url, init) => {
+    asked.push({ url, init, at: Date.now() })
+    return isRefresh(url) ? refresh(init) : jsonResponse({ success: true })
+  }
+  return asked
+}
+const refreshesOf = asked => asked.filter(call => isRefresh(call.url))
+const tokenReads = page => page.asked.filter(name => name === 'pageTokenState').length
+const callOnce = async (post, email) => (await egress(post, email)).status
+
+// What the refresh sends: the front end's own request (NOTES Qwen2API-xun, "the
+// form of the refresh").
+function assertRefresh(xhr, url = REFRESH, timeoutMs = 10000) {
+  assert.equal(xhr.sent.url, url)
+  assert.equal(xhr.sent.method, 'GET')
+  assert.equal(xhr.sent.body, undefined)
+  // Another origin than the page's: the session's cookies ride along only when asked for.
+  assert.equal(xhr.withCredentials, true, 'the session’s cookies were not asked for')
+  assert.equal(xhr.timeout, timeoutMs)
+  // Listened to with addEventListener, as the page's hooks leave alone.
+  assert.equal(xhr.handlerProperties, undefined)
+  const sent = xhr.sent.headers
+  // No Bearer: the front end's interceptor sets none for /auths/refresh. No
+  // Content-Type: axios drops it from a request without a body. No origin: the
+  // front end sets x-request-origin for everything but /auths/*.
+  for (const name of ['authorization', 'content-type', 'cookie', 'x-request-origin']) {
+    assert.equal(name in sent, false, `${name} was sent`)
+  }
+  assert.deepEqual({ ...sent, timezone: '<the page’s clock>', 'x-request-id': '<a uuid>' }, {
+    accept: 'application/json',
+    'accept-language': 'en-US,en;q=0.9',
+    source: 'web',
+    version: '0.3.50',
+    timezone: '<the page’s clock>',
+    'x-request-id': '<a uuid>'
+  })
+  assert.match(sent.timezone, /^\S{3} \S{3} \d\d \d{4} \d\d:\d\d:\d\d GMT[+-]\d{4}$/)
+  assert.match(sent['x-request-id'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+}
+const refreshXhrOf = (script, url = REFRESH) => script.xhrs.find(xhr => xhr.sent.url === url)
+// What the refresh wrote: a token as the front end writes one.
+function assertKept(storage, token) {
+  const state = JSON.parse(storage.qwen_access_token_state)
+  assert.equal(state.version, 1)
+  assert.equal(state.token, token)
+  assert.equal(state.sourceId, 'signin-worker')
+  assert.equal(typeof state.stateId, 'string')
+  assert.ok(state.expiresAt > Date.now() + 14 * 60 * 1000)
+  assert.equal(storage.token, token)
+  assert.equal(Number(storage.at_expire_time), state.expiresAt)
+  assert.equal(Object.hasOwn(storage, 'qwen_token_logged_out_marker'), false)
+}
+
+test('Qwen2API-xun: a call on a page whose token is nearly spent renews the token first, by the front end’s own call — and no page is reloaded for it', async t => {
+  const signer = fakeBrowser()
+  const { post, health, dataDir } = await start(t, { signer })
+  const email = 'idle@example.invalid'
+  withProfile(dataDir, email)
+  signer.script.frontEnd = '0.3.50'
+  // Fourteen minutes since the page's token was written: a minute of it is left.
+  signer.script.storage = keptToken({ leftMs: 60000 })
+  const asked = qwenAi(signer.script)
+
+  const { answer, lines } = await logged(async lines => {
+    const response = await egress(post, email)
+    return { answer: { status: response.status, body: await response.json() }, lines }
+  })
+  assert.equal(answer.status, 200, lines.join('\n'))
+  assert.deepEqual(JSON.parse(answer.body.body), { success: true })
+
+  // Two requests left the page: the refresh, then the call.
+  assert.deepEqual(asked.map(call => call.url), [REFRESH, `${CHAT}/api/v2/chats/new`])
+  assertRefresh(refreshXhrOf(signer.script))
+  assertKept(signer.script.storage, RENEWED)
+
+  // The call went out after the refresh, on the renewed token...
+  const [refresh, call] = asked
+  assert.equal(call.init.headers.authorization, `Bearer ${RENEWED}`)
+  assert.ok(call.at >= refresh.at)
+  // ...and no page was loaded for it: the one load is the page's own opening.
+  assert.equal(signer.calls.filter(entry => entry.op === 'renew').length, 1)
+  assert.ok(lines.some(line => /token-refresh ok \(\d+ ms, 15 min left(?:, after a wait of \d+ ms)?\)$/.test(line)), lines.join('\n'))
+  assert.equal(lines.join('\n').includes(RENEWED), false, 'a token is not for the log')
+  assert.equal((await health()).residentPages, 1)
+})
+
+test('Qwen2API-xun: what was read of the page’s token stands for a while — a fresh page is not asked again at once, a nearly spent one is renewed before the next call', async t => {
+  const signer = fakeBrowser()
+  // Long enough that two calls in a row fall inside it on a loaded machine, short enough to wait out.
+  const { post, dataDir } = await start(t, { signer, tokenReadAgainMs: 1500 })
+  const email = 'later@example.invalid'
+  withProfile(dataDir, email)
+  signer.script.storage = keptToken({ leftMs: 3600000 })
+  const asked = qwenAi(signer.script)
+
+  assert.equal(await callOnce(post, email), 200)
+  const page = signer.contexts[0].page
+  assert.equal(await callOnce(post, email), 200)
+  // Read once, on the page's opening: the call after that did not ask the page again.
+  assert.equal(tokenReads(page), 1)
+  assert.equal(refreshesOf(asked).length, 0)
+  assert.equal(asked.at(-1).init.headers.authorization, 'Bearer page-access-token')
+
+  // Time passes as far as the page's token is concerned: its last two minutes.
+  await sleep(1700)
+  signer.script.storage = keptToken({ leftMs: 120000 })
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(tokenReads(page), 2)
+  assert.equal(refreshesOf(asked).length, 1)
+  assert.equal(asked.at(-1).init.headers.authorization, `Bearer ${RENEWED}`)
+  // And the call after that finds the reading of the renewed token still standing.
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(tokenReads(page), 2)
+  assert.equal(refreshesOf(asked).length, 1)
+})
+
+test('Qwen2API-xun: a token with the front end’s own margin left is left alone', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer })
+  const email = 'young@example.invalid'
+  withProfile(dataDir, email)
+  // Four minutes: more than the three the front end renews at.
+  signer.script.storage = keptToken({ leftMs: 4 * 60 * 1000 })
+  const asked = qwenAi(signer.script)
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(refreshesOf(asked).length, 0)
+  assert.equal(asked.at(-1).init.headers.authorization, 'Bearer page-access-token')
+})
+
+test('Qwen2API-xun: a refresh qwen.ai refuses costs the call its time and nothing else', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, tokenRetryMs: 250 })
+  const email = 'stubborn@example.invalid'
+  withProfile(dataDir, email)
+  signer.script.storage = keptToken({ leftMs: 60000 })
+  const asked = qwenAi(signer.script, () => jsonResponse({
+    success: false, data: { code: 'unauthorized', details: 'private-upstream-refusal-fixture' }
+  }, 401))
+
+  const { answer, lines } = await logged(async lines => {
+    const response = await egress(post, email)
+    return { answer: { status: response.status, body: await response.json() }, lines }
+  })
+  // The call went out all the same, on the token the page had: a refusal of it
+  // is the app's recovery's to answer, with a reload.
+  assert.equal(answer.status, 200, lines.join('\n'))
+  assert.equal(asked.at(-1).init.headers.authorization, 'Bearer page-access-token')
+  assert.equal(signer.script.storage.token, 'page-access-token')
+  assert.equal(signer.calls.filter(entry => entry.op === 'renew').length, 1)
+  const said = lines.filter(line => / token-refresh /.test(line))
+  assert.equal(said.length, 1, lines.join('\n'))
+  assert.match(said[0], /token-refresh failed \(refused, status 401, code unauthorized, \d+ ms(?:, after a wait of \d+ ms)?\)$/)
+  // What qwen.ai put in its refusal beyond the code is not for the worker's log.
+  assert.equal(lines.join('\n').includes('private-upstream-refusal-fixture'), false)
+
+  // Not tried again at once, whatever calls arrive...
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(refreshesOf(asked).length, 1)
+  // ...and tried again once that while has passed.
+  await sleep(300)
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(refreshesOf(asked).length, 2)
+})
+
+test('Qwen2API-xun: a page that does not answer the refresh is said so, and the call goes out', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer })
+  const email = 'torn@example.invalid'
+  withProfile(dataDir, email)
+  signer.script.storage = keptToken({ leftMs: 60000 })
+  const asked = qwenAi(signer.script)
+  // The document leaves from under the refresh, the way a navigation makes it.
+  signer.script.evaluate = (fn, arg, inSandbox) => (fn.name === 'pageRefreshToken'
+    ? Promise.reject(new Error('Execution context was destroyed.'))
+    : inSandbox(fn, arg))
+
+  const { status, lines } = await logged(async lines => ({ status: await callOnce(post, email), lines }))
+  assert.equal(status, 200)
+  assert.equal(refreshesOf(asked).length, 0)
+  assert.equal(asked.at(-1).init.headers.authorization, 'Bearer page-access-token')
+  assert.ok(lines.some(line => /token-refresh failed \(the page did not answer, \d+ ms(?:, after a wait of \d+ ms)?\)$/.test(line)), lines.join('\n'))
+})
+
+test('Qwen2API-xun: with the refresh off the page is not asked about its token at all', async t => {
+  const signer = fakeBrowser()
+  const { post, health, dataDir } = await start(t, { signer, pageTokenRefresh: false })
+  const email = 'asbefore@example.invalid'
+  withProfile(dataDir, email)
+  signer.script.storage = keptToken({ leftMs: 60000 })
+  const asked = qwenAi(signer.script)
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(refreshesOf(asked).length, 0)
+  assert.equal(asked.at(-1).init.headers.authorization, 'Bearer page-access-token')
+  assert.equal(signer.contexts[0].page.asked.includes('pageTokenState'), false)
+  // Said where a flip is verified.
+  assert.equal((await health()).pageTokenRefresh, false)
+})
+
+test('Qwen2API-xun: SIGNIN_PAGE_TOKEN_REFRESH=false turns the refresh off, and /health says so', async t => {
+  const previous = process.env.SIGNIN_PAGE_TOKEN_REFRESH
+  t.after(() => {
+    if (previous === undefined) delete process.env.SIGNIN_PAGE_TOKEN_REFRESH
+    else process.env.SIGNIN_PAGE_TOKEN_REFRESH = previous
+  })
+  const signer = fakeBrowser()
+  delete process.env.SIGNIN_PAGE_TOKEN_REFRESH
+  const on = await start(t, { signer })
+  assert.equal((await on.health()).pageTokenRefresh, true)
+  process.env.SIGNIN_PAGE_TOKEN_REFRESH = 'false'
+  const off = await start(t, { signer })
+  assert.equal((await off.health()).pageTokenRefresh, false)
+})
+
+test('Qwen2API-xun: a page that keeps no token, or one whose end cannot be read, is left to the app’s recovery', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, tokenReadAgainMs: 40 })
+  const email = 'bare@example.invalid'
+  withProfile(dataDir, email)
+  const asked = qwenAi(signer.script)
+
+  // No token at all: the call goes as the app made it, with no Bearer of its own.
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal('authorization' in asked.at(-1).init.headers, false)
+  assert.equal(refreshesOf(asked).length, 0)
+
+  // A token that says nothing of its end, and nothing written beside it.
+  signer.script.storage = {}
+  signer.script.pageToken = 'opaque-token'
+  await sleep(60)
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(asked.at(-1).init.headers.authorization, 'Bearer opaque-token')
+  assert.equal(refreshesOf(asked).length, 0)
+
+  // A JWT says its own end: nearly spent, it is renewed.
+  signer.script.pageToken = accessTokenExpiringIn(60)
+  await sleep(60)
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(refreshesOf(asked).length, 1)
+  assert.equal(asked.at(-1).init.headers.authorization, `Bearer ${RENEWED}`)
+})
+
+test('Qwen2API-xun: the refresh goes to the auth host the worker is told of, with no second slash whatever the host ends with', async t => {
+  for (const authOrigin of ['https://auth.qwen.com', 'https://auth.qwen.com/', 'https://auth.qwen.com//']) {
+    const signer = fakeBrowser()
+    const { post, dataDir } = await start(t, { signer, authOrigin })
+    const email = 'com@example.invalid'
+    withProfile(dataDir, email)
+    signer.script.storage = keptToken({ leftMs: 60000 })
+    const asked = qwenAi(signer.script)
+    assert.equal(await callOnce(post, email), 200, authOrigin)
+    // However the host was written, the path follows it with one slash.
+    assertRefresh(refreshXhrOf(signer.script, `https://auth.qwen.com${REFRESH_PATH}`), `https://auth.qwen.com${REFRESH_PATH}`)
+    assert.equal(refreshesOf(asked).length, 1)
+  }
+})
+
+test('Qwen2API-xun: the refreshes of the pages are kept apart', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, tokenRefreshMinIntervalMs: 300, tokenReadAgainMs: 40 })
+  const emails = ['first@example.invalid', 'second@example.invalid']
+  for (const email of emails) withProfile(dataDir, email)
+  const asked = qwenAi(signer.script)
+  // Both pages are open...
+  for (const email of emails) assert.equal(await callOnce(post, email), 200)
+  // ...and each keeps a token of its own, a minute from its end.
+  const pages = signer.contexts.map(context => context.page)
+  for (const page of pages) page.storage = keptToken({ leftMs: 60000 })
+  await sleep(60)
+
+  // Both are called at once.
+  assert.deepEqual(await Promise.all(emails.map(email => callOnce(post, email))), [200, 200])
+  const refreshes = refreshesOf(asked)
+  assert.equal(refreshes.length, 2)
+  const [first, second] = refreshes
+  // Timers never fire early.
+  assert.ok(second.at - first.at >= 300, `the second refresh followed the first by ${second.at - first.at} ms`)
+  assert.equal(pages.every(page => page.storage.token === RENEWED), true)
+})
+
+// page.evaluate sends pageTokenState and pageRefreshToken by source: run them
+// the same way, in a bare sandbox, to reach what the HTTP tests cannot stage.
+// The guard turns a call that never settles into a failure here instead of a
+// hung test runner. Its objects come from the sandbox's realm, so they are
+// compared as plain data.
+const inPageAsk = async (fn, script, arg) => {
+  let timer
+  const guard = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error('the in-page call never settled')), 2000)
+  })
+  try {
+    const run = vm.runInNewContext(`(${fn.toString()})`, { AbortController, setTimeout, clearTimeout, ...script, ...pageGlobals(script) })
+    return JSON.parse(JSON.stringify(await Promise.race([run(arg), guard])))
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+test('Qwen2API-xun: pageTokenState reads the token the way the front end does — the state, then the two keys, then the token itself — and hands back no token', async () => {
+  const left = 120000
+  const jwt = accessTokenExpiringIn(120)
+  const jwtEnd = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString()).exp * 1000
+  // What its refresh wrote (IC): all three, and the state is what is read.
+  const written = Date.now() + left
+  const state = await inPageAsk(pageTokenState, { storage: {
+    qwen_access_token_state: JSON.stringify({ version: 1, stateId: 's', token: 'state-token', expiresAt: written, updatedAt: 0, sourceId: 'page' }),
+    token: 'older-token', at_expire_time: '1'
+  } })
+  assert.equal(state.present, true)
+  assert.equal(state.source, 'state')
+  assert.equal(state.expiresAt, written)
+  assert.ok(state.msLeft > 0 && state.msLeft <= left)
+  assert.equal(JSON.stringify(state).includes('state-token'), false)
+  assert.equal(JSON.stringify(state).includes('older-token'), false)
+
+  // The two keys it wrote before it kept a state.
+  const keys = await inPageAsk(pageTokenState, { storage: { token: 'keys-token', at_expire_time: String(Date.now() + left) } })
+  assert.equal(keys.present, true)
+  assert.equal(keys.source, 'keys')
+  assert.ok(keys.msLeft > 0 && keys.msLeft <= left)
+
+  // A state that does not say when its token ends is no state: the two keys decide.
+  const blind = await inPageAsk(pageTokenState, { storage: {
+    qwen_access_token_state: JSON.stringify({ version: 1, stateId: 's', token: 'opaque' }), token: 'opaque', at_expire_time: String(Date.now() + left)
+  } })
+  assert.equal(blind.source, 'keys')
+  assert.ok(blind.msLeft > 0 && blind.msLeft <= left)
+
+  // A token that is a JWT says its own end.
+  const own = await inPageAsk(pageTokenState, { pageToken: jwt })
+  assert.equal(own.present, true)
+  assert.equal(own.source, 'jwt')
+  assert.equal(own.expiresAt, jwtEnd)
+
+  // One that is not, with nothing written beside it: its end cannot be read.
+  assert.deepEqual(await inPageAsk(pageTokenState, { pageToken: 'opaque' }),
+    { present: true, expiresAt: null, msLeft: null, source: 'jwt' })
+
+  // A state that does not read is no state.
+  const broken = await inPageAsk(pageTokenState, { storage: { qwen_access_token_state: '{not json', token: 'keys-token', at_expire_time: String(Date.now() + left) } })
+  assert.equal(broken.source, 'keys')
+
+  // No token at all.
+  assert.deepEqual(await inPageAsk(pageTokenState, {}), { present: false, expiresAt: null, msLeft: null, source: 'none' })
+})
+
+test('Qwen2API-xun: pageRefreshToken is the front end’s own refresh — what it sends, and what it writes', async () => {
+  const expiresAt = Math.floor(Date.now() / 1000) + 900
+  const script = {
+    storage: { token: 'spent-token', at_expire_time: '1', qwen_token_logged_out_marker: 'x' },
+    fetch: url => jsonResponse({ success: true, data: { access_token: RENEWED, expires_at: expiresAt } })
+  }
+  const answer = await inPageAsk(pageRefreshToken, script, { url: REFRESH, timeoutMs: 4000, sourceId: 'signin-worker' })
+  assert.equal(answer.ok, true)
+  assert.equal(answer.status, 200)
+  assert.equal(answer.expiresAt, expiresAt * 1000)
+  assert.ok(answer.msLeft > 0 && answer.msLeft <= 900000)
+  assert.equal(typeof answer.tookMs, 'number')
+  // The token never leaves the page in the answer.
+  assert.equal(JSON.stringify(answer).includes(RENEWED), false)
+  assert.equal(script.xhrs.length, 1)
+  assertRefresh(script.xhrs[0], REFRESH, 4000)
+  assertKept(script.storage, RENEWED)
+})
+
+test('Qwen2API-xun: pageRefreshToken reads the end off the token when the answer names none, and assumes a quarter of an hour when it cannot', async () => {
+  const jwt = accessTokenExpiringIn(600)
+  const jwtEnd = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString()).exp * 1000
+  const fromToken = await inPageAsk(pageRefreshToken, {
+    storage: {}, fetch: () => jsonResponse({ success: true, data: { access_token: jwt } })
+  }, { url: REFRESH, timeoutMs: 4000, sourceId: 'signin-worker' })
+  assert.equal(fromToken.ok, true)
+  assert.equal(fromToken.expiresAt, jwtEnd)
+
+  // Neither says: fifteen minutes, as the front end assumes (parseTokenExpireTime).
+  const assumed = await inPageAsk(pageRefreshToken, {
+    storage: {}, fetch: () => jsonResponse({ success: true, data: { access_token: 'opaque' } })
+  }, { url: REFRESH, timeoutMs: 4000, sourceId: 'signin-worker' })
+  assert.equal(assumed.ok, true)
+  assert.ok(Math.abs(assumed.expiresAt - (Date.now() + 900000)) < 2000)
+})
+
+test('Qwen2API-xun: a refresh qwen.ai refuses, or one that does not get through, leaves the page’s token as it was', async () => {
+  const before = { token: 'spent-token', at_expire_time: '1', qwen_token_logged_out_marker: 'x' }
+  const cases = [
+    ['refused under a 200', () => jsonResponse({ success: false, data: { code: 'unauthorized', details: 'private-upstream-refusal-fixture' } }),
+      { ok: false, status: 200, code: 'unauthorized', reason: 'refused', message: 'private-upstream-refusal-fixture' }],
+    ['refused with a 401', () => jsonResponse({ success: false, code: 'invalid token' }, 401),
+      { ok: false, status: 401, code: 'invalid token', reason: 'refused' }],
+    ['a page, not data', () => jsonResponse('<!doctype html><title>Verification</title>'),
+      { ok: false, status: 200, code: null, reason: 'refused' }],
+    ['a token that is already spent', () => jsonResponse({ success: true, data: { access_token: 'late', expires_at: 1 } }),
+      { ok: false, status: 200, code: null, reason: 'refused', message: 'the token is already spent' }],
+    ['an answer with a token and no success', () => jsonResponse({ data: { access_token: 'not-issued', expires_at: Math.floor(Date.now() / 1000) + 900 } }),
+      { ok: false, status: 200, code: null, reason: 'refused' }],
+    ['success false, a token all the same', () => jsonResponse({ success: false, data: { access_token: 'not-issued' } }),
+      { ok: false, status: 200, code: null, reason: 'refused' }],
+    ['a token under a 500', () => jsonResponse({ success: true, data: { access_token: 'not-issued' } }, 500),
+      { ok: false, status: 500, code: null, reason: 'refused' }],
+    ['a dead connection', () => Promise.reject(new TypeError('Failed to fetch')),
+      { ok: false, status: 0, code: null, reason: 'network_error' }]
+  ]
+  for (const [what, answer, expected] of cases) {
+    const script = { storage: { ...before }, fetch: () => answer() }
+    // How long it took is the one thing not compared.
+    const result = await inPageAsk(pageRefreshToken, script, { url: REFRESH, timeoutMs: 4000, sourceId: 'signin-worker' })
+    delete result.tookMs
+    assert.deepEqual(result, expected, what)
+    // Nothing was written, and the mark of a logged-out session is not the refresh's to remove.
+    assert.deepEqual(script.storage, before, what)
+  }
+})
+
+// Since Qwen2API-0c6 (2026-11-26): what the worker's line says of a whole answer
+// beyond its status. qwen.ai refused chats/new in the body of a 200 twice in the
+// hour of 2026-11-26, and the line read like an accepted call; on 2026-11-25 it
+// answered a file call with 405, and whether the header that names a regional
+// block was there could not be told afterwards.
+
+test('Qwen2API-0c6: a refusal qwen.ai puts in the body of a 200 is said by its code on the worker’s line', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer })
+  const email = 'refused@example.invalid'
+  withProfile(dataDir, email)
+  // The code where the app reads it: on the answer, and on its data.
+  for (const body of [
+    { success: false, code: 'unauthorized' },
+    { success: false, data: { code: 'unauthorized', details: 'private-upstream-refusal-fixture' } }
+  ]) {
+    signer.script.fetch = () => jsonResponse(body)
+    const { answer, lines } = await logged(async lines => {
+      const response = await egress(post, email)
+      return { answer: { status: response.status, body: await response.json() }, lines }
+    })
+    // The app gets qwen.ai's answer as it was, and classifies it itself...
+    assert.equal(answer.status, 200)
+    assert.equal(answer.body.status, 200)
+    assert.deepEqual(JSON.parse(answer.body.body), body)
+    // ...and the log tells the refused call from an accepted one.
+    assert.ok(lines.some(line => /egress \/api\/v2\/chats\/new -> 200 \(1\/16 pages\) — code unauthorized$/.test(line)),
+      `${JSON.stringify(body)}:\n${lines.join('\n')}`)
+    assert.equal(lines.join('\n').includes('private-upstream-refusal-fixture'), false)
+  }
+  // A refusal that names no code is told from an accepted call all the same.
+  signer.script.fetch = () => jsonResponse({ success: false })
+  const lines = await logged(async captured => {
+    await (await egress(post, email)).json()
+    return captured
+  })
+  assert.ok(lines.some(line => /egress \/api\/v2\/chats\/new -> 200 \(1\/16 pages\) — refused, no code$/.test(line)), lines.join('\n'))
+})
+
+test('Qwen2API-0c6: an answer that is no 2xx is said by its headers and the start of its body — and by nothing that could hold a credential', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer })
+  const email = 'blocked@example.invalid'
+  withProfile(dataDir, email)
+  // What qwen.ai answered a file call with on 2026-11-25: 405, a page of error.
+  const page = '<!doctype html><html><head><title>405</title></head><body>\n\t<p>Method Not Allowed</p></body></html>'
+  signer.script.fetch = () => new Response(page, {
+    status: 405,
+    headers: {
+      'content-type': 'text/html; charset=utf-8', server: 'Tengine', 'x-region-restriction': 'true',
+      'set-cookie': 'secret_cookie=1', Authorization: 'Bearer secret_bearer', 'x-api-key': 'secret_key',
+      'x-session-id': 'secret_session', 'x-token': 'secret_token', 'x-request-id': 'abc'
+    }
+  })
+  const { answer, lines } = await logged(async lines => {
+    const response = await egress(post, email)
+    return { answer: { status: response.status, body: await response.json() }, lines }
+  })
+  assert.equal(answer.status, 200)
+  assert.equal(answer.body.status, 405)
+  const line = lines.find(entry => /egress \/api\/v2\/chats\/new -> 405 /.test(entry))
+  assert.ok(line, lines.join('\n'))
+  // On one line, whatever the body had in it; the start of the body only.
+  assert.ok(line.endsWith(' — headers: content-type=text/html; charset=utf-8, server=Tengine, x-region-restriction=true, x-request-id=abc; ' +
+    'body: <!doctype html><html><head><title>405</title></head><body> <p>Method Not Allowed</p></body></html>'), line)
+  for (const secret of ['secret_cookie', 'secret_bearer', 'secret_key', 'secret_session', 'secret_token', 'set-cookie']) {
+    assert.equal(line.includes(secret), false, `${secret} reached the log`)
+  }
+  // The app still has the answer whole, headers included.
+  assert.equal(answer.body.headers['x-region-restriction'], 'true')
+  assert.equal(answer.body.headers['set-cookie'], 'secret_cookie=1')
+})
+
+test('Qwen2API-0c6: answerNote quotes a refusal and a failure, and nothing else', () => {
+  // An accepted answer says nothing beyond its status...
+  assert.equal(answerNote({ status: 200, headers: {}, body: '{"success":true}' }), '')
+  // ...nor does a body that is no refusal, or no JSON at all (a challenge page is named beside this, by the worker).
+  assert.equal(answerNote({ status: 200, headers: {}, body: '{"ret":[]}' }), '')
+  assert.equal(answerNote({ status: 201, headers: {}, body: '[1,2]' }), '')
+  // A code on an answer that is no refusal (an accepted call may carry one) is not quoted as one.
+  assert.equal(answerNote({ status: 200, headers: {}, body: '{"success":true,"code":"OK","data":{}}' }), '')
+  assert.equal(answerNote({ status: 200, headers: {}, body: '{"code":"0"}' }), '')
+  assert.equal(answerNote({ status: 200, headers: { 'content-type': 'text/html' }, body: '<!doctype html>' }), '')
+
+  // A refusal in the body of a 2xx: its code, wherever the app reads it from.
+  for (const [body, code] of [
+    ['{"success":false,"code":"unauthorized"}', 'unauthorized'],
+    ['{"success":false,"data":{"code":"unauthorized"}}', 'unauthorized'],
+    ['{"success":false,"error":{"code":"invalid token"}}', 'invalid token'],
+    ['{"success":false,"error":"forbidden"}', 'forbidden']
+  ]) {
+    const note = answerNote({ status: 200, headers: {}, body })
+    assert.equal(note, ` — code ${code}`)
+    assert.equal(answerNote({ status: 204, headers: {}, body }).replace(/ — code .+$/, ' — code <code>'), ' — code <code>')
+  }
+  // A punish envelope: what its lines say.
+  assert.equal(answerNote({ status: 200, headers: {}, body: '{"ret":["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::SM::x"]}' }),
+    ' — code FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::x')
+  // What only a refusal carries says it too, with success not in the answer at all.
+  assert.equal(answerNote({ status: 200, headers: {}, body: '{"error":{"code":"FAIL_SYS_USER_VALIDATE","details":"Unable to process your request"}}' }),
+    ' — code FAIL_SYS_USER_VALIDATE')
+  // A refusal that names no code is said to be one: it is no accepted call. One too long to be a refusal is not looked into.
+  assert.equal(answerNote({ status: 200, headers: {}, body: '{"success":false}' }), ' — refused, no code')
+  assert.equal(answerNote({ status: 200, headers: {}, body: '{"success":false,"message":"Something went wrong."}' }), ' — refused, no code')
+  assert.equal(answerNote({ status: 200, headers: {}, body: `{"success":false,"code":"x","pad":"${'x'.repeat(256 * 1024)}"}` }), '')
+  // What travels with a refusal is not quoted on a 2xx.
+  assert.equal(answerNote({ status: 200, headers: { 'set-cookie': 'a=b' }, body: '{"success":false,"code":"quota","data":{"details":"private"}}' }), ' — code quota')
+
+  // Not a 2xx: its code, the headers that could hold no credential, and the
+  // start of its body on one line.
+  assert.equal(answerNote({ status: 405, headers: {
+    'content-type': 'text/html', 'Set-Cookie': 'a=b', AUTHORIZATION: 'Bearer x', 'x-api-key': 'k', 'x-session-id': 's', 'X-Token': 't', server: 'T'
+  }, body: 'first\n\tline\r\nsecond' }), ' — headers: content-type=text/html, server=T; body: first line second')
+  assert.equal(answerNote({ status: 405, headers: {}, body: '{"success":false,"code":"Method Not Allowed"}' }),
+    ' — code Method Not Allowed; headers: none; body: {"success":false,"code":"Method Not Allowed"}')
+  assert.equal(answerNote({ status: 502, headers: {}, body: '' }), ' — headers: none; body: ')
+  // A code on an answer that is no 2xx is said, refusal or not.
+  assert.equal(answerNote({ status: 500, headers: {}, body: '{"code":"internal_error","message":"x"}' }),
+    ' — code internal_error; headers: none; body: {"code":"internal_error","message":"x"}')
+  assert.equal(answerNote({ status: 403, headers: {}, body: '{"success":false}' }), ' — headers: none; body: {"success":false}')
+  // Of a long body, the start only.
+  const long = answerNote({ status: 500, headers: {}, body: 'y'.repeat(1000) })
+  assert.equal(long, ` — headers: none; body: ${'y'.repeat(300)}`)
+  // Of many headers, the first few; of a long value, the start.
+  const many = Object.fromEntries(Array.from({ length: 40 }, (_, at) => [`x-h${at}`, String(at)]))
+  assert.equal(answerNote({ status: 503, headers: many, body: '' }), ` — headers: ${
+    Array.from({ length: 12 }, (_, at) => `x-h${at}=${at}`).join(', ')}; body: `)
+  // A credential inside a body is not quoted as itself.
+  const jwt = `eyJ${'a'.repeat(20)}.${'b'.repeat(20)}.${'c'.repeat(10)}`
+  const masked = answerNote({ status: 502, headers: {}, body: `Bearer abc.${jwt} and ${jwt} again` })
+  assert.equal(masked, ' — headers: none; body: <credential> and <credential> again')
+  // What is named a secret — a field of a JSON body, a pair of a form — loses
+  // its value too, in a body and in a header, string or not, whatever its case;
+  // a header so named is not quoted at all; what is not named one keeps it.
+  const named = answerNote({ status: 502, headers: { 'x-signature': 'named_secret_header', 'x-auth': 'Bearer abc.def', 'x-trace': 'token=abc123&ok=1' },
+    body: '{"AccessKeySecret":"named_secret_json","SecurityToken":"named_secret_token","access_token":"named_secret_access",' +
+      '"refresh_token":"named_secret_refresh","api_key":"named_secret_key","session_id":123456789,"ok":"kept"}' +
+      '&Signature=named_secret_signature&session=named_secret_session&token="two words"&plain=kept2' })
+  assert.equal(named, ' — headers: x-auth=<credential>, x-trace=token=<credential>&ok=1; ' +
+    'body: {"AccessKeySecret":"<credential>","SecurityToken":"<credential>","access_token":"<credential>","refresh_token":"<credential>",' +
+    '"api_key":"<credential>","session_id":"<credential>","ok":"kept"}&Signature=<credential>&session=<credential>&token=<credential>&plain=kept2')
+  assert.equal(answerNote({ status: 502, headers: {}, body: 'bearer v' }), ' — headers: none; body: <credential>')
+  // A body made to be gone through again and again — a name that never ends, a JWT that never
+  // ends, from every place either may start — is gone through once: it costs a moment, not the worker.
+  const begun = Date.now()
+  answerNote({ status: 500, headers: {}, body: `${'a.'.repeat(6 * 1024)}secret${'eyJ'.repeat(21 * 1024)}` })
+  assert.ok(Date.now() - begun < 1000, `${Date.now() - begun} ms on a body made to be slow`)
+  // Nothing that would break the line, or make it read backwards: separators and direction marks.
+  const odd = answerNote({ status: 500, headers: { 'x-note': 'a\u2028b\u2029c\u0085d\u202e\u2066f' }, body: 'one\u2028two\u2029three\u202egfour' })
+  assert.equal(odd, ' — headers: x-note=a b c d f; body: one two three gfour')
+  assert.equal(answerNote({ status: 500, headers: { 'x-note': 'a\u200eb\u200fc\u061cd' }, body: '' }), ' — headers: x-note=a b c d; body: ')
+  // The code itself, as a log line may show it: a number is one; one that is nothing but control
+  // characters is no code; one with a separator in it is not cut at it; one that carries a
+  // credential is masked like anything else.
+  assert.equal(answerNote({ status: 200, headers: {}, body: '{"success":false,"code":401}' }), ' — code 401')
+  assert.equal(answerNote({ status: 200, headers: {}, body: JSON.stringify({ success: false, code: '\u0001\u0002' }) }), ' — refused, no code')
+  assert.equal(answerNote({ status: 200, headers: {}, body: JSON.stringify({ success: false, code: 'a; b' }) }), ' — code a; b')
+  assert.equal(answerNote({ status: 200, headers: {}, body: JSON.stringify({ success: false, code: 'token=abc' }) }), ' — code token=<credential>')
+})
+
+test('Qwen2API-xun: a page is not idle while its token is renewed on a call — at the cap it is not evicted for another account', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, maxPages: 2, tokenReadAgainMs: 40 })
+  for (const email of ['x@example.invalid', 'y@example.invalid', 'z@example.invalid']) withProfile(dataDir, email)
+  // Both pages are open, each on a token of its own.
+  for (const email of ['x@example.invalid', 'y@example.invalid']) assert.equal(await callOnce(post, email), 200)
+  const [x, y] = signer.contexts.map(context => context.page)
+  x.storage = keptToken({ leftMs: 60000 })
+  y.storage = keptToken({ leftMs: 3600000 })
+  await sleep(60)
+  // The refresh of x's page takes a while...
+  let release
+  const refreshing = new Promise(resolve => { release = resolve })
+  const asked = []
+  signer.script.fetch = async (url, init) => {
+    asked.push({ url, init, at: Date.now() })
+    if (isRefresh(url)) await refreshing
+    // ...and y's page is busy with a call of its own meanwhile.
+    if (init.headers['x-request-id'] === 'y-hold') await refreshing
+    return isRefresh(url)
+      ? jsonResponse({ success: true, data: { access_token: RENEWED, expires_at: Math.floor(Date.now() / 1000) + 900 } })
+      : jsonResponse({ success: true })
+  }
+  const busy = egress(post, 'y@example.invalid', { headers: { 'content-type': 'application/json', 'x-request-id': 'y-hold' } })
+  const renewed = egress(post, 'x@example.invalid', { headers: { 'content-type': 'application/json' } })
+  await until(() => asked.some(call => isRefresh(call.url)))
+
+  // z arrives at the cap: x's page is claimed for its call, y's is busy with one.
+  const refused = await egress(post, 'z@example.invalid')
+  assert.equal(refused.status, 503)
+  assert.equal((await refused.json()).code, 'resident_capacity')
+
+  release()
+  assert.equal((await renewed).status, 200)
+  assert.equal((await busy).status, 200)
+  // x's call went out on the renewed token, on the page it started with.
+  assert.equal(asked.at(-1).init.headers.authorization, `Bearer ${RENEWED}`)
+  assert.equal(signer.contexts[0].closed, false, "x's page was evicted while its token was being renewed")
+  assert.equal(signer.contexts.length, 2)
+})
+
+test('Qwen2API-xun: a page is claimed while its token is renewed as it opens — at the cap it is not evicted for another account', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, maxPages: 1 })
+  for (const email of ['x@example.invalid', 'z@example.invalid']) withProfile(dataDir, email)
+  // x's page opens on a token with a minute left, and the refresh takes a while.
+  signer.script.storage = keptToken({ leftMs: 60000 })
+  let release
+  const refreshing = new Promise(resolve => { release = resolve })
+  const asked = []
+  signer.script.fetch = async (url, init) => {
+    asked.push({ url, init, at: Date.now() })
+    if (isRefresh(url)) await refreshing
+    return isRefresh(url)
+      ? jsonResponse({ success: true, data: { access_token: RENEWED, expires_at: Math.floor(Date.now() / 1000) + 900 } })
+      : jsonResponse({ success: true })
+  }
+  const opening = egress(post, 'x@example.invalid', { headers: { 'content-type': 'application/json' } })
+  await until(() => asked.some(call => isRefresh(call.url)))
+
+  // z arrives at the cap while x's page is up for its caller, its token being renewed.
+  const refused = await egress(post, 'z@example.invalid')
+  assert.equal(refused.status, 503)
+  assert.equal((await refused.json()).code, 'resident_capacity')
+
+  release()
+  assert.equal((await opening).status, 200)
+  assert.equal(asked.at(-1).init.headers.authorization, `Bearer ${RENEWED}`)
+  assert.equal(signer.contexts[0].closed, false, "x's page was evicted while its token was being renewed")
+  assert.equal(signer.contexts.length, 1)
+})
+
+test('Qwen2API-nch: a renewal on a resident page takes its turn in the queue, like the page’s own opening', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, loadMinIntervalMs: 200, minCacheSeconds: 7200 })
+  const email = 'turn@example.invalid'
+  withProfile(dataDir, email)
+  // When the page was loaded: its opening, then its reload.
+  const loads = []
+  const renew = signer.renew
+  signer.renew = async context => { loads.push(Date.now()); return renew(context) }
+  assert.equal(await callOnce(post, email), 200)
+  const askedAt = Date.now()
+  assert.equal((await post('/renew', { email, force: true })).status, 200)
+  assert.equal(loads.length, 2)
+  // Timers never fire early: the reload waited for the worker's turn.
+  assert.ok(loads[1] - loads[0] >= 200, `the reload came ${loads[1] - loads[0]} ms after the opening`)
+  assert.ok(loads[1] >= askedAt)
+})
+
+test('Qwen2API-nch: two accounts opening their pages at once load them one after the other, and no browser is launched before its turn', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, loadMinIntervalMs: 150 })
+  const emails = ['first@example.invalid', 'second@example.invalid']
+  for (const email of emails) withProfile(dataDir, email)
+  // When each browser was launched, and when each page was loaded.
+  const launches = []
+  const loads = []
+  const open = signer.openContext
+  signer.openContext = async options => { launches.push(Date.now()); return open(options) }
+  const renew = signer.renew
+  signer.renew = async context => { loads.push(Date.now()); return renew(context) }
+
+  assert.deepEqual(await Promise.all(emails.map(email => callOnce(post, email))), [200, 200])
+  assert.equal(loads.length, 2)
+  // Timers never fire early.
+  assert.ok(loads[1] - loads[0] >= 150, `the pages were loaded ${loads[1] - loads[0]} ms apart`)
+  // The turn is waited for before the browser starts: a line of openings is not a line of browsers waiting.
+  assert.ok(launches[1] - launches[0] >= 150, `the browsers were launched ${launches[1] - launches[0]} ms apart`)
+})
+
+test('Qwen2API-xun: what was read of the page’s token stands exactly as long as the token leaves the margin — no longer', async t => {
+  const signer = fakeBrowser()
+  // A reading may stand for five seconds; this token leaves the margin for three.
+  const { post, dataDir } = await start(t, { signer, tokenReadAgainMs: 5000 })
+  const email = 'edge@example.invalid'
+  withProfile(dataDir, email)
+  signer.script.storage = keptToken({ leftMs: 180000 + 3000, token: 'edge-token' })
+  const asked = qwenAi(signer.script)
+
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(await callOnce(post, email), 200)
+  // More than the margin is left: no refresh, and no second question to the page.
+  assert.equal(refreshesOf(asked).length, 0)
+  assert.equal(asked.at(-1).init.headers.authorization, 'Bearer edge-token')
+  const reads = tokenReads(signer.contexts[0].page)
+  assert.equal(reads, 1)
+
+  // The token has run into the margin since — sooner than a reading may stand: it is read again, and renewed.
+  await sleep(3300)
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(tokenReads(signer.contexts[0].page), reads + 1)
+  assert.equal(refreshesOf(asked).length, 1)
+  assert.equal(asked.at(-1).init.headers.authorization, `Bearer ${RENEWED}`)
+})
+
+test('Qwen2API-xun: a refresh the page reports as renewing to a token that is already spent is a failure, and the call goes out', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer })
+  const email = 'late@example.invalid'
+  withProfile(dataDir, email)
+  signer.script.storage = keptToken({ leftMs: 60000 })
+  const asked = qwenAi(signer.script)
+  // The page answers the question, but not with a token that has time left.
+  signer.script.evaluate = (fn, arg, inSandbox) => (fn.name === 'pageRefreshToken'
+    ? Promise.resolve({ ok: true, status: 200, expiresAt: 1000, msLeft: 0, tookMs: 1 })
+    : inSandbox(fn, arg))
+
+  const { status, lines } = await logged(async lines => ({ status: await callOnce(post, email), lines }))
+  assert.equal(status, 200)
+  assert.equal(asked.at(-1).init.headers.authorization, 'Bearer page-access-token')
+  assert.equal(lines.some(line => / token-refresh ok /.test(line)), false, `a spent token was said to be a renewal:\n${lines.join('\n')}`)
+  assert.ok(lines.some(line => / token-refresh failed \(.+, \d+ ms(?:, after a wait of \d+ ms)?\)$/.test(line)), lines.join('\n'))
+})
+
+test('Qwen2API-nch: a stop that lands while a page waits for its turn to open ends the call with page_closed, and no page is said to have died', async t => {
+  const signer = fakeBrowser()
+  // Another account's page took the worker's only turn for a long time.
+  const { post, dataDir, server } = await start(t, { signer, loadMinIntervalMs: 60000 })
+  const first = 'first@example.invalid'
+  const email = 'waiting@example.invalid'
+  withProfile(dataDir, first)
+  withProfile(dataDir, email)
+  assert.equal(await callOnce(post, first), 200)
+
+  const waiting = callOnce(post, email)
+  await sleep(80)
+  const { status, lines } = await logged(async lines => {
+    await server.workerShutdown()
+    return { status: await waiting, lines }
+  })
+  assert.equal(status, 502)
+  assert.equal(signer.calls.filter(call => call.op === 'open').length, 1, 'a browser was launched for the waiting page')
+  assert.equal(lines.some(line => /^resident-close (open_failed|operation_failed) /.test(line.replace(/^\S+ /, ''))), false,
+    `a page was said to have died while the worker was stopping:\n${lines.join('\n')}`)
+})
+
+test('Qwen2API-xun: by default what was read of the page’s token stands a minute — a call soon after does not ask the page again', async t => {
+  const signer = fakeBrowser()
+  // No tokenReadAgainMs here: the default is what is measured.
+  const { post, dataDir } = await start(t, { signer })
+  const email = 'default@example.invalid'
+  withProfile(dataDir, email)
+  const asked = qwenAi(signer.script)
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(await callOnce(post, email), 200)
+  assert.equal(tokenReads(signer.contexts[0].page), 1)
+  assert.equal(refreshesOf(asked).length, 0)
+})
+
+// What a reading of the first version of the three changes found (2026-11-26), and what two
+// readings of the corrections found besides. A stand-in for the worker's queue, which a test
+// holds: a page load that is to take a turn waits in it until let through; one that is not, does not.
+function heldQueue() {
+  const asked = []
+  let held = null
+  return {
+    asked,
+    async beforeLoad({ turn } = {}) {
+      asked.push({ turn })
+      if (turn !== false && held) await held
+    },
+    hold() {
+      let release
+      held = new Promise(resolve => { release = resolve })
+      return { release: () => { held = null; release() } }
+    }
+  }
+}
+
+// A registry of resident pages on its own, without the worker's server around
+// it: on a held queue, with what it says of its pages written down.
+async function queuedResidents(t, options) {
+  const signer = fakeBrowser()
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwen-signin-turn-'))
+  const queue = heldQueue()
+  const said = []
+  const residents = createResidents({
+    signer, profileDir: email => path.join(dataDir, email), beforeLoad: queue.beforeLoad, drainMs: 10,
+    log: (event, extra) => said.push(`${new Date().toISOString()} ${event}${extra ? ' ' + extra : ''}`),
+    ...options
+  })
+  t.after(() => {
+    residents.shutdown()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  })
+  return { signer, queue, residents, said, withProfile: email => fs.mkdirSync(path.join(dataDir, email)) }
+}
+// What was said of the pages, without the time of it.
+const saidOfPages = lines => lines.filter(line => /^\S+ resident-(close|open) /.test(line)).map(line => line.replace(/^\S+ /, ''))
+const diedWhileStopping = /^resident-close (open_failed|operation_failed) /
+
+test('Qwen2API-nch: a page waiting for its turn to open counts against the cap meanwhile — an account arriving then finds the cap taken', { timeout: 10000 }, async t => {
+  const { signer, queue, residents, withProfile } = await queuedResidents(t, { maxPages: 1 })
+  withProfile('a@example.invalid')
+  withProfile('b@example.invalid')
+  // a's page is in line for the worker's turn: nothing is launched for it yet.
+  const hold = queue.hold()
+  const waiting = residents.acquire('a@example.invalid').then(() => 'opened', error => error.code)
+  await until(() => queue.asked.length === 1)
+  assert.deepEqual(queue.asked[0], { turn: true })
+  assert.equal(signer.calls.length, 0)
+
+  // b arrives at the cap: the one page there is is a's, claimed for the call that asked for it.
+  await assert.rejects(residents.acquire('b@example.invalid'), { code: 'resident_capacity' })
+  assert.equal(signer.calls.length, 0, 'a browser was launched while another page was in line for the only slot')
+
+  hold.release()
+  assert.equal(await waiting, 'opened')
+  assert.equal(signer.calls.filter(call => call.op === 'open').length, 1)
+})
+
+test('Qwen2API-nch: a stop that lands while a page waits for its turn launches no browser for it, even though its wait then ends well — and no page is said to have died', { timeout: 10000 }, async t => {
+  const { signer, queue, residents, said, withProfile } = await queuedResidents(t)
+  withProfile('a@example.invalid')
+  const hold = queue.hold()
+  const opening = residents.acquire('a@example.invalid').then(() => 'opened', error => error.code)
+  await until(() => queue.asked.length === 1)
+  await residents.shutdown()
+  hold.release()
+  assert.equal(await opening, 'page_closed')
+  assert.equal(signer.calls.length, 0, 'a browser was launched after the stop')
+  assert.equal(said.some(line => diedWhileStopping.test(line)), false, said.join('\n'))
+})
+
+test('Qwen2API-nch: a page dropped while its renewal waited for the turn to load is not run on, and is said to have died once', { timeout: 10000 }, async t => {
+  const { signer, queue, residents, said, withProfile } = await queuedResidents(t)
+  withProfile('a@example.invalid')
+  const entry = await residents.acquire('a@example.invalid')
+  // The renewal waits for the turn...
+  const hold = queue.hold()
+  const ran = []
+  const renewal = residents.exclusive(entry, async () => { ran.push(Date.now()); return 'renewed' })
+  await until(() => queue.asked.length === 2)
+  assert.deepEqual(queue.asked[1], { turn: true })
+  // ...and the page dies while it does, as a crash takes it.
+  const openingSaid = said.length
+  signer.contexts[0].page.emit('crash')
+  hold.release()
+  await assert.rejects(renewal, { code: 'page_closed' })
+  assert.equal(ran.length, 0, 'the renewal ran on a page that was gone')
+  assert.deepEqual(saidOfPages(said.slice(openingSaid)), ['resident-close page_crashed (0 pages)'])
+})
+
+test('Qwen2API-nch: a page that is gone before its navigation would ask for a turn asks for none', { timeout: 10000 }, async t => {
+  const { queue, residents, withProfile } = await queuedResidents(t)
+  withProfile('a@example.invalid')
+  const entry = await residents.acquire('a@example.invalid')
+  // Closed for good before anything is asked of the queue — as it is for a change of proxy.
+  await residents.close(entry, 'proxy_changed')
+  await assert.rejects(residents.exclusive(entry, async () => 'renewed'), { code: 'page_closed' })
+  assert.equal(queue.asked.length, 1, 'a turn was asked for a page that was already gone')
+})
+
+test('Qwen2API-nch: a sign-in on a resident page does not wait for the turn — nothing is waited for in the queue for it', { timeout: 10000 }, async t => {
+  const { signer, queue, residents, withProfile } = await queuedResidents(t)
+  withProfile('a@example.invalid')
+  const entry = await residents.acquire('a@example.invalid')
+  // The worker's turn is taken for a long time, and a renewal waits for it...
+  const hold = queue.hold()
+  const renewal = residents.exclusive(entry, async () => 'renewed')
+  await until(() => queue.asked.length === 2)
+  // ...but a sign-in does not: the login pacer is what spaces sign-ins, and the worker's
+  // queue is told of it by the worker itself.
+  const signIn = residents.exclusive(entry, async context => {
+    await signer.signin(context, { email: 'a@example.invalid' })
+    return 'signed in'
+  }, { turn: false })
+  assert.equal(await signIn, 'signed in')
+  assert.deepEqual(queue.asked[2], { turn: false })
+  hold.release()
+  assert.equal(await renewal, 'renewed')
+})
+
+// A page opening on a token with a minute left, whose refresh is held until `release()`; `asked` is what was asked of qwen.ai.
+async function heldRefresh(t, options) {
+  const signer = fakeBrowser()
+  const worker = await start(t, { signer, ...options })
+  const email = 'held@example.invalid'
+  withProfile(worker.dataDir, email)
+  signer.script.storage = keptToken({ leftMs: 60000 })
+  let release
+  const refreshing = new Promise(resolve => { release = resolve })
+  const asked = qwenAi(signer.script, async () => {
+    await refreshing
+    return jsonResponse({ success: true, data: { access_token: RENEWED, expires_at: Math.floor(Date.now() / 1000) + 900 } })
+  })
+  return { ...worker, signer, email, asked, release }
+}
+
+test('Qwen2API-xun: a stop that lands while an opening page’s token is renewed ends the call with page_closed — no page said to have died, no refresh said at all', { timeout: 10000 }, async t => {
+  const { post, email, asked, release, server } = await heldRefresh(t)
+  const opening = egress(post, email)
+  await until(() => asked.some(call => isRefresh(call.url)))
+  const { status, lines } = await logged(async lines => {
+    const stopped = server.workerShutdown()
+    // The refresh is answered after all: the worker has stopped all the same.
+    release()
+    await stopped
+    return { status: (await opening).status, lines }
+  })
+  assert.equal(status, 502)
+  assert.equal(lines.some(line => diedWhileStopping.test(line.replace(/^\S+ /, ''))), false, lines.join('\n'))
+  assert.equal(lines.some(line => / token-refresh /.test(line)), false, `a refresh was said while the worker was stopping:\n${lines.join('\n')}`)
+})
+
+test('Qwen2API-xun: a refresh the worker’s stop closes the page under is not said to have failed', { timeout: 10000 }, async t => {
+  // The stop waits no time for the call, and closes the page under its refresh.
+  const { post, email, asked, server } = await heldRefresh(t, { shutdownMs: 60 })
+  const opening = egress(post, email)
+  await until(() => asked.some(call => isRefresh(call.url)))
+  const { status, lines } = await logged(async lines => {
+    await server.workerShutdown()
+    return { status: (await opening).status, lines }
+  })
+  assert.equal(status, 502)
+  assert.equal(lines.some(line => diedWhileStopping.test(line.replace(/^\S+ /, ''))), false, lines.join('\n'))
+  assert.equal(lines.some(line => / token-refresh /.test(line)), false, `a refresh was said while the worker was stopping:\n${lines.join('\n')}`)
+})
+
+test('Qwen2API-xun: a page that dies while its token is renewed as it opens is not handed out, and is said to have died once', { timeout: 10000 }, async t => {
+  const { post, email, asked, release, signer } = await heldRefresh(t)
+  const opening = egress(post, email)
+  await until(() => asked.some(call => isRefresh(call.url)))
+  const { answer, lines } = await logged(async lines => {
+    signer.contexts[0].page.emit('crash')
+    release()
+    const response = await opening
+    return { answer: { status: response.status, body: await response.json() }, lines }
+  })
+  assert.equal(answer.status, 502)
+  assert.equal(answer.body.code, 'page_closed')
+  assert.equal(signer.contexts.length, 1)
+  assert.deepEqual(saidOfPages(lines), ['resident-close page_crashed (0 pages)'])
+  // The page's death is said by its close; the refresh that was under way is nobody's failure.
+  assert.equal(lines.some(line => / token-refresh /.test(line)), false, `a refresh was said of a page that died under it:\n${lines.join('\n')}`)
+})
+
+test('Qwen2API-xun: a page that dies while its token is renewed for a call is not handed out either — the call opens the page anew', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  // What was read of the page's token stands no time: the next call reads it again.
+  const { post, dataDir } = await start(t, { signer, tokenReadAgainMs: 0 })
+  const email = 'reopened@example.invalid'
+  withProfile(dataDir, email)
+  assert.equal(await callOnce(post, email), 200)
+  // A nearly spent token since, and a refresh that takes a while.
+  const page = signer.contexts[0].page
+  page.storage = keptToken({ leftMs: 60000 })
+  let release
+  const refreshing = new Promise(resolve => { release = resolve })
+  const asked = qwenAi(signer.script, async () => {
+    await refreshing
+    return jsonResponse({ success: true, data: { access_token: RENEWED, expires_at: Math.floor(Date.now() / 1000) + 900 } })
+  })
+  const call = egress(post, email)
+  await until(() => asked.some(entry => isRefresh(entry.url)))
+  const { status, lines } = await logged(async lines => {
+    page.emit('crash')
+    // The page opened anew keeps a young token of its own.
+    signer.script.storage = keptToken({ leftMs: 3600000, token: RENEWED })
+    release()
+    return { status: (await call).status, lines }
+  })
+  assert.equal(status, 200)
+  assert.equal(signer.contexts.length, 2)
+  assert.equal(signer.contexts[0].closed, true)
+  assert.equal(asked.at(-1).init.headers.authorization, `Bearer ${RENEWED}`)
+  // The page that died is said so once; the one opened for the call is said up, once.
+  assert.deepEqual(saidOfPages(lines), ['resident-close page_crashed (0 pages)', 'resident-open ok (1/16 pages, front-end 0.3.50)'])
+  assert.equal(lines.some(line => / token-refresh /.test(line)), false, `a refresh was said of a page that died under it:\n${lines.join('\n')}`)
+})
+
+test('Qwen2API-xun: a page that dies, or a worker that stops, while the front end of an opening page is read is neither said up nor handed out', { timeout: 10000 }, async t => {
+  for (const how of ['dies', 'stops']) {
+    const signer = fakeBrowser()
+    const worker = await start(t, { signer })
+    const email = `front-${how}@example.invalid`
+    withProfile(worker.dataDir, email)
+    // The front end is read for the line that says the page is up; the reading takes a while.
+    let release
+    const reading = new Promise(resolve => { release = resolve })
+    let readings = 0
+    signer.script.evaluate = (fn, arg, inSandbox) => (fn.name !== 'readFrontEndVersion'
+      ? inSandbox(fn, arg)
+      : (readings++, reading.then(() => inSandbox(fn, arg))))
+    const opening = egress(worker.post, email)
+    await until(() => readings === 1)
+    const { status, lines } = await logged(async lines => {
+      if (how === 'dies') signer.contexts[0].page.emit('crash')
+      else await worker.server.workerShutdown()
+      release()
+      return { status: (await opening).status, lines }
+    })
+    assert.equal(status, 502, how)
+    assert.equal(lines.some(line => /resident-open ok/.test(line)), false, `the page ${how}, and was said up:\n${lines.join('\n')}`)
+  }
+})
+
+test('Qwen2API-xun: a refresh that does not get through keeps every page behind that proxy from trying its own for a while, and each call goes out all the same; a refusal keeps nobody', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  // The circuit stands a second and a half: long enough for the next call to land inside it on a loaded machine.
+  const { post, dataDir } = await start(t, { signer, tokenRefreshCircuitMs: 1500 })
+  const [down, quiet, later] = ['down@example.invalid', 'quiet@example.invalid', 'later@example.invalid']
+  for (const email of [down, quiet, later]) withProfile(dataDir, email)
+  // Every page keeps a token with a minute left. The auth host does not answer...
+  signer.script.storage = keptToken({ leftMs: 60000 })
+  let unreachable = true
+  const asked = qwenAi(signer.script, () => (unreachable
+    ? Promise.reject(new TypeError('Failed to fetch'))
+    : jsonResponse({ success: false, data: { code: 'unauthorized' } }, 401)))
+  const first = await logged(async lines => {
+    assert.equal(await callOnce(post, down), 200)
+    return lines
+  })
+  assert.ok(first.some(line => / token-refresh failed \(network_error, \d+ ms(?:, after a wait of \d+ ms)?\)$/.test(line)), first.join('\n'))
+
+  // While it is down, no other page pays the wait for a try of its own: the
+  // call goes out at once, on the token there is.
+  const { status, lines } = await logged(async lines => ({ status: await callOnce(post, quiet), lines }))
+  assert.equal(status, 200)
+  assert.equal(signer.contexts[1].page.asked.includes('pageTokenState'), false, `the page was asked about its token:\n${lines.join('\n')}`)
+  assert.equal(signer.contexts[1].page.asked.includes('pageRefreshToken'), false, `the page was asked to refresh:\n${lines.join('\n')}`)
+  assert.equal(refreshesOf(asked).length, 1)
+  assert.equal(asked.at(-1).init.headers.authorization, 'Bearer page-access-token')
+
+  // The while over, a page tries again...
+  await sleep(1600)
+  unreachable = false
+  const refused = await logged(async lines => {
+    assert.equal(await callOnce(post, later), 200)
+    return lines
+  })
+  assert.equal(refreshesOf(asked).length, 2)
+  assert.ok(refused.some(line => / token-refresh failed \(refused, status 401, code unauthorized, \d+ ms(?:, after a wait of \d+ ms)?\)$/.test(line)), refused.join('\n'))
+  // ...and a refresh qwen.ai refuses is that page's own: it keeps nobody else from trying.
+  assert.equal(await callOnce(post, quiet), 200)
+  assert.equal(refreshesOf(asked).length, 3)
+})
+
+test('Qwen2API-xun: the circuit is the road’s — a page behind another proxy, or behind none, tries its own refresh all the same', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, tokenRefreshCircuitMs: 60000 })
+  // Three roads: a proxy whose way to the auth host is dead, no proxy (that way is dead too), and a proxy whose way is not.
+  const [onDead, onNone, onLive, onDeadAgain] = ['dead-road@example.invalid', 'no-road@example.invalid', 'live-road@example.invalid', 'dead-road-too@example.invalid']
+  for (const email of [onDead, onNone, onLive, onDeadAgain]) withProfile(dataDir, email)
+  // Every page keeps a token with a minute left.
+  signer.script.storage = keptToken({ leftMs: 60000 })
+  let refreshes = 0
+  const asked = []
+  signer.script.fetch = (url, init) => {
+    asked.push({ url, init, at: Date.now() })
+    if (!isRefresh(url)) return jsonResponse({ success: true })
+    // The first two roads are dead; the third answers.
+    return ++refreshes <= 2 ? Promise.reject(new TypeError('Failed to fetch'))
+      : jsonResponse({ success: true, data: { access_token: RENEWED, expires_at: Math.floor(Date.now() / 1000) + 900 } })
+  }
+  const call = (email, proxy) => egress(post, email, { proxy })
+  assert.equal((await call(onDead, 'http://dead-road.invalid:8080')).status, 200)
+  assert.equal((await call(onNone)).status, 200)
+  assert.equal((await call(onLive, 'http://live-road.invalid:8080')).status, 200)
+  // Each of the three was asked on its own road — and the last one's token was renewed.
+  assert.equal(refreshes, 3, 'a page was kept from its refresh by a dead road it is not on, or not asked on a dead one')
+  assert.equal(asked.at(-1).init.headers.authorization, `Bearer ${RENEWED}`)
+  // A second page on the first road is not asked: that road is known to be dead.
+  assert.equal((await call(onDeadAgain, 'http://dead-road.invalid:8080')).status, 200)
+  assert.equal(refreshes, 3, 'a page was asked on a road known to be dead')
+  assert.equal(signer.contexts[3].page.asked.includes('pageRefreshToken'), false)
+})
+
+test('Qwen2API-nch: a sign-in on a resident page does not wait for the worker’s turn either — the login pacer is what spaces sign-ins', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, loadMinIntervalMs: 60000, minCacheSeconds: 7200 })
+  const email = 'signed@example.invalid'
+  withProfile(dataDir, email)
+  // The page's own opening took the only turn there is for a long time.
+  assert.equal(await callOnce(post, email), 200)
+  const began = Date.now()
+  const signedIn = await post('/session', { email, password: 'pw', force: true })
+  assert.equal(signedIn.status, 200, JSON.stringify(await signedIn.json()))
+  assert.ok(Date.now() - began < 5000, `the sign-in waited ${Date.now() - began} ms`)
+  // On the resident page: no second launch on the locked profile.
+  assert.equal(signer.calls.filter(call => call.op === 'open').length, 1)
+  assert.equal(signer.calls.find(call => call.op === 'signin').page, signer.contexts[0].page)
+})
+
+test('Qwen2API-xun: the code of a refused refresh is cut to one line of at most 80 characters, whatever qwen.ai put in it', async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer })
+  const email = 'wordy@example.invalid'
+  withProfile(dataDir, email)
+  signer.script.storage = keptToken({ leftMs: 60000 })
+  // A code with a line break and a forged line of the worker's own log in it, and then some.
+  qwenAi(signer.script, () => jsonResponse({
+    success: false, data: { code: `unauthorized\r\n2026-11-26T00:00:00.000Z token-refresh ok (forged) ${'z'.repeat(200)}` }
+  }, 401))
+  const { status, lines } = await logged(async lines => ({ status: await callOnce(post, email), lines }))
+  assert.equal(status, 200)
+  // Control characters are spaces, and 80 characters are quoted at most: one line, saying one failure.
+  const said = lines.filter(line => / token-refresh /.test(line))
+  assert.equal(said.length, 1, lines.join('\n'))
+  assert.match(said[0], / token-refresh failed \(refused, status 401, code unauthorized 2026-11-26T00:00:00\.000Z token-refresh ok \(forged\) z{16}, \d+ ms(?:, after a wait of \d+ ms)?\)$/)
+})
+
+// Another account's page takes the turn, so this account's page — opened for a call — stands in
+// line; a renewal of the account arrives behind it, on the account's lock.
+async function renewalBehindOpening(t, body) {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, loadMinIntervalMs: 400 })
+  withProfile(dataDir, 'first@example.invalid')
+  assert.equal(await callOnce(post, 'first@example.invalid'), 200)
+  const email = 'queued@example.invalid'
+  withProfile(dataDir, email)
+  const call = callOnce(post, email)
+  await sleep(100)
+  const renews = () => signer.calls.filter(entry => entry.op === 'renew').length
+  const before = renews()
+  const { answer, lines } = await logged(async lines => {
+    const response = await post('/renew', { email, ...body })
+    return { answer: { status: response.status, body: await response.json() }, lines }
+  })
+  assert.equal(await call, 200)
+  return { answer, lines, reloaded: renews() - before - 1 }
+}
+
+test('Qwen2API-nch: a renewal that stood behind its own page’s opening answers the session that opening settled — no turn and no reload of its own', { timeout: 10000 }, async t => {
+  const { answer, lines, reloaded } = await renewalBehindOpening(t, {})
+  assert.equal(answer.status, 200, lines.join('\n'))
+  // The opening loaded the page once and settled its session; that is the session answered.
+  assert.equal(reloaded, 0, 'a second page load for a session that was just settled')
+  assert.equal(answer.body.token, 'token-renew-2')
+  assert.ok(lines.some(line => / renew no reload \(/.test(line)), lines.join('\n'))
+  assert.equal(lines.some(line => / renew ok /.test(line)), false, lines.join('\n'))
+})
+
+test('Qwen2API-nch: a forced renewal standing behind the same opening reloads all the same', { timeout: 10000 }, async t => {
+  const { answer, lines, reloaded } = await renewalBehindOpening(t, { force: true })
+  assert.equal(answer.status, 200, lines.join('\n'))
+  assert.equal(reloaded, 1)
+  assert.equal(answer.body.token, 'token-renew-3')
+  assert.ok(lines.some(line => / renew ok \(forced\)/.test(line)), lines.join('\n'))
+})
+
+test('Qwen2API-nch: a forced renewal that joins one already standing behind the opening gets its reload too', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { post, dataDir } = await start(t, { signer, loadMinIntervalMs: 400 })
+  withProfile(dataDir, 'first@example.invalid')
+  assert.equal(await callOnce(post, 'first@example.invalid'), 200)
+  const email = 'joined@example.invalid'
+  withProfile(dataDir, email)
+  const call = callOnce(post, email)
+  await sleep(100)
+  const renews = () => signer.calls.filter(entry => entry.op === 'renew').length
+  const before = renews()
+  // A plain renewal stands behind the opening; then the application's recovery insists on a live one.
+  const plain = post('/renew', { email })
+  await sleep(50)
+  const { answer, lines } = await logged(async lines => {
+    const response = await post('/renew', { email, force: true })
+    return { answer: { status: response.status, body: await response.json() }, lines }
+  })
+  assert.equal((await plain).status, 200)
+  assert.equal(await call, 200)
+  // One reload for both, as always — and a reload it is, not the session the opening settled meanwhile.
+  assert.equal(renews(), before + 2)
+  assert.equal(answer.body.token, 'token-renew-3')
+  assert.ok(lines.some(line => / renew ok \(/.test(line)), lines.join('\n'))
+  assert.equal(lines.some(line => / renew no reload /.test(line)), false, lines.join('\n'))
 })

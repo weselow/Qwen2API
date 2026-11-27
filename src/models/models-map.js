@@ -11,6 +11,13 @@ let cachedModels = null
 let cachedModelsAt = 0
 let fetchPromise = null
 
+// How long qwen.ai may take with the list. Unbounded, a dead upstream held every refresh
+// for the whole of the transport's own headers timeout (300 s, the dead-proxy incident of
+// 2026-11-19) — and each held refresh went on serving the stale cache as if nothing were
+// wrong. Bounded, the failure is logged within seconds; the stale cache is still what is
+// served (Qwen2API-0a4).
+const FETCH_TIMEOUT_MS = 15 * 1000
+
 // 缓存是否已过期（modelsCacheTtl = 0 表示永不过期）
 const isCacheExpired = () => {
     return config.modelsCacheTtl > 0 && Date.now() - cachedModelsAt > config.modelsCacheTtl * 1000
@@ -45,7 +52,8 @@ const getLatestModels = async (force = false) => {
     })
 
     const requestConfig = {
-        headers
+        headers,
+        timeout: FETCH_TIMEOUT_MS
     }
 
     applyProxyToAxiosConfig(requestConfig, account);

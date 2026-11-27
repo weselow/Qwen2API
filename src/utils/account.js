@@ -7,6 +7,8 @@ const sessionPersistence = require('./v2-session-persistence')
 const AccountRotator = require('./account-rotator')
 const { logger } = require('./logger')
 const { generateDeterministicFingerprint } = require('./fingerprint')
+const signinWorker = require('./signin-worker-client')
+const accountRegistry = require('./account-registry')
 
 /**
  * 默认 daily stats 结构。返回新对象，调用方安全修改
@@ -94,6 +96,22 @@ const _hasNonZeroStats = (stats) => {
         || (Number(l.output) || 0) > 0
 }
 
+// What the worker's /forget reports of the browser profile (Qwen2API-2l0):
+// deleted or not deletable are worth a word, kept and never-there are not.
+const FORGET_PROFILE_NOTE = { deleted: '，浏览器配置已删除', left: '，浏览器配置没能删除', absent: '', kept: '' }
+
+// The timer's cycle of token refreshes (Qwen2API-ops). In browser mode a
+// refresh is a reload of the account's page in the signin-worker whenever the
+// worker has no fresh session of it to answer from — after the worker's
+// restart, or once its cached session has run low; while the worker's own
+// timer keeps that session fresh, it answers from the cache and no page is
+// loaded. The cycle cannot tell the two apart beforehand, so every refresh is
+// given room: two accounts of one cycle are kept this far apart, plus up to
+// the same again as jitter — as the worker keeps its full sign-ins. Shorter,
+// and a renewal that does reload would stand in the worker's line of page
+// loads, holding its account's lock until its turn (Qwen2API-m47).
+const AUTO_REFRESH_MIN_INTERVAL_MS = 30000
+
 const STATS_HISTORY_RETENTION_DAYS = 90
 /**
  * 账户管理器
@@ -119,6 +137,8 @@ class Account {
         // cli请求次数定时刷新器
         this.cliRequestNumberInterval = null
         this.cliDailyResetInterval = null
+        // Whether the timer's cycle of token refreshes is running (autoRefreshTokens)
+        this.autoRefreshCycleRunning = false
 
         // Keep the init promise so debug methods can await readiness
         this._initPromise = this._initialize()
@@ -144,7 +164,7 @@ class Account {
             // 设置定期刷新令牌
             if (config.autoRefresh) {
                 this.refreshInterval = setInterval(
-                    () => this.autoRefreshTokens(),
+                    () => this.autoRefreshTokens(24, { paced: true }),
                     (config.autoRefreshInterval || 21600) * 1000 // 默认6小时
                 )
             }
@@ -508,14 +528,41 @@ class Account {
     /**
      * 自动刷新即将过期的令牌
      * @param {number} thresholdHours - 过期阈值（小时）
+     * @param {Object} [options]
+     * @param {boolean} [options.paced] - 调用方是定时器（Qwen2API-ops）：browser 模式下同一次循环里的
+     *   账户彼此隔开（_refreshPauseMs），上一轮还没结束时这一轮不开始。面板的按钮不传它——
+     *   它们在自己的 HTTP 请求里等结果，间隔照旧。
      * @returns {Promise<number>} 成功刷新的令牌数量
      */
-    async autoRefreshTokens(thresholdHours = 24) {
+    async autoRefreshTokens(thresholdHours = 24, { paced = false } = {}) {
         if (!this.isInitialized) {
             logger.warn('账户管理器尚未初始化，跳过自动刷新', 'TOKEN')
             return 0
         }
+        // 一次只有一轮：账户之间的停顿能让一轮持续得比定时器的间隔还久（16 个账户——
+        // 间隔 15 分钟时最多约 18 分钟），而同时跑着的第二轮会一次更新两个账户。
+        if (paced && this.autoRefreshCycleRunning) {
+            logger.info('上一轮自动刷新还没结束，跳过这一轮', 'TOKEN')
+            return 0
+        }
+        if (paced) this.autoRefreshCycleRunning = true
+        try {
+            return await this._refreshDueTokens(thresholdHours, paced)
+        } finally {
+            if (paced) this.autoRefreshCycleRunning = false
+        }
+    }
 
+    /**
+     * 一轮：刷新令牌将在阈值内过期的账户。循环可能持续几分钟，所以期间被删除的账户、
+     * 或令牌已经被别的路径更新过的账户，都跳过（Qwen2API-ops；刷新被删除的账户还会在
+     * signin-worker 里重新打开它的页面——Qwen2API-2l0）。
+     * @param {number} thresholdHours - 过期阈值（小时）
+     * @param {boolean} paced - 是否是定时器的那一轮（autoRefreshTokens）
+     * @returns {Promise<number>} 成功刷新的令牌数量
+     * @private
+     */
+    async _refreshDueTokens(thresholdHours, paced) {
         logger.info('开始自动刷新令牌...', 'TOKEN', '🔄')
 
         // 获取需要刷新的账户
@@ -528,11 +575,26 @@ class Account {
 
         logger.info(`发现 ${needsRefresh.length} 个令牌需要刷新`, 'TOKEN')
 
+        // What the due accounts' tokens were as the cycle began. The cycle can last minutes, and the
+        // record may change meanwhile both ways: a refresh replaces it, a recovered session rewrites
+        // its token in place — on the very object this cycle holds.
+        const tokenAtStart = new Map(needsRefresh.map(account => [account.email, account.token]))
+
         let successCount = 0
         let failedCount = 0
 
         // 逐个刷新账户，每次成功后立即保存
-        for (const account of needsRefresh) {
+        for (const [index, account] of needsRefresh.entries()) {
+            const current = this.accountTokens.find(acc => acc.email === account.email)
+            if (!current) {
+                logger.info(`账户 ${account.email} 已被删除，跳过刷新`, 'TOKEN')
+                continue
+            }
+            if (current.token !== tokenAtStart.get(account.email) ||
+                !this.tokenManager.isTokenExpiringSoon(current.token, thresholdHours)) {
+                logger.info(`账户 ${account.email} 的令牌已是新的，跳过刷新`, 'TOKEN')
+                continue
+            }
             try {
                 const refreshed = await this.refreshAccountToken(account.email)
                 if (refreshed) {
@@ -552,7 +614,16 @@ class Account {
             }
 
             // 添加延迟避免请求过于频繁
-            await this._delay(1000)
+            if (paced && v2sessions.browser) {
+                // 最后一个账户之后不停：后面已经没有要隔开的了
+                if (index < needsRefresh.length - 1) {
+                    const pauseMs = this._refreshPauseMs()
+                    logger.info(`${Math.round(pauseMs / 1000)} 秒后刷新下一个账户 (${index + 1}/${needsRefresh.length})`, 'TOKEN')
+                    await this._delay(pauseMs)
+                }
+            } else {
+                await this._delay(1000)
+            }
         }
 
         // 更新轮询器
@@ -560,6 +631,16 @@ class Account {
 
         logger.success(`令牌刷新完成: 成功 ${successCount} 个，失败 ${failedCount} 个`, 'TOKEN')
         return successCount
+    }
+
+    /**
+     * 定时器那一轮里两个账户之间等多久（Qwen2API-ops）：最小间隔，加上最多同样大小的随机添加卡
+     * @param {() => number} [random] - 添加卡的来源，[0, 1)
+     * @returns {number} 毫秒
+     * @private
+     */
+    _refreshPauseMs(random = Math.random) {
+        return Math.round(AUTO_REFRESH_MIN_INTERVAL_MS * (1 + random()))
     }
 
     /**
@@ -906,6 +987,9 @@ class Account {
                 return false
             }
 
+            // The account is the app's again: its calls reach the worker from here on (Qwen2API-u50).
+            accountRegistry.noteAdded(email)
+
             // 更新轮询器
             this.accountRotator.setAccounts(this.accountTokens)
 
@@ -993,17 +1077,60 @@ class Account {
                 // Keep memory and rotation intact if storage refuses the deletion.
                 if (!await this.dataPersistence.deleteAccount(email)) return false
                 const index = this.accountTokens.findIndex(acc => acc.email === email)
-                lab.sessions.delete(email)
+                // The session and its recovery state go with the account (Qwen2API-u50): a
+                // request still out on it must find nothing to recover, and an account
+                // added again must not inherit the old one's backoff.
+                sessionPersistence.forgetRecovery(email)
                 if (index !== -1) this.accountTokens.splice(index, 1)
                 if (account.cli_info?.refresh_token_interval) clearInterval(account.cli_info.refresh_token_interval)
                 this.accountRotator.setAccounts(this.accountTokens)
                 logger.success(`成功移除账户: ${email}`, 'ACCOUNT')
+                // In browser mode the signin-worker keeps a session, a renew
+                // timer and a page for every account it has seen (Qwen2API-2l0).
+                // Told here, inside the account's queue: the deletion is durable
+                // by now, and nothing done to this account later can overtake it.
+                await this._forgetWorkerSession(email)
                 return true
             } catch (error) {
                 logger.error(`移除账户失败 (${email})`, 'ACCOUNT', '', error)
                 return false
             }
         })
+    }
+
+    /**
+     * 账户已经从应用里删掉——让 signin-worker 也忘掉它（Qwen2API-2l0）：否则它为这个
+     * 账户留着的会话、悄悄续期的定时器和常驻页面会一直活着。删除已经落盘，这里只是
+     * 通知：signin-worker 拒绝或没有回答，账户照样是删除的，日志里留一条警告。警告分三种：
+     * 拒绝——它的会话和页面会留到 signin-worker 重启；没及时回答——那边会自己做完，
+     * 不用管；它等不下去了（这个账户的登录或续期一次又一次地开始）——结束后可能又
+     * 留下会话，要人手动再叫一次 /forget。
+     * 只有 browser 模式用得到 signin-worker。
+     * @param {string} email - 邮箱地址
+     * @returns {Promise<void>}
+     * @private
+     */
+    async _forgetWorkerSession(email) {
+        if (!v2sessions.browser) return
+        const removed = `账户 ${email} 已删除，`
+        try {
+            const forgotten = await signinWorker.forgetAccount(email)
+            if (forgotten.pending) {
+                logger.warn(`${removed}但 signin-worker 等不下去了——这个账户的${forgotten.pending === 'login' ? '登录' : '续期'}还在进行，` +
+                    '结束后可能又留下会话：需要手动再叫一次 /forget（带 signin-worker 的密钥）', 'ACCOUNT')
+                return
+            }
+            logger.info(`signin-worker 已忘掉账户 ${email}（会话${forgotten.session ? '已清除' : '本无'}，` +
+                `页面${forgotten.page ? '已关闭' : '本无'}${FORGET_PROFILE_NOTE[forgotten.profile] || ''}）`, 'ACCOUNT')
+        } catch (error) {
+            if (error.timedOut) {
+                logger.warn(`${removed}但 signin-worker 没有及时回答 (${error.code})：那边会自己把它忘掉——` +
+                    '看 signin-worker 日志里的 forget 行', 'ACCOUNT')
+                return
+            }
+            logger.warn(`${removed}但 signin-worker 没能忘掉它 (${error.workerCode || error.code})：` +
+                '它的会话、续期定时器和页面会留在 signin-worker 里，直到 signin-worker 重启', 'ACCOUNT')
+        }
     }
 
     /**
@@ -1105,4 +1232,4 @@ process.on('SIGINT', () => {
 
 module.exports = accountManager
 // Said where code that must not load this module can find it once it is loaded.
-require('./account-registry').manager = accountManager
+accountRegistry.manager = accountManager
