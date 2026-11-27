@@ -23,6 +23,8 @@
  *                                                 '' for a page that shows none, 'elsewhere' for one
  *                                                 whose scripts show no version
  *   language   string                            the page's language (navigator.language)
+ *   origin     string                            the page's own origin (location.origin): the chat's unless a
+ *                                                 test gives another
  *   pageToken  string                            the session token the page keeps (localStorage.token)
  *   storage    object                            what the page keeps in localStorage besides: a test may seed it
  *                                                 (the token's expiry, the front end's state), and reads here what the
@@ -44,7 +46,7 @@ const CHAT = 'https://chat.qwen.ai'
 /**
  * The globals pageCall needs beyond the ones every page has and the test
  * already provides (timers, btoa, the stream channel).
- * @param {{fetch?: Function, hold?: Function, frontEnd?: string, xhrs?: object[], fetches?: object[]}} script
+ * @param {{fetch?: Function, hold?: Function, frontEnd?: string, origin?: string, xhrs?: object[], fetches?: object[]}} script
  * @param {{emit?: Function}} [page] hears 'response' for every answer
  */
 function pageGlobals(script, page = null) {
@@ -56,11 +58,20 @@ function pageGlobals(script, page = null) {
         atob: value => atob(value),
         crypto: globalThis.crypto,
         URL,
-        location: { href: `${CHAT}/` },
+        location: pageLocation(script),
         navigator: { get language() { return script.language || 'en-US' } },
         localStorage: pageStorage(script),
         document: pageDocument(script)
     }
+}
+
+/**
+ * The page's own address, as its scripts see it: the href, and the origin — which the
+ * front end's interceptor sends as x-request-origin on what goes to /auths/* (Qwen2API-xun).
+ * Read off `script` each time: `script.origin` when a test gives one, the chat's if not.
+ */
+function pageLocation(script) {
+    return { href: `${CHAT}/`, get origin() { return script.origin ?? CHAT } }
 }
 
 /**
@@ -327,4 +338,4 @@ function pageFetch(script, page) {
     }
 }
 
-module.exports = { pageGlobals, pageFetch, pageStorage, xmlHttpRequest, pageDocument }
+module.exports = { pageGlobals, pageLocation, pageFetch, pageStorage, xmlHttpRequest, pageDocument }

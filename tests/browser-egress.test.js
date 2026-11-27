@@ -67,7 +67,8 @@ function standInWorker() {
         req.on('data', chunk => { raw += chunk })
         req.on('end', () => {
             const route = req.url
-            const call = { route, auth: req.headers.authorization, body: raw ? JSON.parse(raw) : {} }
+            // `at`, on the clock of the process: how long the app left between two calls of one request.
+            const call = { route, at: performance.now(), auth: req.headers.authorization, body: raw ? JSON.parse(raw) : {} }
             calls.push(call)
             const answer = () => script[route.slice(1)](call.body)
             // A script that has nothing left is the test's mistake: say so
@@ -1229,6 +1230,11 @@ function relay() {
             send({ type: 'head', status, url: `${COMPLETIONS}chat-1`, redirected: false, headers, cookies }),
         chunk: data => send({ type: 'chunk', data: Buffer.from(data).toString('base64') }),
         end: (cookies = []) => finish({ type: 'end', cookies }),
+        // The worker's answer ends with no last event at all: what the app reads as relay_closed.
+        drop: () => {
+            if (response) response.end()
+            else finishing = true
+        },
         fail: code => finish({ type: 'error', code, message: `In-page fetch failed (${code}).` }),
         // An event exactly as the test writes it, whatever it is.
         raw: send,
@@ -2531,10 +2537,12 @@ async function withAccount(account, fn) {
     }
 }
 
-// An Express response, as the controllers write one.
+// An Express response, as the controllers write one. Before anything is sent, a header set
+// can be taken back — as Bun's response lets one be until then.
 const response = () => ({
     headers: {}, headersSent: false, writableEnded: false, statusCode: 200, output: '',
     set(key, value) { if (typeof key === 'object') Object.assign(this.headers, key); else this.headers[key] = value; return this },
+    removeHeader(name) { delete this.headers[name] },
     status(value) { this.statusCode = value; return this },
     json(body) { this.body = body; this.headersSent = true; this.writableEnded = true; return this },
     write(chunk) { this.headersSent = true; this.output += chunk; return true },
@@ -4040,4 +4048,745 @@ test('Qwen2API-3ue.12: with chats/new direct, the file call is the one it always
     assert.match(puts[0].signature, /^OSS test-access-key:[A-Za-z0-9+/=]+$/)
     assert.equal(new URL(puts[0].url).host, `${STS.bucketname}.oss-cn-hangzhou.aliyuncs.com`)
     assert.equal(worker.calls.length, 0, 'the worker is not involved')
+})
+
+/* ------------ the whole retry of an answer without a stream (Qwen2API-jk9, 2026-11-27) -- */
+
+// A request without a stream is answered whole, so when its first attempt dies the client has
+// been told nothing yet, and the request is made once more from its start
+// (src/utils/whole-answer-retry.js). Through the real controllers and the real egress, with
+// the stand-in for the worker: what gets the retry, what does not, how often, for how long
+// into the request, and for which answers.
+const wholeAnswerRetry = require('../src/utils/whole-answer-retry')
+const { handleChatCompletion } = require('../src/controllers/chat')
+const { handleAnthropicMessages } = require('../src/controllers/anthropic')
+
+// A frame of answer text; and the frame that closes an answer — its finish reason, and a usage
+// qwen.ai reports.
+const said = content => frame({ phase: 'answer', content })
+const CLOSED = `data: ${JSON.stringify({
+    id: 'c', object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { input_tokens: 4, output_tokens: 1 }
+})}\n\n`
+// An answer from its head to its end.
+const whole = (content = 'pong') => {
+    const stream = relay()
+    stream.head()
+    stream.chunk(said(content))
+    stream.chunk(CLOSED)
+    stream.chunk(DONE)
+    stream.end()
+    return stream
+}
+// An answer that began: qwen.ai's head, and one frame of text. What ends it is the test's to say.
+const begun = (content = 'cut ') => {
+    const stream = relay()
+    stream.head()
+    stream.chunk(said(content))
+    return stream
+}
+// An answer that begins and then dies: the same, and the error event the worker ends the relay with.
+const breaking = (code, content = 'cut ') => {
+    const stream = begun(content)
+    stream.fail(code)
+    return stream
+}
+// qwen.ai's refusal on the head of completions, its body and all.
+const headRefused = status => {
+    const stream = relay()
+    stream.head(status, { 'content-type': 'application/json' })
+    stream.chunk(`{"error":"scripted ${status}"}`)
+    stream.end()
+    return stream
+}
+// An answer with nothing but a thought in it: what makes each handler ask once more on its own —
+// the empty-output compensation of chat.js, the gate's correcting round of anthropic.js.
+const thought = () => {
+    const stream = relay()
+    stream.head()
+    stream.chunk(frame({ phase: 'think', content: 'hm' }))
+    stream.chunk(CLOSED)
+    stream.chunk(DONE)
+    stream.end()
+    return stream
+}
+// The worker's own refusal of a chats/new its page did not answer in time.
+const chatsNewTimedOut = () => refused(504, 'egress_timeout')
+const ACCEPTED = () => egress(chat('chat-1'))
+// One attempt of the request on the stand-in: what its chats/new is answered with, and its
+// completions relay (`null` where the attempt died before one was asked for). Either may be the
+// reply itself or a function giving it — a relay is made once, so a second use wants a new one.
+const attempt = (creation, answer) => ({ creation, answer })
+const served = scripted => (typeof scripted === 'function' ? scripted() : scripted)
+// The request's two attempts, in order. `asItDies` runs as the stand-in answers the call the
+// first attempt dies on — the moment the app learns of the death.
+const twoAttempts = (first, again, asItDies = () => {}) => {
+    const creations = [first.creation, again.creation].map(served)
+    const answers = [first.answer, again.answer].filter(Boolean).map(served)
+    worker.script.egress = body => {
+        if (body.stream === true) {
+            assert.ok(answers.length, 'more completions calls than the two attempts have between them')
+            if (answers.length > 1) asItDies()
+            return answers.shift().open
+        }
+        assert.ok(creations.length, 'more chats/new calls than the two attempts have between them')
+        if (first.answer === null && creations.length > 1) asItDies()
+        return creations.shift()
+    }
+}
+// The stand-in for a request with more to it than its chats/new and its completions relays: those
+// two in order, and every other call of the page — a context's attachment, its parse — left to `page`.
+const pageAndChats = (creations, relays, page) => {
+    worker.script.egress = body => {
+        if (body.stream === true) {
+            assert.ok(relays.length, 'more completions calls than the test has relays for')
+            return relays.shift().open
+        }
+        if (new URL(body.url).pathname === '/api/v2/chats/new') {
+            assert.ok(creations.length, 'more chats/new calls than the test has answers for')
+            return creations.shift()
+        }
+        return page(body)
+    }
+}
+// A request with tools, as the middleware hands it to the controllers, and the answer a turn
+// with tools is wrapped the way the agent prompt asks for (a bare text is not).
+const WITH_TOOLS = {
+    body: { tools: [{ type: 'function', function: { name: 'get_time', parameters: { type: 'object', properties: {} } } }] },
+    request: { has_tools: true, tool_choice: 'auto', allowed_tool_names: ['get_time'] }
+}
+const WITH_ANTHROPIC_TOOLS = {
+    body: { tools: [{ name: 'get_time', input_schema: { type: 'object', properties: {} } }] }
+}
+const turn = () => whole('<agent_final>pong</agent_final>')
+// The request's chats/new calls, as the stand-in recorded them: the body it was asked with, and
+// when it came.
+const chatsNew = () => worker.calls.filter(call => call.route === '/egress' && call.body.stream !== true)
+// What the stand-in saw of a request, for an assertion to say when it fails.
+const seen = () => JSON.stringify({ routes: worker.routes().map((route, at) => `${route}#${at + 1}`), said: logs.map(args => String(args[0]).slice(0, 60)) })
+
+// The three ways a first attempt dies that get the request made once more, how the line names
+// each, and how many calls to the worker the request makes in all with its retry.
+const FIRST = {
+    upstream_broke: { creation: ACCEPTED, answer: () => breaking('egress_failed'), reason: 'upstream_broke, egress_failed', calls: 4 },
+    upstream_5xx: { creation: ACCEPTED, answer: () => headRefused(502), reason: 'upstream_5xx, 502', calls: 4 },
+    chats_new_timeout: { creation: chatsNewTimedOut, answer: null, reason: 'chats_new_timeout', calls: 3 }
+}
+const retried = reason => [
+    `warn REQUEST 非流式整体重试 (原因: ${reason})`,
+    `info REQUEST 非流式整体重试成功 (原因: ${reason})`
+]
+
+// What the whole retry said while `fn` ran, as the logger was asked to print it. The file's
+// before-hook has logger.warn; logger.info is taken over for the call only.
+async function withRetryLines(fn) {
+    const said = []
+    const taken = {}
+    for (const level of ['warn', 'info']) {
+        taken[level] = logger[level]
+        logger[level] = function (...args) { said.push([level, ...args]); taken[level].apply(this, args) }
+    }
+    try {
+        await fn()
+    } finally {
+        Object.assign(logger, taken)
+    }
+    return said
+        .filter(([, message]) => String(message).startsWith('非流式整体重试'))
+        .map(([level, message, tag]) => `${level} ${tag} ${message}`)
+}
+
+// The two surfaces of a whole answer, as their controllers are asked once the middleware is
+// through with the request.
+const SURFACES = [
+    {
+        name: '/v1/chat/completions',
+        ask: (account, stream, res, extra = {}) => handleChatCompletion({
+            body: { model: MODEL, max_tokens: 64, stream, messages: [{ role: 'user', content: 'hello' }], ...extra.body },
+            enable_thinking: false, enable_web_search: false, has_tools: false, allowed_tool_names: [],
+            // The request's pictures were uploaded from this account's page: its chat is made on it too.
+            upload_account: account,
+            ...extra.request
+        }, res),
+        answered: res => res.body.choices[0].message.content
+    },
+    {
+        name: '/v1/messages',
+        ask: (account, stream, res, extra = {}) => handleAnthropicMessages({
+            body: { model: MODEL, max_tokens: 64, stream, messages: [{ role: 'user', content: 'hello' }], ...extra.body }
+        }, res),
+        answered: res => res.body.content.filter(block => block.type === 'text').map(block => block.text).join('')
+    }
+]
+// What each surface answers a first attempt that died and was not asked again: as it always did.
+// /v1/chat/completions gives for the error's code the transport's own (ECONNRESET for a relay
+// that broke, and so on): that is how it answered before, and it is gone into per case below.
+const NOT_RETRIED = {
+    '/v1/chat/completions': {
+        upstream_broke: [502, 'ECONNRESET', '上游响应处理失败'],
+        upstream_5xx: [502, 'upstream_error', 'Upstream did not produce a usable response'],
+        chats_new_timeout: [503, 'upstream_transport_error', 'Qwen chat creation transport failed']
+    },
+    '/v1/messages': {
+        upstream_broke: [500, undefined, 'Service error'],
+        upstream_5xx: [502, undefined, 'Upstream did not produce a usable response'],
+        chats_new_timeout: [503, 'upstream_transport_error', 'Qwen chat creation transport failed']
+    }
+}
+// One request through a surface on the account given: what the client got, and what the whole
+// retry said meanwhile. `drive` is handed the request under way, to stage the stand-in against
+// it, and settles once the request is over.
+async function through(surface, account, stream, extra, drive = null) {
+    const res = response()
+    let asking
+    const lines = await withAccount(account, () => withRetryLines(() => {
+        asking = within(surface.ask(account, stream, res, extra), DEADLINE, 'the request ending')
+        return drive ? drive(asking, res) : asking
+    }))
+    return { res, lines }
+}
+const theError = res => [res.statusCode, res.body?.error?.code, res.body?.error?.message]
+// What a request of these tests has left before its test's own deadline (15 s): a request that never
+// ends is reported as the wait that gave up on it, and not as the runner's clock running out first.
+const DEADLINE = 10000
+// `promise`, or a rejection once `ms` passed: a request that never ends fails its test instead of hanging it.
+const within = (asking, ms, what) => {
+    let timer
+    return Promise.race([
+        asking.finally(() => clearTimeout(timer)),
+        new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`not within ${ms} ms: ${what}`)), ms)
+        })
+    ])
+}
+// A request of these tests, before it is made: the stand-in and the log as if no test ran, the
+// account with its session, completions through the worker's relay (the before-hook above leaves
+// the transport on auto), and the retry's clock and pause as `setup` gives them — the process's
+// own unless it does.
+const afresh = (setup = {}) => {
+    worker.calls.length = 0
+    logs.length = 0
+    config.completionsTransport = 'browser'
+    wholeAnswerRetry.setWholeAnswerRetryForTests(setup)
+    return givenAccount()
+}
+
+for (const surface of SURFACES) {
+    for (const [kind, first] of Object.entries(FIRST)) {
+        test(`Qwen2API-jk9: ${surface.name}, without a stream: a first attempt that died of ${kind} is made once more, whole — and the client gets the second answer behind a 200`, { timeout: 15000 }, async () => {
+            // The pause before a retried chats/new is not waited out here: its length is its own test's.
+            const account = afresh({ pause: async () => {} })
+            twoAttempts(first, attempt(ACCEPTED, whole()))
+
+            const { res, lines } = await through(surface, account, false)
+
+            assert.equal(res.statusCode, 200, JSON.stringify(res.body))
+            assert.equal(surface.answered(res), 'pong', 'the second answer, and not a byte of the first')
+            assert.deepEqual(lines, retried(first.reason))
+            // A retry is a whole request: a new chats/new and a new completions call — one each, and no more.
+            assert.deepEqual(worker.routes(), Array(first.calls).fill('/egress'))
+            assert.equal(chatsNew().length, 2)
+            assert.equal(completionsCalls().length, kind === 'chats_new_timeout' ? 1 : 2)
+            // The same request again: what left the page for completions is what left it the first time.
+            if (kind !== 'chats_new_timeout') {
+                const [firstSend, again] = completionsCalls()
+                assert.deepEqual([firstSend.email, again.email], [EMAIL, EMAIL])
+                assert.deepEqual(JSON.parse(again.body), JSON.parse(firstSend.body))
+            }
+        })
+    }
+
+    test(`Qwen2API-jk9: ${surface.name}: an answer that broke under its reader is asked for again for qwen.ai's and the page's doing — and the line says which`, { timeout: 15000 }, async () => {
+        for (const code of ['egress_failed', 'page_closed', 'browser_error']) {
+            const account = afresh()
+            twoAttempts(attempt(ACCEPTED, breaking(code)), attempt(ACCEPTED, whole()))
+
+            const { res, lines } = await through(surface, account, false)
+
+            assert.equal(surface.answered(res), 'pong', code)
+            assert.deepEqual(lines, retried(`upstream_broke, ${code}`), code)
+            assert.equal(chatsNew().length, 2, code)
+        }
+    })
+
+    test(`Qwen2API-jk9: ${surface.name}: the relay's own failures under an answer are not asked again — the client gets what it always got, and the retry says nothing`, { timeout: 15000 }, async () => {
+        // How the relay fails other than by qwen.ai's or the page's break: its silence, its cut, its
+        // malformation, qwen.ai's silence under an answer that began, a script of the page, an account
+        // removed, a worker that is not there. The watchdog's relay_silent is staged as the error it
+        // destroys the stream with: through sendChatRequest its timer is the whole silence budget.
+        // The third of each is what /v1/chat/completions writes for the error's code where it is
+        // not the ECONNRESET of a relay that broke.
+        const DYING = [
+            ['relay_silent', () => breaking('relay_silent'), 'ETIMEDOUT'],
+            ['relay_closed', () => { const stream = begun(); stream.drop(); return stream }],
+            ['relay_malformed', () => { const stream = begun(); stream.raw({ type: 'surprise' }); return stream }, 'EGRESS_RELAY_MALFORMED'],
+            ['relay_error', () => { const stream = begun(); stream.raw({ type: 'error', code: '', message: 'scripted' }); return stream }],
+            ['egress_timeout', () => breaking('egress_timeout'), 'ETIMEDOUT'],
+            ['page_fault', () => breaking('page_fault')],
+            ['egress_too_large', () => breaking('egress_too_large')],
+            ['resident_capacity', () => breaking('resident_capacity')],
+            ['account_removed', () => breaking('account_removed')],
+            ['worker_unreachable', () => breaking('worker_unreachable')]
+        ]
+        for (const [code, dying, wireCode = 'ECONNRESET'] of DYING) {
+            const account = afresh()
+            twoAttempts(attempt(ACCEPTED, dying()), attempt(ACCEPTED, whole()))
+
+            const { res, lines } = await through(surface, account, false)
+
+            assert.deepEqual(lines, [], `${code}: nothing is said of a retry`)
+            assert.equal(chatsNew().length, 1, `${code}: the request is not made again`)
+            assert.equal(completionsCalls().length, 1, code)
+            const [status, , message] = NOT_RETRIED[surface.name].upstream_broke
+            assert.deepEqual(theError(res), [status, surface.name === '/v1/chat/completions' ? wireCode : undefined, message], code)
+        }
+    })
+
+    test(`Qwen2API-jk9: ${surface.name}: qwen.ai's 5xx on the head of completions is asked again — its 4xx and its 429 are not`, { timeout: 15000 }, async () => {
+        for (const status of [500, 502, 503, 504, 529]) {
+            const account = afresh()
+            twoAttempts(attempt(ACCEPTED, headRefused(status)), attempt(ACCEPTED, whole()))
+
+            const { value: { res, lines }, charged } = await charging(() => through(surface, account, false))
+
+            assert.equal(surface.answered(res), 'pong', String(status))
+            assert.deepEqual(lines, retried(`upstream_5xx, ${status}`), String(status))
+            assert.equal(chatsNew().length, 2, String(status))
+            // The retry costs the account nothing beyond what the first attempt's refusal always did.
+            assert.deepEqual(charged, [['recordAccountError', EMAIL, status]], String(status))
+        }
+        // The account's own refusals and its quota: a second request would be answered the same.
+        for (const status of [400, 403, 404, 429]) {
+            const account = afresh()
+            twoAttempts(attempt(ACCEPTED, headRefused(status)), attempt(ACCEPTED, whole()))
+
+            const { value: { res, lines }, charged } = await charging(() => through(surface, account, false))
+
+            assert.deepEqual(lines, [], String(status))
+            assert.equal(chatsNew().length, 1, `${status}: the request is not made again`)
+            assert.equal(completionsCalls().length, 1, String(status))
+            // As before: the 429 is the quota, with its status, and puts the account on its cooldown; the
+            // rest is the unclassified refusal, with the account's warn mark and nothing more.
+            assert.equal(res.statusCode, status === 429 ? 429 : NOT_RETRIED[surface.name].upstream_5xx[0], String(status))
+            assert.deepEqual(charged, [status === 429 ? ['recordAccountQuotaExhausted', EMAIL, null] : ['recordAccountError', EMAIL, status]], String(status))
+        }
+    })
+
+    test(`Qwen2API-jk9: ${surface.name}: only the worker's egress_timeout on chats/new is asked again — any other word of its on chats/new is not`, { timeout: 15000 }, async () => {
+        const pauses = []
+        for (const [status, code] of [[502, 'page_closed'], [503, 'resident_capacity'], [500, 'browser_error'], [401, 'unauthorized']]) {
+            const account = afresh({ pause: async ms => { pauses.push(ms) } })
+            twoAttempts(attempt(() => refused(status, code), null), attempt(ACCEPTED, whole()))
+
+            const { res, lines } = await through(surface, account, false)
+
+            assert.deepEqual(lines, [], code)
+            assert.equal(chatsNew().length, 1, `${code}: the request is not made again`)
+            assert.equal(completionsCalls().length, 0, code)
+            assert.deepEqual(theError(res), NOT_RETRIED[surface.name].chats_new_timeout, code)
+        }
+        assert.deepEqual(pauses, [], 'a chats/new that did not time out is not waited for')
+    })
+
+    test(`Qwen2API-jk9: ${surface.name}: with a stream nothing is asked again — the first attempt's failure is the client's, as before`, { timeout: 15000 }, async () => {
+        const pauses = []
+        for (const [kind, first] of Object.entries(FIRST)) {
+            const account = afresh({ pause: async ms => { pauses.push(ms) } })
+            // With a stream the answer reaches the client as it comes, so the relay is let break only
+            // once its first frame did: a stream of /v1/messages that breaks before a single block
+            // was delivered is failed over to another request of its own (anthropic.js#handleAnthropicStream) —
+            // the stream's retry, not this one.
+            const dying = kind === 'upstream_broke' ? begun() : null
+            twoAttempts(kind === 'upstream_broke' ? attempt(ACCEPTED, dying) : first, attempt(ACCEPTED, whole()))
+
+            const { res, lines } = await through(surface, account, true, undefined, async (asking, streamed) => {
+                if (!dying) return asking
+                await within((async () => {
+                    while (!streamed.output.includes('cut ')) await new Promise(resolve => setTimeout(resolve, 5))
+                })(), 5000, `the first frame of ${kind} reaching the client`)
+                dying.fail('egress_failed')
+                return within(asking, 5000, `${kind}: the streamed request ending`)
+            })
+
+            assert.deepEqual(lines, [], `${kind}; ${seen()}`)
+            assert.equal(chatsNew().length, 1, `${kind}: the request is not made again`)
+            assert.equal(completionsCalls().length, kind === 'chats_new_timeout' ? 0 : 1, kind)
+            // What reached the client is the first attempt's: its head, its status, its error — never the second answer.
+            assert.doesNotMatch(res.output, /pong/, `${kind}; ${seen()}`)
+            assert.doesNotMatch(JSON.stringify(res.body) || '', /pong/, `${kind}; ${seen()}`)
+        }
+        assert.deepEqual(pauses, [], 'a request with a stream is never asked again')
+    })
+
+    test(`Qwen2API-jk9: ${surface.name}: one retry per request — a retry that dies too is answered as that failure always was, with one line said and no success`, { timeout: 15000 }, async () => {
+        for (const [kind, first] of Object.entries(FIRST)) {
+            const account = afresh({ pause: async () => {} })
+            // The retry dies the same death.
+            const dies = kind === 'upstream_broke' ? breaking('egress_failed', 'cut again ')
+                : kind === 'upstream_5xx' ? headRefused(502) : null
+            twoAttempts(first, attempt(kind === 'chats_new_timeout' ? chatsNewTimedOut : ACCEPTED, dies))
+
+            const { res, lines } = await through(surface, account, false)
+
+            assert.deepEqual(lines, [`warn REQUEST 非流式整体重试 (原因: ${first.reason})`], `${kind}: begun, and never delivered; ${seen()}`)
+            assert.deepEqual(theError(res), NOT_RETRIED[surface.name][kind], `${kind}; ${seen()}`)
+            assert.equal(chatsNew().length, 2, `${kind}: a second request, and no third`)
+            assert.equal(completionsCalls().length, kind === 'chats_new_timeout' ? 0 : 2, kind)
+        }
+    })
+
+    test(`Qwen2API-jk9: ${surface.name}: a retry whose answer came to nothing is not told delivered — the client gets the failure it always got, and the one line is said`, { timeout: 15000 }, async () => {
+        const account = afresh({ pause: async () => {} })
+        // The first attempt dies under its reader; the retried answer ends with nothing in it, and no error.
+        const nothing = relay()
+        nothing.head()
+        nothing.end()
+        // Each surface asks once more for an answer with nothing in it — /v1/chat/completions by the
+        // empty-output compensation (chat.js), /v1/messages by the gate's correcting round (anthropic.js) —
+        // and that request is refused here, as it is when a chat cannot be made or qwen.ai says no.
+        const openai = surface.name === '/v1/chat/completions'
+        const relays = openai
+            ? [breaking('egress_failed'), nothing]
+            : [breaking('egress_failed'), nothing, headRefused(403)]
+        const creations = openai ? [ACCEPTED(), ACCEPTED(), refused(503, 'resident_capacity')] : [ACCEPTED(), ACCEPTED(), ACCEPTED()]
+        worker.script.egress = body => (body.stream === true ? relays.shift().open : creations.shift())
+
+        const { res, lines } = await through(surface, account, false)
+
+        assert.deepEqual(theError(res), openai
+            ? [503, 'upstream_transport_error', 'Qwen chat creation transport failed']
+            : [502, undefined, '上游重试后仍未返回正文或工具调用'], seen())
+        assert.deepEqual(lines, ['warn REQUEST 非流式整体重试 (原因: upstream_broke, egress_failed)'], seen())
+        assert.equal(chatsNew().length, 3, seen())
+    })
+
+    test(`Qwen2API-jk9: ${surface.name}: a refusal of chats/new on the handler's own round is not asked again — whatever word the worker puts on it`, { timeout: 15000 }, async () => {
+        // The first answer has nothing but a thought in it, and the handler asks once more on its own.
+        // That round's chats/new is refused as the worker refuses a call it could not carry — with the
+        // very words that on a read of an answer would get the request its whole retry. A refused call is
+        // not a broken read, and the handler answers it as it always did.
+        const pauses = []
+        for (const [status, code] of [[502, 'page_closed'], [500, 'browser_error'], [502, 'egress_failed'], [504, 'egress_timeout']]) {
+            const account = afresh({ pause: async ms => { pauses.push(ms) } })
+            pageAndChats([ACCEPTED(), refused(status, code)], [thought()])
+
+            const { res, lines } = await through(surface, account, false)
+
+            assert.deepEqual(theError(res), NOT_RETRIED[surface.name].chats_new_timeout, `${code}; ${seen()}`)
+            assert.deepEqual(lines, [], `${code}: nothing is said of a retry; ${seen()}`)
+            assert.equal(chatsNew().length, 2, `${code}: the handler's own round, and no whole retry`)
+            assert.equal(completionsCalls().length, 1, code)
+        }
+        assert.deepEqual(pauses, [], "no pause is sat out on the handler's own round")
+    })
+
+    test(`Qwen2API-jk9: ${surface.name}: qwen.ai's 5xx on the head of the handler's own round is not asked again either`, { timeout: 15000 }, async () => {
+        const pauses = []
+        const account = afresh({ pause: async ms => { pauses.push(ms) } })
+        pageAndChats([ACCEPTED(), ACCEPTED()], [thought(), headRefused(502)])
+
+        const { value: { res, lines }, charged } = await charging(() => through(surface, account, false))
+
+        assert.deepEqual(theError(res), [502, surface.name === '/v1/chat/completions' ? 'upstream_empty_output' : undefined, '上游重试后仍未返回正文或工具调用'], seen())
+        assert.deepEqual(lines, [], seen())
+        assert.equal(chatsNew().length, 2, seen())
+        assert.equal(completionsCalls().length, 2, seen())
+        // What it always cost the account: the refusal of that one completions call, and nothing for a retry there is not.
+        assert.deepEqual(charged, [['recordAccountError', EMAIL, 502]], seen())
+        assert.deepEqual(pauses, [])
+    })
+
+    test(`Qwen2API-jk9: ${surface.name}: a request six minutes old is not asked again — it is answered as it always was, and the retry says nothing`, { timeout: 15000 }, async () => {
+        const pauses = []
+        for (const [kind, first] of Object.entries(FIRST)) {
+            let now = 1_700_000_000_000
+            const account = afresh({ now: () => now, pause: async ms => { pauses.push(ms) } })
+            twoAttempts(first, attempt(ACCEPTED, whole()), () => { now += 6 * 60 * 1000 })
+
+            const { res, lines } = await through(surface, account, false)
+
+            assert.deepEqual(lines, [], kind)
+            assert.deepEqual(theError(res), NOT_RETRIED[surface.name][kind], kind)
+            assert.equal(chatsNew().length, 1, `${kind}: the request is not made again`)
+        }
+        assert.deepEqual(pauses, [], 'a request that is not asked again does not wait')
+    })
+}
+
+test('Qwen2API-jk9: the retry is the request itself again — the same body and options, on the account the first attempt named, and the rotator is not asked', { timeout: 15000 }, async () => {
+    const account = afresh({ pause: async () => {} })
+    let asked = 0
+    const getAccount = accountManager.getAccount
+    accountManager.getAccount = () => { asked += 1; return account }
+    try {
+        twoAttempts(FIRST.upstream_broke, attempt(ACCEPTED, whole()))
+
+        const res = response()
+        const lines = await withRetryLines(() => within(SURFACES[0].ask(account, false, res), DEADLINE, 'the request ending'))
+
+        assert.equal(SURFACES[0].answered(res), 'pong')
+        assert.deepEqual(lines, retried('upstream_broke, egress_failed'))
+        assert.equal(asked, 0, 'a request that names its account names it to the retry too')
+        assert.deepEqual(worker.sent('/egress').map(call => call.email), [EMAIL, EMAIL, EMAIL, EMAIL])
+        // What the page was asked the second time is what it was asked the first: the same call, to the
+        // same address, from the same account's page — a chats/new carries a timestamp of its own, and
+        // every call a request id of its own.
+        const pageCall = call => {
+            const { headers, body: page, ...rest } = call.body
+            const payload = JSON.parse(page)
+            if (payload.timestamp !== undefined) payload.timestamp = '<now>'
+            return { ...rest, headers: { ...headers, 'x-request-id': '<fresh>' }, body: payload }
+        }
+        const [created, createdAgain] = chatsNew().map(pageCall)
+        assert.deepEqual(createdAgain, created)
+        const [sent, sentAgain] = worker.calls
+            .filter(call => call.route === '/egress' && call.body.stream === true).map(pageCall)
+        assert.deepEqual(sentAgain, sent)
+    } finally {
+        accountManager.getAccount = getAccount
+    }
+})
+
+test('Qwen2API-jk9: after a chats/new that did not come back in time the request waits two seconds before it is asked again', { timeout: 20000 }, async t => {
+    const account = afresh()
+    twoAttempts(FIRST.chats_new_timeout, attempt(ACCEPTED, whole()))
+
+    const { res, lines } = await through(SURFACES[0], account, false)
+
+    assert.equal(SURFACES[0].answered(res), 'pong')
+    assert.deepEqual(lines, retried('chats_new_timeout'))
+    assert.equal(chatsNew().length, 2)
+    // Between the chats/new that timed out and the one after it. The floor leaves out what a timer
+    // may fire short by (a millisecond) and what a Windows clock tick takes: what it rules out is no
+    // pause, or a shorter one.
+    const waited = chatsNew()[1].at - chatsNew()[0].at
+    t.diagnostic(`the retry was asked ${Math.round(waited)} ms after the first chats/new`)
+    assert.ok(waited >= 1980, `the retry was asked ${Math.round(waited)} ms after the first chats/new`)
+})
+
+test('Qwen2API-jk9: the budget is half of what qwen.ai may take to answer one, counted from the request\'s start — a millisecond inside gets the retry, on the line it does not', { timeout: 15000 }, async () => {
+    const started = 1_700_000_000_000
+    const budget = wholeAnswerRetry.WHOLE_ANSWER_RETRY_BUDGET_MS
+    assert.equal(budget, browserEgress.COMPLETIONS_TIMEOUT_MS / 2)
+    for (const [age, again] of [[budget - 1, true], [budget, false]]) {
+        let now = started
+        const account = afresh({ now: () => now })
+        twoAttempts(FIRST.upstream_5xx, attempt(ACCEPTED, whole()), () => { now = started + age })
+
+        const { res, lines } = await through(SURFACES[0], account, false)
+
+        assert.equal(res.statusCode, again ? 200 : 502, `${age} ms old`)
+        assert.equal(chatsNew().length, again ? 2 : 1, `${age} ms old`)
+        assert.deepEqual(lines, again ? retried('upstream_5xx, 502') : [], `${age} ms old`)
+    }
+})
+
+test('Qwen2API-jk9: /v1/chat/completions with tools, without a stream: a turn that died on the way is made once more too, and the second turn is what the client gets', { timeout: 15000 }, async () => {
+    for (const [kind, first] of Object.entries(FIRST)) {
+        const account = afresh({ pause: async () => {} })
+        twoAttempts(first, attempt(ACCEPTED, turn()))
+
+        const { res, lines } = await through(SURFACES[0], account, false, WITH_TOOLS)
+
+        assert.equal(res.statusCode, 200, `${kind}: ${JSON.stringify(res.body)}`)
+        assert.equal(SURFACES[0].answered(res), 'pong', `${kind}: the second turn, and not a byte of the first`)
+        assert.equal(res.body.choices[0].finish_reason, 'stop', kind)
+        assert.deepEqual(lines, retried(first.reason), kind)
+        assert.equal(chatsNew().length, 2, kind)
+    }
+})
+
+for (const [surface, withTools] of [[SURFACES[0], WITH_TOOLS], [SURFACES[1], WITH_ANTHROPIC_TOOLS]]) {
+    test(`Qwen2API-jk9: ${surface.name} with tools, without a stream: one retry per request — a retry that dies too is answered as that failure always was`, { timeout: 15000 }, async () => {
+        for (const [kind, first] of Object.entries(FIRST)) {
+            const account = afresh({ pause: async () => {} })
+            // The retry dies the same death.
+            const dies = kind === 'upstream_broke' ? breaking('egress_failed', 'cut again ')
+                : kind === 'upstream_5xx' ? headRefused(502) : null
+            twoAttempts(first, attempt(kind === 'chats_new_timeout' ? chatsNewTimedOut : ACCEPTED, dies))
+
+            const { res, lines } = await through(surface, account, false, withTools)
+
+            assert.deepEqual(lines, [`warn REQUEST 非流式整体重试 (原因: ${first.reason})`], `${kind}: begun, and never delivered; ${seen()}`)
+            // A turn that broke under its reader is answered with the agent handler's own words on
+            // /v1/chat/completions, with the controller's on /v1/messages — as each always did.
+            assert.deepEqual(theError(res), kind === 'upstream_broke' && surface.name === '/v1/chat/completions'
+                ? [502, 'ECONNRESET', '上游 Agent 回合处理失败']
+                : NOT_RETRIED[surface.name][kind], `${kind}; ${seen()}`)
+            assert.equal(chatsNew().length, 2, `${kind}: a second request, and no third`)
+            assert.equal(completionsCalls().length, kind === 'chats_new_timeout' ? 0 : 2, kind)
+        }
+    })
+
+    test(`Qwen2API-jk9: ${surface.name} with tools, without a stream: what the handler's own round is refused by is not asked again`, { timeout: 15000 }, async () => {
+        // With tools the agent handlers ask once more on their own too. /v1/chat/completions for a turn that is
+        // bare prose where the prompt asks for the wrapper: its correcting round stays on the chat it has
+        // (utils/openai-agent-runtime.js#runOpenAIAgentTurn), so there is no chats/new to refuse on it — what
+        // can be refused is its completions call. /v1/messages for a turn with nothing but a thought in it:
+        // its correcting round makes a chat of its own, and that chats/new can be refused as the worker
+        // refuses a call it could not carry. Neither is a broken read, whatever stands on it: the handler
+        // answers as it always did.
+        const pauses = []
+        if (surface.name === '/v1/chat/completions') {
+            for (const status of [502, 503]) {
+                const account = afresh({ pause: async ms => { pauses.push(ms) } })
+                pageAndChats([ACCEPTED()], [whole('No tool here'), headRefused(status)])
+
+                const { res, lines } = await through(surface, account, false, withTools)
+
+                assert.deepEqual(theError(res), [502, 'upstream_retry_failed', 'Agent 回合纠正请求失败'], `${status}; ${seen()}`)
+                assert.deepEqual(lines, [], `${status}: nothing is said of a retry; ${seen()}`)
+                assert.equal(chatsNew().length, 1, `${status}: one chat, and no whole retry`)
+                assert.equal(completionsCalls().length, 2, status)
+            }
+        } else {
+            for (const [status, code] of [[502, 'page_closed'], [500, 'browser_error'], [502, 'egress_failed'], [504, 'egress_timeout']]) {
+                const account = afresh({ pause: async ms => { pauses.push(ms) } })
+                pageAndChats([ACCEPTED(), refused(status, code)], [thought()])
+
+                const { res, lines } = await through(surface, account, false, withTools)
+
+                assert.deepEqual(theError(res), NOT_RETRIED[surface.name].chats_new_timeout, `${code}; ${seen()}`)
+                assert.deepEqual(lines, [], `${code}: nothing is said of a retry; ${seen()}`)
+                assert.equal(chatsNew().length, 2, `${code}: the handler's own round, and no whole retry`)
+                assert.equal(completionsCalls().length, 1, code)
+            }
+        }
+        assert.deepEqual(pauses, [], "no pause is sat out on the handler's own round")
+    })
+}
+
+test('Qwen2API-jk9: a compensating answer that broke under its reader is the request\'s retry to make — not a 502 of empty output, and not a failure to log either', { timeout: 15000 }, async () => {
+    const account = afresh({ pause: async () => {} })
+    // The first answer has nothing but a thought in it: the empty-output compensation is asked for,
+    // on a new chat with a hint appended — and its answer dies under the reader.
+    const relays = [thought(), breaking('egress_failed'), whole()]
+    // Three chats of the client's kind: the first attempt's, the compensation's, the whole retry's.
+    const creations = [ACCEPTED(), ACCEPTED(), ACCEPTED()]
+    worker.script.egress = body => (body.stream === true ? relays.shift().open : creations.shift())
+
+    const res = response()
+    const lines = await withAccount(account, () => withRetryLines(() => within(SURFACES[0].ask(account, false, res), DEADLINE, 'the request ending')))
+
+    assert.equal(res.statusCode, 200, `${JSON.stringify(res.body)}; ${seen()}`)
+    assert.equal(SURFACES[0].answered(res), 'pong')
+    assert.deepEqual(lines, retried('upstream_broke, egress_failed'))
+    // The whole retry is the request from its start: a new chats/new, with the client's body — not the hint.
+    assert.equal(chatsNew().length, 3)
+    assert.equal(completionsCalls().length, 3)
+    assert.equal(JSON.parse(completionsCalls()[1].body).messages.at(-1).content.includes('# Tool-call retry'), true,
+        'the compensation is the second completions call, and carries the hint')
+    assert.equal(JSON.parse(completionsCalls()[2].body).messages.at(-1).content, 'hello')
+    // A break that gets the request its retry is no failure of the compensation: nothing is logged as one,
+    // and the counter of the logs has no error line to list for a request answered with a 200.
+    assert.equal(logs.filter(args => args[0] === 'Agent 补偿重试失败').length, 0, seen())
+})
+
+test('Qwen2API-jk9: on a direct transport too — an answer whose connection went under it is asked again, and the line names the code', { timeout: 15000 }, async () => {
+    const account = afresh()
+    // Plain axios for completions, answered by the test; chats/new still through the page.
+    config.completionsTransport = 'axios'
+    // The connection goes under the answer after its first frame; then a whole one.
+    const answers = [
+        Readable.from((async function* () { yield said('cut '); throw Object.assign(new Error('other side closed'), { code: 'ECONNRESET' }) })()),
+        Readable.from([said('pong'), CLOSED, DONE])
+    ]
+    directReply = async () => ({ status: 200, headers: {}, data: answers.shift() })
+    worker.script.egress = () => ACCEPTED()
+
+    const res = response()
+    const lines = await withAccount(account, () => withRetryLines(() => within(SURFACES[0].ask(account, false, res), DEADLINE, 'the request ending')))
+
+    assert.equal(res.statusCode, 200, `${JSON.stringify(res.body)}; ${seen()}`)
+    assert.equal(SURFACES[0].answered(res), 'pong')
+    assert.deepEqual(lines, retried('network_error, ECONNRESET'))
+    assert.equal(chatsNew().length, 2)
+    assert.equal(direct.length, 2)
+})
+
+test('Qwen2API-jk9: an answer that ended early without an error is not asked again — it is the answer it always was', { timeout: 15000 }, async () => {
+    for (const surface of SURFACES) {
+        const account = afresh()
+        // The relay ends cleanly after one frame: no finish reason, no [DONE], and no error.
+        const early = relay()
+        early.head()
+        early.chunk(said('cut '))
+        early.end()
+        twoAttempts(attempt(ACCEPTED, early), attempt(ACCEPTED, whole()))
+
+        const { res, lines } = await through(surface, account, false)
+
+        assert.deepEqual(lines, [], surface.name)
+        assert.equal(chatsNew().length, 1, surface.name)
+        assert.equal(res.statusCode, 200, surface.name)
+        assert.equal(surface.answered(res), 'cut ', surface.name)
+    }
+})
+
+test('Qwen2API-jk9: the warning of a context that was cut is the delivered attempt\'s — through the request module, on a retried request', { timeout: 20000 }, async () => {
+    const HEADER = 'X-Qwen2API-Context-Compacted'
+    // A context over the threshold: its attachment is asked for before completions. Where the page gives no
+    // token for it, the context is cut to what fits inline — the attempt the warning is for
+    // (utils/request.js#contextCompacted).
+    const LONG = { messages: [{ role: 'user', content: 'x'.repeat(4096) }] }
+    const chatsMade = () => worker.calls.filter(call => call.route === '/egress' && new URL(call.body.url).pathname === '/api/v2/chats/new').length
+    const cuts = () => logs.filter(args => String(args[0]).startsWith('Agent 上下文附件失败，已保留最近上下文')).length
+    const threshold = config.agentContextFileThresholdBytes
+    config.agentContextFileThresholdBytes = 2048
+    upload.resetParseBreaker()
+    upload.resetParseRateLimiter()
+    try {
+        for (const surface of SURFACES) {
+            // `refusedTokens`: how many token calls the page refuses before it answers one; `cuts`: the attempts
+            // that asked and got none, and cut their context; `warned`: whether the answer carries the warning;
+            // `chats`: the chats the request made; `begun`: whether its retry was begun.
+            for (const { named, refusedTokens, relays, creations, status, warned, cut, puts: uploaded, retried: askedAgain, chats, begun } of [
+                // Not retried at all: the warning is on the answer whose context was cut, as it always was.
+                { named: 'one attempt, its context cut', refusedTokens: Infinity,
+                    relays: () => [whole()], creations: () => [ACCEPTED()],
+                    status: 200, warned: true, cut: 1, puts: 0, retried: false, chats: 1, begun: false },
+                { named: 'the first attempt cut its context, the retry\'s went up whole', refusedTokens: 1,
+                    relays: () => [breaking('egress_failed'), whole()], creations: () => [ACCEPTED(), ACCEPTED()],
+                    status: 200, warned: false, cut: 1, puts: 1, retried: true, chats: 2, begun: true },
+                { named: 'both attempts cut their context', refusedTokens: Infinity,
+                    relays: () => [breaking('egress_failed'), whole()], creations: () => [ACCEPTED(), ACCEPTED()],
+                    status: 200, warned: true, cut: 2, puts: 0, retried: true, chats: 2, begun: true },
+                { named: 'the first attempt cut its context, the retry was refused on the head of completions', refusedTokens: Infinity,
+                    relays: () => [breaking('egress_failed'), headRefused(502)], creations: () => [ACCEPTED(), ACCEPTED()],
+                    status: 502, warned: false, cut: 2, puts: 0, retried: false, chats: 2, begun: true },
+                { named: 'the first attempt cut its context, the retry\'s chats/new was refused', refusedTokens: Infinity,
+                    relays: () => [breaking('egress_failed')], creations: () => [ACCEPTED(), refused(503, 'resident_capacity')],
+                    status: 503, warned: false, cut: 1, puts: 0, retried: false, chats: 2, begun: true }
+            ]) {
+                const account = afresh({ pause: async () => {} })
+                // Each attempt whose attachment failed counts on the upload module's parse limiter: a
+                // scenario starts with it as the process does, and not exhausted by the ones before.
+                upload.resetParseBreaker()
+                upload.resetParseRateLimiter()
+                let tokens = 0
+                qwenFilesBehindThePage(() => (tokens++ < refusedTokens ? stsRefused() : json({ success: true, data: STS })), PARSE_OK, parsed(STS.file_id))
+                pageAndChats(creations(), relays(), worker.script.egress)
+                const puts = []
+
+                const { res, lines } = await withOssPut(putRecording(puts), () => through(surface, account, false, { body: LONG }))
+
+                assert.equal(res.statusCode, status, `${surface.name}, ${named}: ${JSON.stringify(res.body)}; ${seen()}`)
+                if (status === 200) assert.equal(surface.answered(res), 'pong', `${surface.name}, ${named}`)
+                // The warning is the delivered attempt's own — its size, not the one's that died —, or nobody's.
+                if (warned) {
+                    assert.ok(Number(res.headers[HEADER]) >= 2048, `${surface.name}, ${named}: ${seen()}`)
+                } else {
+                    assert.equal(res.headers[HEADER], undefined, `${surface.name}, ${named}: ${seen()}`)
+                }
+                assert.equal(cuts(), cut, `${surface.name}, ${named}; ${seen()}`)
+                assert.equal(chatsMade(), chats, `${surface.name}, ${named}; ${seen()}`)
+                assert.deepEqual(lines, askedAgain ? retried('upstream_broke, egress_failed')
+                    : begun ? ['warn REQUEST 非流式整体重试 (原因: upstream_broke, egress_failed)'] : [], `${surface.name}, ${named}`)
+                // The attachment that went up: the retry's, where the page gave its token.
+                assert.equal(puts.length, uploaded, `${surface.name}, ${named}`)
+            }
+        }
+    } finally {
+        config.agentContextFileThresholdBytes = threshold
+    }
 })

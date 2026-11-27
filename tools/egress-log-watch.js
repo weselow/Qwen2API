@@ -29,6 +29,16 @@
  * closer than planned); and three of the app's own lines — an answer
  * that failed while the app handled it, and a call the app made again after
  * the relay broke — are counted as what they are, not listed as unknown.
+ *
+ * Since Qwen2API-jk9 (2026-11-27) the two lines of a whole answer asked for
+ * once more are counted the same way: one request without a stream whose
+ * first attempt died before a byte reached its client is made again —
+ * `app.wholeAnswerRetry`, by why —, and its answer is delivered —
+ * `app.wholeAnswerRetry.delivered`. They are a symptom, not a verdict: what
+ * broke is said by the lines that already make the verdict (a stream that
+ * ended with an error, an answer that failed under the application), and a
+ * retry that was not delivered is not a failure by itself — its client may
+ * have gone away while it was under way.
  */
 
 // Terminal colors, as the logger writes them on a console.
@@ -234,6 +244,16 @@ function readAppLine(report, level, message) {
     } else if (message === '非流式聊天处理错误') {
         // The same of an answer without a stream: the client gets a 502.
         bump(report, 'app.wholeAnswerFailed')
+    } else if ((found = /^非流式整体重试 \(原因: ([a-z_0-9]+)(?:, .*)?\)$/.exec(message))) {
+        // Since Qwen2API-jk9 (2026-11-27): a request without a stream whose first attempt died before a byte
+        // of its answer reached the client is made once more, whole (src/utils/whole-answer-retry.js). Counted
+        // altogether, and by why: upstream_broke, network_error, upstream_5xx, chats_new_timeout. What the
+        // reason carries after its comma — the relay's code, the status — stays in the line.
+        bump(report, 'app.wholeAnswerRetry')
+        bump(report, `app.wholeAnswerRetry.${found[1]}`)
+    } else if (/^非流式整体重试成功 \(原因: /.test(message)) {
+        // ...and the retried answer reached the client.
+        bump(report, 'app.wholeAnswerRetry.delivered')
     } else if (message.startsWith('聊天请求传输错误')) {
         // A call the app makes once more, nothing having reached its client yet (src/utils/request.js).
         bump(report, 'app.retried')

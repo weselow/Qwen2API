@@ -9,6 +9,7 @@ const {
 const { stripAgentTags } = require('../utils/agent-turn.js')
 const { createUpstreamResponseFilter } = require('../utils/sse.js')
 const { watchClient, isClientGone, consumeWhileClientStays } = require('../utils/client-gone.js')
+const { createWholeAnswerRetry } = require('../utils/whole-answer-retry.js')
 const accountManager = require('../utils/account.js')
 const config = require('../config/index.js')
 const { logger } = require('../utils/logger')
@@ -545,6 +546,13 @@ const handleOpenAIAgentNonStream = async (
     } catch (error) {
         // The client went away and the upstream was closed for it: nothing failed.
         if (isClientGone(error)) return
+        // Since Qwen2API-jk9 (2026-11-27): an answer that broke while it was read, before a byte of it reached
+        // the client, is the request's whole retry to make, and making it is the caller's
+        // (utils/whole-answer-retry.js): it sends the request again and calls this again on the new answer, the
+        // turn read from its first frame. Only such a break is let out — of a round's answer as it was read;
+        // never a call refused on a correcting round of this turn's, whatever the word on it — and only while
+        // the request still has its retry. Every other failure is answered below, as before.
+        if (options.wholeAnswerRetry?.wants(error)) throw error
         logger.error('OpenAI 非流式 Agent 回合处理失败', 'AGENT', '', error)
         if (!error.accountFailureRecorded) {
             noteRateLimitedAccount(error, error.failedAccountEmail ? { email: error.failedAccountEmail } : options.currentAccount)
@@ -589,6 +597,9 @@ const handleOpenAIAgentNonStream = async (
         choices: [{ index: 0, message: assistantMessage, finish_reason: finishReason }],
         usage
     })
+    // Since Qwen2API-jk9 (2026-11-27): the answer was delivered. It is what the whole retry goes by to tell
+    // its second request's answer from a failure this answered on the way (utils/whole-answer-retry.js).
+    return true
 }
 
 const handleStreamResponse = async (res, response, enable_thinking, enable_web_search, requestBody = null, options = {}) => {
@@ -1118,6 +1129,11 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
             } catch (e) {
                 // The client went away and the upstream was closed for it: nothing failed.
                 if (isClientGone(e)) throw e
+                // Since Qwen2API-jk9 (2026-11-27): the compensating answer broke under its reader with the client
+                // still told nothing — the request's whole retry to make, and the catch below lets it out to it.
+                // Asked of the retry first: a break it takes is no failure of the compensation to log. A call
+                // refused on this round is not a broken read, whatever the worker's word on it, and is logged.
+                if (options.wholeAnswerRetry?.wants(e)) throw e
                 logger.error('Agent 补偿重试失败', 'CHAT', '', e)
                 if (e.publicMessage) throw e
             }
@@ -1181,10 +1197,20 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
             "usage": totalTokens
         }
         res.json(bodyTemplate)
+        // Since Qwen2API-jk9 (2026-11-27): the answer was delivered. It is what the whole retry goes by to tell
+        // its second request's answer from a failure this answered on the way (utils/whole-answer-retry.js).
+        return true
     } catch (error) {
         // The client went away and the upstream was closed for it: nothing failed,
         // and there is nobody to answer with an error.
         if (isClientGone(error)) return
+        // Since Qwen2API-jk9 (2026-11-27): an answer that broke while it was read, before a byte of it reached
+        // the client, is the request's whole retry to make, and making it is the caller's
+        // (utils/whole-answer-retry.js): it sends the request again and calls this again on the new answer, read
+        // from its first byte. Only such a break is let out — of this answer's or of the compensating answer's
+        // read; never a call refused on a round of this handler's own, whatever the word on it — and only while
+        // the request still has its retry. Every other failure is answered here, as before.
+        if (options.wholeAnswerRetry?.wants(error)) throw error
         logger.error('非流式聊天处理错误', 'CHAT', '', error)
         noteRateLimitedAccount(error, options.currentAccount)
         if (!res.headersSent) writeOpenAIHttpError(res, upstreamErrorShape(error, '上游响应处理失败'))
@@ -1206,6 +1232,15 @@ const handleChatCompletion = async (req, res) => {
     // Watched until the response is over: a client that goes away takes its
     // upstream with it, on the signal of req and its socket (utils/client-gone.js).
     const client = watchClient(req)
+    // Since Qwen2API-jk9 (2026-11-27): a request without a stream whose first attempt dies before a byte of
+    // its answer reached the client is made once more, whole (utils/whole-answer-retry.js). Its budget is counted
+    // from here — the handler's start, ahead of the first chats/new — so it is made now; a request with a stream
+    // leaves it unused, as what a stream delivered cannot be taken back.
+    const wholeAnswer = createWholeAnswerRetry({ client })
+    // Whether the attempt being answered warned the client of a context it had to cut
+    // (utils/request.js#contextCompacted): the warning is set as the attempt is answered, and taken back
+    // when a second request is made for the client — the attempt before it died with nothing answered.
+    let compactedWarning = false
     try {
         // Gemelo de anthropic.js: compactar solo sin tools; con tools el fallo del
         // adjunto sale como 503 reintentable (catch de abajo). La clave de sesion permite
@@ -1223,72 +1258,108 @@ const handleChatCompletion = async (req, res) => {
                 firstMessage: requestMessages.find(message => message?.role !== 'system') ?? null
             })
         }
-        const response_data = await sendChatRequest(req.body, {
-            ...upstreamOptions,
-            // The request's pictures were uploaded from this account's page: its chat is made
-            // on it too (Qwen2API-fjk). A request that uploaded nothing names no account here.
-            ...(req.upload_account ? { currentAccount: req.upload_account } : {})
-        })
-
-        if (!response_data.status || !response_data.response) {
-            // El fallo dice por que fallo: cuota 429 `insufficient_quota`, sobrecarga o
-            // transporte 503, sin clasificar 502. Antes: un 500 mudo para todo, con el que
-            // un cliente agentico no podia distinguir "vuelve luego" de "servidor roto".
-            return writeOpenAIHttpError(res, openAIErrorShape(
-                response_data.failure || unclassifiedFailure(502),
-                response_data.message || 'Upstream did not produce a usable response'
-            ))
+        // One request as the client made it: the first, and the whole retry after it — the same body and the
+        // same options again (Qwen2API-jk9).
+        let second = false
+        const send = () => {
+            // The second request is the whole retry. The attempt before it died with nothing answered, and
+            // the warning it set for a context it had to cut is not the warning of whatever is answered next,
+            // delivered or not. Taken back before the request is made, while the answer is still free: every
+            // way the retry can end — a read, a refusal, a call that throws — then finds it gone.
+            if (second && compactedWarning) {
+                res.removeHeader('X-Qwen2API-Context-Compacted')
+                compactedWarning = false
+            }
+            second = true
+            return sendChatRequest(req.body, {
+                ...upstreamOptions,
+                // The request's pictures were uploaded from this account's page: its chat is made
+                // on it too (Qwen2API-fjk). A request that uploaded nothing names no account here.
+                ...(req.upload_account ? { currentAccount: req.upload_account } : {})
+            })
         }
+        // The request refused outright — no chat, no answer —, for the client to be told of it.
+        // El fallo dice por que fallo: cuota 429 `insufficient_quota`, sobrecarga o
+        // transporte 503, sin clasificar 502. Antes: un 500 mudo para todo, con el que
+        // un cliente agentico no podia distinguir "vuelve luego" de "servidor roto".
+        const refuse = (response_data) => writeOpenAIHttpError(res, openAIErrorShape(
+            response_data.failure || unclassifiedFailure(502),
+            response_data.message || 'Upstream did not produce a usable response'
+        ))
+        if (!stream) {
+            // One answer of this request read whole and handed to the client; true once it was. Anything else
+            // this resolves with is a failure it answered itself — an answer that ended early, a turn the gate
+            // refused —, which is no delivery.
+            const answerWithoutStream = async (response_data) => {
+                // Aviso al cliente cuando el contexto se recortó en silencio. El fallback por fallo
+                // del adjunto deja pasar un 200 con una fracción del contexto original: sin esta
+                // cabecera el cliente cree que el modelo lo vio todo. Convención existente:
+                // anthropic.compatibility.js#X-Qwen2API-Anthropic-Warnings.
+                if (response_data.contextCompacted) {
+                    res.set('X-Qwen2API-Context-Compacted', String(response_data.contextSerializedBytes || 0))
+                    compactedWarning = true
+                }
+                setResponseHeaders(res, false)
+                return (await handleNonStreamResponse(res, response_data.response, enable_thinking, enable_web_search, model, req.body, {
+                    has_tools: req.has_tools,
+                    tool_choice: req.tool_choice,
+                    allowed_tool_names: req.allowed_tool_names,
+                    // Puertas de schema del parser (reparacion de comillas / aceptacion tras
+                    // prosa). Sin esto ambas fallan cerradas en el runtime de Agent.
+                    tool_schemas: req.tool_schemas,
+                    // Semilla del ledger de deduplicacion (chat-middleware.js). Informa, no suprime.
+                    tool_history_calls: req.tool_history_calls,
+                    currentAccount: response_data.currentAccount,
+                    upstreamOptions,
+                    client,
+                    upstream_request_body: response_data.requestBody,
+                    upstream_context: {
+                        chatId: response_data.chatId,
+                        parentId: response_data.parentId
+                    },
+                    // Since Qwen2API-jk9 (2026-11-27): asked of a read that ended in an error, before the
+                    // failure is answered — the request's whole retry to make, or not.
+                    wholeAnswerRetry: wholeAnswer
+                })) === true
+            }
+            // Since Qwen2API-jk9 (2026-11-27): the first attempt, and — when it dies in a way the whole retry is
+            // for — the request made once more, answered by this same handler on the new answer. A request
+            // without a stream is over when this returns: delivered, or answered with the failure of its
+            // second attempt, or gone with its client.
+            await wholeAnswer.run({ send, refused: refuse, answer: answerWithoutStream })
+            return
+        }
+        // From here on the request has a stream, and what a stream delivered cannot be taken back: one request.
+        const response_data = await send()
+        if (!response_data.status || !response_data.response) return refuse(response_data)
 
-    // Aviso al cliente cuando el contexto se recortó en silencio. El fallback por fallo
-    // del adjunto deja pasar un 200 con una fracción del contexto original: sin esta
-    // cabecera el cliente cree que el modelo lo vio todo. Convención existente:
-    // anthropic.compatibility.js#X-Qwen2API-Anthropic-Warnings.
+        // Aviso al cliente cuando el contexto se recortó en silencio. El fallback por fallo
+        // del adjunto deja pasar un 200 con una fracción del contexto original: sin esta
+        // cabecera el cliente cree que el modelo lo vio todo. Convención existente:
+        // anthropic.compatibility.js#X-Qwen2API-Anthropic-Warnings.
         if (response_data.contextCompacted) {
             res.set('X-Qwen2API-Context-Compacted', String(response_data.contextSerializedBytes || 0))
         }
 
-        if (stream) {
-            setResponseHeaders(res, true)
-            await handleStreamResponse(res, response_data.response, enable_thinking, enable_web_search, req.body, {
-                has_tools: req.has_tools,
-                tool_choice: req.tool_choice,
-                allowed_tool_names: req.allowed_tool_names,
-                // Puertas de schema del parser (reparacion de comillas / aceptacion tras
-                // prosa). Sin esto ambas fallan cerradas en el runtime de Agent.
-                tool_schemas: req.tool_schemas,
-                // Semilla del ledger de deduplicacion (chat-middleware.js). Informa, no suprime.
-                tool_history_calls: req.tool_history_calls,
-                currentAccount: response_data.currentAccount,
-                upstreamOptions,
-                client,
-                upstream_request_body: response_data.requestBody,
-                upstream_context: {
-                    chatId: response_data.chatId,
-                    parentId: response_data.parentId
-                }
-            })
-        } else {
-            setResponseHeaders(res, false)
-            await handleNonStreamResponse(res, response_data.response, enable_thinking, enable_web_search, model, req.body, {
-                has_tools: req.has_tools,
-                tool_choice: req.tool_choice,
-                allowed_tool_names: req.allowed_tool_names,
-                // Puertas de schema del parser (reparacion de comillas / aceptacion tras
-                // prosa). Sin esto ambas fallan cerradas en el runtime de Agent.
-                tool_schemas: req.tool_schemas,
-                // Semilla del ledger de deduplicacion (chat-middleware.js). Informa, no suprime.
-                tool_history_calls: req.tool_history_calls,
-                currentAccount: response_data.currentAccount,
-                upstreamOptions,
-                client,
-                upstream_request_body: response_data.requestBody,
-                upstream_context: {
-                    chatId: response_data.chatId,
-                    parentId: response_data.parentId
-                }
-            })
-        }
+        setResponseHeaders(res, true)
+        await handleStreamResponse(res, response_data.response, enable_thinking, enable_web_search, req.body, {
+            has_tools: req.has_tools,
+            tool_choice: req.tool_choice,
+            allowed_tool_names: req.allowed_tool_names,
+            // Puertas de schema del parser (reparacion de comillas / aceptacion tras
+            // prosa). Sin esto ambas fallan cerradas en el runtime de Agent.
+            tool_schemas: req.tool_schemas,
+            // Semilla del ledger de deduplicacion (chat-middleware.js). Informa, no suprime.
+            tool_history_calls: req.tool_history_calls,
+            currentAccount: response_data.currentAccount,
+            upstreamOptions,
+            client,
+            upstream_request_body: response_data.requestBody,
+            upstream_context: {
+                chatId: response_data.chatId,
+                parentId: response_data.parentId
+            }
+        })
 
     } catch (error) {
         logger.error('聊天处理错误', 'CHAT', '', error)

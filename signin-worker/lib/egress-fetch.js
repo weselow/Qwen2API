@@ -433,6 +433,20 @@ const pageAbortStream = ({ registry, id, reason }) => {
 // three minutes left, or after it was refused as unauthorized: never on a
 // timer. So a page that only the worker talks to keeps an expired token until
 // qwen.ai refuses a call for it.
+//
+// Read again on 2026-11-27, off main.js of 0.3.51, 0.3.52, 0.3.53 and 0.3.54:
+// the call, the margin and the writer are the same in all of them under other
+// names (the interceptor nV, the writer FC; compared piece by piece, the names
+// set aside). One thing had been read wrong in 0.3.50. Its interceptor sets
+// x-request-origin — the origin of the page itself — on what goes to /auths/*
+// and on three other auth paths (/users/logout/, /users/reset/password,
+// /oauth/), and on nothing else; it was taken to set it on everything but
+// those. So the refresh the worker made went out without the header the front
+// end's own carries, and qwen.ai refused it each time it was tried live
+// (2026-11-27: status 200, code Bad_Request) — as it had refused a refresh
+// without the front end's headers on 2026-11-21 ("Invalid request header" →
+// "Missing origin", docs/et0-live-integration-2026-11-21.md). That the header
+// is what it wanted is what the live check of the next rollout is for.
 
 // The two functions below run in the page as their source, and carry the names
 // the front end keeps its token under as literals: the state it reads first
@@ -501,14 +515,18 @@ function pageTokenState() {
  * it must not reference anything from this module.
  *
  * The front end's own token refresh (main.js of 0.3.50, performHttpRefresh and
- * the request interceptor SV): a GET on the auth host — another origin than the
+ * the request interceptor SV; the same in 0.3.51, 0.3.52, 0.3.53 and 0.3.54,
+ * where the interceptor is nV): a GET on the auth host — another origin than the
  * chat's, so the session's cookies ride along by `withCredentials` and the
  * browser asks the host first whether it may send these headers — made as an
  * XMLHttpRequest, with no Bearer and no body. Of its headers, what every
  * request of the page's own API client carries; Content-Type is not among them,
- * as axios drops it from a request that has no body. A fresh access token is
- * the answer; it is written the way the front end's IC writes one, so that the
- * front end's own requests find it too. Listened to with addEventListener, as
+ * as axios drops it from a request that has no body. And x-request-origin, the
+ * page's own origin: the interceptor sets it on what goes to /auths/* and on
+ * three other auth paths, on nothing else (read the other way round on
+ * 2026-11-26; see above). A fresh access token is the answer; it is written
+ * the way the front end's IC writes one, so that the front end's own requests
+ * find it too. Listened to with addEventListener, as
  * pageCall listens: the page's request hooks are known to hold an answer back
  * from the onload PROPERTIES.
  *
@@ -566,7 +584,10 @@ function pageRefreshToken({ url, timeoutMs, sourceId }) {
                 source: 'web',
                 // The front end's own form: the date's string without the zone's name in brackets.
                 timezone: new Date().toString().replace(/\s*\(.+\)$/, ''),
-                'x-request-id': uuid()
+                'x-request-id': uuid(),
+                // Which page asks: the interceptor sets this on what goes to /auths/* and three
+                // other auth paths, on nothing else. The page says it of itself, wherever it is.
+                'x-request-origin': globalThis.location.origin
             }
             if (version) sent.version = version
             return sent
