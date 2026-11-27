@@ -211,6 +211,13 @@ class TokenManager {
      * (sessionLost) откатывается на полный вход с паролем.
      */
     async refreshBrowserSession(account, options = {}) {
+        // Taken before the worker is asked, as refreshLabSession takes it: a
+        // session published while the worker was out (a recovery, a sign-in)
+        // is not displaced in the store by what this ends with — which may be
+        // the worker's cached, refused token still (Qwen2API-cke). The record
+        // takes this token all the same; the recovery's adoption, in the account's
+        // queue behind this one, puts its own back (account.js#adoptSessionToken).
+        const previous = v2sessions.sessions.get(account.email)
         try {
             let harvested
             try {
@@ -222,7 +229,6 @@ class TokenManager {
             const decoded = this.validateToken(harvested.token)
             if (!decoded) throw new SigninError('signin_upstream_error', 502, 'Signin worker returned an invalid token.')
             const next = { token: harvested.token, expiresAt: decoded.exp, jar: harvested.jar }
-            const previous = v2sessions.sessions.get(account.email)
             const publish = () => {
                 const current = v2sessions.sessions.get(account.email)
                 // publishSession 同时写 store 与持久层（jik.4）；

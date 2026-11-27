@@ -774,13 +774,28 @@ class Account {
      * with it (Qwen2API-3ue.2). The record follows IN PLACE: every holder of
      * the account object — rotation, a request already in flight — sees the
      * live token, which is what the v2 session store now accepts.
+     * In the account's queue of mutations, like every other change of its
+     * record (Qwen2API-cke): a refresh of the same account that is out at the
+     * worker would otherwise end after it and put its own token back on
+     * record — the sign-in's result, published first, was lost on the record.
      * @param {string} email - 邮箱地址
      * @param {{token: string, expiresAt: number}} session - The renewed session
-     * @returns {Promise<boolean|null>} null: no such account; false: storage refused the token
+     * @returns {Promise<boolean|null>} null: no such account; false: storage refused
+     *   the token; true: the token is on record already, or the store holds another
+     *   session now and there is nothing to adopt
      */
     async adoptSessionToken(email, session) {
+        return this._runAccountMutation(email, () => this._adoptSessionToken(email, session))
+    }
+
+    async _adoptSessionToken(email, session) {
         const account = this.accountTokens.find(acc => acc.email === email)
         if (!account) return null
+        // The store holds another session now, or none: one may have been published
+        // while this waited its turn (a refresh that began after the session was
+        // published and ended before this ran). The record follows the store, not a
+        // session it no longer holds (Qwen2API-cke).
+        if (v2sessions.sessions.get(email)?.token !== session.token) return true
         if (account.token === session.token) return true
         account.token = session.token
         account.expires = session.expiresAt
