@@ -89,8 +89,13 @@ services:
       - RESIDENT_LOAD_MAX_WAIT_MS=${RESIDENT_LOAD_MAX_WAIT_MS:-120000}
       # Removing an account in the app tells the worker (POST /forget), which
       # drops its session and closes its page. Set to true, the browser
-      # profile goes too: an account added again then signs in afresh.
+      # profile goes too — not at once, but after the pause below: an account
+      # added again inside it keeps its profile and skips the sign-in
+      # (Qwen2API-t8s); one added again after it signs in afresh.
       - SIGNIN_FORGET_DELETES_PROFILE=${SIGNIN_FORGET_DELETES_PROFILE:-false}
+      # The pause before a removed account's profile is deleted, in ms.
+      # 0 = at once.
+      - SIGNIN_FORGET_GRACE_MS=${SIGNIN_FORGET_GRACE_MS:-120000}
     # One Chromium profile per account; keep them on a volume so auth.qwen.ai
     # sessions survive restarts and renewal stays a silent reload.
     volumes:

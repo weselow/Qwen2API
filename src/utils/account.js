@@ -96,9 +96,10 @@ const _hasNonZeroStats = (stats) => {
         || (Number(l.output) || 0) > 0
 }
 
-// What the worker's /forget reports of the browser profile (Qwen2API-2l0):
-// deleted or not deletable are worth a word, kept and never-there are not.
-const FORGET_PROFILE_NOTE = { deleted: '，浏览器配置已删除', left: '，浏览器配置没能删除', absent: '', kept: '' }
+// What the worker's /forget reports of the browser profile (Qwen2API-2l0,
+// Qwen2API-t8s): deleted, not deletable and put off to the pause are worth
+// a word; kept and never-there are not.
+const FORGET_PROFILE_NOTE = { deleted: '，浏览器配置已删除', left: '，浏览器配置没能删除', deferred: '，浏览器配置稍后删除', absent: '', kept: '' }
 
 // The timer's cycle of token refreshes (Qwen2API-ops). In browser mode a
 // refresh is a reload of the account's page in the signin-worker whenever the

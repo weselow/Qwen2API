@@ -72,6 +72,8 @@ async function start(t, { script, ...options } = {}) {
     // keeps the page loads of every account apart, and the token refreshes,
     // are signin-worker-egress.test.js's.
     minLoginIntervalMs: 1, loadMinIntervalMs: 1, tokenRefreshMinIntervalMs: 1, minRenewDelayMs: 60000,
+    // A profile goes at once here; the pause before it goes is signin-worker-forget-grace.test.js's.
+    forgetGraceMs: 0,
     ...options
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))

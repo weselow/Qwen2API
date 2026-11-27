@@ -45,6 +45,9 @@
  *
  * The profile stays unless SIGNIN_FORGET_DELETES_PROFILE is set; `pending`
  * names a sign-in or renewal the route gave up waiting for (handleForget).
+ * With that set the profile goes after a pause (SIGNIN_FORGET_GRACE_MS,
+ * Qwen2API-t8s): the answer says `profile: "deferred"`, and a request the
+ * worker takes for the account before the pause is over keeps the profile.
  *
  * qwen.ai's status and body always travel inside a 200: a WAF challenge page
  * too, under whatever status it came. The worker names it in its log (and
@@ -222,6 +225,13 @@ function createServer(overrides = {}) {
         // (Qwen2API-2l0). Off, a profile kept lets an account added again
         // skip the sign-in. Only an exact "true" turns it on.
         forgetDeletesProfile: overrides.forgetDeletesProfile ?? process.env.SIGNIN_FORGET_DELETES_PROFILE === 'true',
+        // How long the worker waits before it deletes a removed account's
+        // profile (forgetDeletesProfile): /forget answers at once, and the
+        // profile goes after this pause — an
+        // account added again inside it keeps its profile and skips the
+        // password sign-in (Qwen2API-t8s). 0 = at once, as before. Any
+        // request the worker takes for the account takes the deletion back.
+        forgetGraceMs: overrides.forgetGraceMs ?? envCount('SIGNIN_FORGET_GRACE_MS', 120000),
         // How many rounds /forget takes (handleForget); tests make it one.
         forgetRounds: overrides.forgetRounds ?? FORGET_ROUNDS
     }
@@ -245,6 +255,23 @@ function createServer(overrides = {}) {
     const logins = new Map()
     // What names a stream while it runs: the app going away aborts "its" stream.
     let streamSequence = 0
+    // email -> {at, timer}: a removed account's profile, to be deleted when
+    // its pause is over (Qwen2API-t8s).
+    const deletions = new Map()
+    // email -> how many requests the worker has taken for the account. /forget
+    // compares it: an account asked for while /forget was at work is being
+    // added again, and its profile is not put down for deletion.
+    const askings = new Map()
+    // email -> the last operation on the account's mark, for the one after it to wait for.
+    // The operation's own outcome is the caller's; the line itself goes on.
+    const markOps = new Map()
+    const withMark = (email, operation) => {
+        const task = (markOps.get(email) || Promise.resolve()).then(operation)
+        const line = task.then(() => {}, () => {})
+        markOps.set(email, line)
+        line.then(() => { if (markOps.get(email) === line) markOps.delete(email) })
+        return task
+    }
     const pacer = createLoginPacer({
         minIntervalMs: config.minLoginIntervalMs,
         maxWaitMs: config.maxLoginWaitMs
@@ -321,6 +348,85 @@ function createServer(overrides = {}) {
         clearTimeout(sessions.get(email)?.timer)
         sessions.delete(email)
     }
+
+    // What marks a profile whose deletion waits for the end of its pause —
+    // inside the profile directory, so that it outlives the worker.
+    const FORGET_MARK = '.qwen2api-forget-at'
+    const markPath = email => path.join(profileDir(email), FORGET_MARK)
+
+    /**
+     * The account is asked for — a sign-in, a renewal, a call. A deletion
+     * waiting for its profile is taken back: at once, and before anything
+     * else of the account runs, so that a deletion whose moment came while
+     * the account's lock was taken finds nothing to do when it gets the lock.
+     * Nothing is put in the account's turn for it: the account's mark is not
+     * what the sign-in, a renewal or a call wait for. An account with no
+     * deletion waiting costs nothing here.
+     */
+    const askedFor = email => {
+        askings.set(email, (askings.get(email) || 0) + 1)
+        const entry = deletions.get(email)
+        if (!entry) return
+        clearTimeout(entry.timer)
+        deletions.delete(email)
+        withMark(email, () => fs.promises.rm(markPath(email), { force: true }))
+    }
+
+    /** The profile of `email` is deleted when `at` (epoch ms) comes — unless the account is asked for first. */
+    const armDeletion = (email, at) => {
+        clearTimeout(deletions.get(email)?.timer)
+        const entry = { at, timer: null, due: false }
+        // Not what keeps the worker up: a stop does not wait for it, and the mark is read at the next start.
+        // Capped at what a timer takes: a longer wait would come at once.
+        entry.timer = setTimeout(() => { entry.due = true; runDeletion(email) }, Math.min(2 ** 31 - 1, Math.max(0, at - Date.now())))
+        entry.timer.unref?.()
+        deletions.set(email, entry)
+    }
+
+    const runDeletion = email => serialized(email, async () => {
+        // Taken back, or put off to a later moment, while this waited for the account's lock.
+        const entry = deletions.get(email)
+        if (!entry?.due) return
+        deletions.delete(email)
+        let profile = 'deleted'
+        try {
+            // /forget closed the account's browsers within its bound (closeMs) before it answered,
+            // and the pause is over by now. A session a sign-in that outlived /forget may have put
+            // back is not this's to touch: /forget said so in its answer (`pending`).
+            await fs.promises.rm(profileDir(email), { recursive: true, force: true })
+        } catch (error) {
+            profile = 'left'
+            log('forget', `profile not removed after the pause (${error.code || 'error'})`)
+        }
+        log('forget', `profile ${profile} after the pause (${sessions.size} sessions)`)
+    }).catch(() => {})
+
+    // Profiles whose deletion was waiting when the worker stopped are seen to
+    // here — before the worker takes a request, so that no account's sign-in
+    // races the mark it would take back. One whose moment has passed is
+    // deleted at once by the same timer: its wait is nothing.
+    const swept = (async () => {
+        let names
+        try { names = await fs.promises.readdir(config.dataDir) } catch { return }
+        for (const name of names) {
+            if (!name.startsWith('account-')) continue
+            const dir = path.join(config.dataDir, name)
+            let mark
+            try { mark = JSON.parse(await fs.promises.readFile(path.join(dir, FORGET_MARK), 'utf8')) } catch (error) {
+                if (error.code !== 'ENOENT') log('forget', 'a mark could not be read: its profile stays as it is')
+                continue
+            }
+            // A mark acts on the profile it lies in and on no other: one that does not name it is left alone.
+            if (!mark || typeof mark.email !== 'string' || !Number.isFinite(mark.at) || profileDir(mark.email) !== dir) {
+                log('forget', 'a mark that names no profile of its own was left alone')
+                continue
+            }
+            if (!config.forgetDeletesProfile) {
+                // The worker no longer deletes profiles: the mark is worth nothing.
+                await fs.promises.rm(path.join(dir, FORGET_MARK), { force: true }).catch(() => {})
+            } else armDeletion(mark.email, mark.at)
+        }
+    })()
 
     // The live page is the source of truth for the jar: what the browser holds
     // now replaces the cached cookies, so a cached /renew never hands out a
@@ -494,6 +600,7 @@ function createServer(overrides = {}) {
 
     async function handleSession(body) {
         const email = parseEmail(body)
+        askedFor(email)
         const { password } = body
         if (typeof password !== 'string' || !password || password.length > 1024) {
             throw new WorkerError('invalid_request', 'A password is required.')
@@ -554,6 +661,7 @@ function createServer(overrides = {}) {
      */
     async function handleRenew(body) {
         const email = parseEmail(body)
+        askedFor(email)
         const proxy = parseProxy(body)
         const force = parseForce(body)
         if (force) forget(email)
@@ -563,6 +671,7 @@ function createServer(overrides = {}) {
 
     async function handleEgress(req, res, body) {
         const email = parseEmail(body)
+        askedFor(email)
         const proxy = parseProxy(body)
         const request = normalizeEgress(body, {
             chatOrigin: config.chatOrigin,
@@ -687,6 +796,15 @@ function createServer(overrides = {}) {
      * "left"`), not failed over: the session and the page are gone by then,
      * which is what was asked.
      *
+     * With a pause (forgetGraceMs) the profile is not removed here: a mark
+     * with the moment of its removal is put into it, and the answer says
+     * `profile: "deferred"`. Any request the worker takes for the account
+     * before that moment takes the removal back — the account was added again
+     * —; one that came while this was at work, or a sign-in of the account
+     * that was in flight, keeps the profile outright. The mark outlives the
+     * worker: at its start the worker removes what is past its moment and
+     * waits for the rest (Qwen2API-t8s).
+     *
      * A sign-in or renewal that keeps starting for the account for all the
      * rounds outlives this: the answer says so (`pending`). It is not a
      * refusal — the session and the page are dropped — but what is still
@@ -694,12 +812,18 @@ function createServer(overrides = {}) {
      */
     async function handleForget(body) {
         const email = parseEmail(body)
+        const askingsBefore = askings.get(email) || 0
+        // A sign-in of the account in flight here, or at any moment while this
+        // waits: the account is being added again — its sign-in is not in line
+        // behind the app's removal, and so may have reached the worker first.
+        let signingIn = Boolean(logins.get(email))
         // First of all: no timer may start a reload of this account from here
         // on, and nothing hands its session out while this waits.
         clearTimeout(sessions.get(email)?.timer)
         let session = sessions.delete(email)
         let page = false
         for (let round = 0; round < config.forgetRounds; round++) {
+            signingIn ||= logins.has(email)
             await Promise.allSettled([logins.get(email), renewing.get(email)])
             const found = await serialized(email, async () => {
                 const resident = residents.get(email)
@@ -717,6 +841,41 @@ function createServer(overrides = {}) {
         if (config.forgetDeletesProfile) {
             const dir = profileDir(email)
             profile = fs.existsSync(dir) ? 'deleted' : 'absent'
+            if (profile === 'deleted' && config.forgetGraceMs > 0) {
+                // Not at once: after the pause, which an adding of the account
+                // inside it takes back (Qwen2API-t8s). The account's turn
+                // decides whether the mark is put — it is what the worker
+                // reads at its next start — after a request that came
+                // meanwhile is seen; the file itself is written in the order
+                // of the account's marks, so that one taken back just before
+                // is not written back over. The pause is counted from the account's turn, and
+                // the account is asked once more once the mark is written: an asking that came
+                // while it was being written found no deletion to take back yet.
+                const put = await serialized(email, async () => {
+                    const askedMeanwhile = () => signingIn || (askings.get(email) || 0) !== askingsBefore
+                    if (askedMeanwhile()) return { put: 'asked' }
+                    const at = Date.now() + config.forgetGraceMs
+                    try {
+                        await withMark(email, () => fs.promises.writeFile(markPath(email), `${JSON.stringify({ email, at })}\n`))
+                        if (askedMeanwhile()) {
+                            await withMark(email, () => fs.promises.rm(markPath(email), { force: true }))
+                            return { put: 'asked' }
+                        }
+                        return { put: 'marked', at }
+                    } catch {
+                        return { put: 'unmarked' }
+                    }
+                })
+                if (put.put === 'marked') {
+                    profile = 'deferred'
+                    armDeletion(email, put.at)
+                } else if (put.put === 'asked') {
+                    // Asked for again since /forget began, or its sign-in was in flight — an adding
+                    // again, most likely: the account keeps its profile.
+                    profile = 'kept'
+                }
+                // A mark that could not be written would not outlive the worker: the profile goes now, as it used to.
+            }
             if (profile === 'deleted') {
                 try {
                     // No page of the account is left to close here; a browser of
@@ -792,17 +951,20 @@ function createServer(overrides = {}) {
             // The headless mode is here to be checked after a flip, before the
             // first request that depends on it. So are the settings of
             // 2026-11-26 (Qwen2API-xun, Qwen2API-nch, Qwen2API-ops), how
-            // long the line of page loads is, and whether removing an account
-            // in the app deletes its profile (Qwen2API-2l0).
+            // long the line of page loads is, whether removing an account
+            // in the app deletes its profile (Qwen2API-2l0), and how long it
+            // waits before it does (Qwen2API-t8s).
             return send(res, 200, {
                 ok: true, sessions: sessions.size, ...residents.stats(),
                 headless: config.headless, headlessMode: config.headless ? config.headlessMode : null,
                 pageTokenRefresh: config.pageTokenRefresh, streamWaitMs: config.streamWaitMs,
                 loadMinIntervalMs: config.loadMinIntervalMs, loadMaxWaitMs: config.loadMaxWaitMs,
                 pageLoadQueue: pageLoads.stats(),
-                forgetDeletesProfile: config.forgetDeletesProfile
+                forgetDeletesProfile: config.forgetDeletesProfile, forgetGraceMs: config.forgetGraceMs
             })
         }
+        // Nothing is taken for an account before the profiles left for deletion are seen to.
+        await swept
         if (req.method === 'POST' && req.url === '/forget') {
             if (!authorized(req)) throw new WorkerError('unauthorized', 'Invalid worker token.')
             const body = await readJson(req, REQUEST_BODY_LIMIT)
