@@ -86,6 +86,39 @@ jobs:
           TEST_GATE_TIMEOUT_MS: 300000
           TEST_GATE_ATTEMPTS: 2
 
+  worker-node20:
+    name: Sign-in worker on its production Node (20)
+    # The worker of prod is built FROM node:20-slim, while everything else here
+    # runs on Node 24: its own test files once on the Node it runs on in
+    # production (Qwen2API-25q). The gate script does not run on Node 20
+    # (--test-isolation needs Node 22) — one process per file instead, over the
+    # list tools/gate-image/run-worker-tests.js names, which sets the gate's
+    # environment itself. No count is compared: the number of tests these files
+    # generate varies with the Node version. A file gets WORKER_TESTS_TIMEOUT_MS,
+    # and the job is given room for every file to run to the end of it.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - uses: actions/cache@v5
+        with:
+          path: ~/.bun/install/cache
+          key: bun-node20-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
+      - run: bun install --frozen-lockfile
+      - name: Build the Node 20 image from the recipe in the repository
+        run: docker build -t qwen2api-gate-node20 -f tools/gate-image/Dockerfile.node20 tools/gate-image
+      - name: The Node the worker's tests are about to run on
+        run: docker run --rm qwen2api-gate-node20 node --version
+      - name: The worker's test files, one process per file, on Node 20
+        run: |
+          docker run --rm -v "$PWD:/work:ro" -w /work -e WORKER_TESTS_TIMEOUT_MS=150000 \
+            qwen2api-gate-node20 node tools/gate-image/run-worker-tests.js
+
   frontend:
     needs: changes
     if: needs.changes.outputs.binaries == 'true'
@@ -112,7 +145,9 @@ jobs:
           retention-days: 7
 
   binaries:
-    needs: [regression, frontend]
+    # The worker's tests on the Node of prod come first too: nothing is built
+    # around a worker that failed there.
+    needs: [regression, frontend, worker-node20]
     name: Binary and container (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25

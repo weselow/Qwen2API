@@ -9,6 +9,7 @@ const { spawnSync } = require('node:child_process')
 const GUARD = path.join(__dirname, '..', 'tools', 'net-guard.js')
 const CHILD = [
     `const guard = require(${JSON.stringify(GUARD)})`,
+    "if (process.argv[1] === 'no-websocket') globalThis.WebSocket = undefined",
     'guard.install()',
     "if (process.argv[1] === 'fetch') {",
     "    globalThis.fetch = () => Promise.reject(Object.assign(new Error('this wrap is missing'), { code: 'ENOENT' }))",
@@ -39,6 +40,17 @@ test('the network guard refuses every way to the outside world with its own erro
     assert.equal(blocked.length, outside.length)
     assert.ok(blocked.every(entry => ['192.0.2.1', 'outside.invalid', '(any)'].includes(entry.host)),
         'nothing but the reserved targets was ever refused, so nothing else was ever asked for')
+})
+
+test('without a global WebSocket nothing is wrapped, and nothing is probed: the self-test still holds', () => {
+    const child = probe({}, 'no-websocket')
+    assert.equal(child.status, 0, child.stderr || child.stdout)
+    const { results, blocked } = JSON.parse(child.stdout)
+    assert.equal(results.filter(result => /WebSocket/.test(result.label)).length, 0)
+    const outside = results.filter(result => result.label.startsWith('O '))
+    assert.ok(outside.length >= 20, 'every other client is still probed')
+    for (const { label, code } of outside) assert.ok(refused(code), `${label}: ${code}`)
+    assert.equal(blocked.length, outside.length)
 })
 
 test('the self-test fails when one of the wraps does not hold', () => {

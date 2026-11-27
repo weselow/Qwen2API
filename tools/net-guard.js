@@ -343,12 +343,16 @@ async function selfTest() {
     await probe('O new dns.Resolver().resolve4 of an outside name', done => new dns.Resolver().resolve4('outside.invalid', (error, addresses) => done(error || `OK:resolved ${addresses}`)))
     await probe('O new dns.promises.Resolver().resolveAny of an outside name', done => new dns.promises.Resolver().resolveAny('outside.invalid').then(() => done('OK:resolved'), done))
     await probe('O dns.promises.reverse of an outside address', done => dns.promises.reverse(OUTSIDE).then(() => done('OK:resolved'), done))
-    await probe('O WebSocket to an outside address', done => {
-        const socket = new WebSocket(`ws://${OUTSIDE}:80`)
-        socket.addEventListener('open', () => { socket.close(); done('OK:connected') })
-        socket.addEventListener('error', () => done(unguarded()))
-        setTimeout(() => done(unguarded()), 3000)
-    })
+    // Node 20 has no global WebSocket (it comes with Node 22): nothing is wrapped
+    // there, so there is nothing to prove either.
+    if (typeof globalThis.WebSocket === 'function') {
+        await probe('O WebSocket to an outside address', done => {
+            const socket = new WebSocket(`ws://${OUTSIDE}:80`)
+            socket.addEventListener('open', () => { socket.close(); done('OK:connected') })
+            socket.addEventListener('error', () => done(unguarded()))
+            setTimeout(() => done(unguarded()), 3000)
+        })
+    }
     try {
         const dgram = require('node:dgram')
         await probe('O dgram: a UDP socket', done => {

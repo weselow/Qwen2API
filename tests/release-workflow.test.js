@@ -244,7 +244,8 @@ test('build detection uses the event diff and defaults to building if the diff i
 
 test('native executables and Alpine images are tested before artifact export', () => {
   const binaries = readWorkflow('verify.yml').jobs.binaries
-  assert.deepEqual(binaries.needs, ['regression', 'frontend'])
+  // After the gate, and after the worker's tests on the Node of its production image (Qwen2API-25q).
+  assert.deepEqual(binaries.needs, ['regression', 'frontend', 'worker-node20'])
   assert.deepEqual(binaries.strategy.matrix.include.map(entry => entry.platform), ['linux-x64', 'linux-arm64', 'windows-x64'])
   assert.equal(binaries.strategy.matrix.include.find(entry => entry.platform === 'linux-arm64').runner, 'ubuntu-24.04-arm')
   const steps = binaries.steps
