@@ -11,7 +11,7 @@ const { createResidents } = require('../signin-worker/lib/resident-pages')
 const {
     pageCall, pageAbortStream, STREAM_CHANNEL, STREAM_ABORTS, ABORT_REASON
 } = require('../signin-worker/lib/egress-fetch')
-const { pageGlobals, pageFetch, pageStorage, xmlHttpRequest, pageDocument } = require('./helpers/fake-xml-http-request')
+const { pageGlobals, pageLocation, pageFetch, pageStorage, xmlHttpRequest, pageDocument } = require('./helpers/fake-xml-http-request')
 
 // The streaming /egress (Qwen2API-3ue.3): qwen.ai's answer relayed to the app
 // as it arrives, and the app's going away aborting the fetch inside the page.
@@ -101,7 +101,7 @@ function fakeBrowser() {
       // What a page gives its requests (Qwen2API-3ue.5).
       define('XMLHttpRequest', () => xmlHttpRequest(script, page))
       define('document', () => pageDocument(script))
-      define('location', () => ({ href: `${CHAT}/` }))
+      define('location', () => pageLocation(script))
       define('navigator', () => ({ language: script.language || 'en-US' }))
       define('localStorage', () => pageStorage(script))
       page.realm = realm
@@ -1581,6 +1581,8 @@ test('Qwen2API-xun: a stream on a page whose token is nearly spent is sent on th
   const [refresh] = signer.script.xhrs
   assert.equal(refresh.sent.url, 'https://auth.qwen.ai/api/v2/auths/refresh')
   assert.equal(refresh.withCredentials, true)
+  // The page named itself in x-request-origin, as the front end's interceptor does.
+  assert.equal(refresh.sent.headers['x-request-origin'], CHAT)
   // ...and the stream, which is a fetch, on what it brought.
   assert.equal(signer.script.fetches.length, 1)
   const [stream] = signer.script.fetches

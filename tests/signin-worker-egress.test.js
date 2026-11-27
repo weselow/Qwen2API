@@ -1526,6 +1526,15 @@ test('a stop signal exits only after the resident browsers are closed; a second 
 // page. Here the worker makes the front end's call for the page instead. That
 // qwen.ai takes it from the worker, and a call made on the token it brings, is
 // to be verified live (the session of the rollout).
+//
+// 2026-11-27: refused live, 4 of 4 — status 200, code Bad_Request. Read again
+// off main.js of 0.3.51, 0.3.52, 0.3.53 and 0.3.54 (and 0.3.50 once more): the
+// interceptor sets x-request-origin, the page's own origin, on what goes to
+// /auths/* (and three other auth paths) — it had been taken to set it on
+// everything else — so the worker's refresh went out without the header the
+// front end's own carries. The stand-in below refuses a refresh without it as
+// qwen.ai refused the worker's; that the header is what qwen.ai wanted is what
+// the live check of the next rollout is for.
 
 const AUTH_HOST = 'https://auth.qwen.ai'
 const REFRESH_PATH = '/api/v2/auths/refresh'
@@ -1555,7 +1564,11 @@ function qwenAi(script, refresh = () => jsonResponse({
   const asked = []
   script.fetch = (url, init) => {
     asked.push({ url, init, at: Date.now() })
-    return isRefresh(url) ? refresh(init) : jsonResponse({ success: true })
+    if (!isRefresh(url)) return jsonResponse({ success: true })
+    // Which page asks: without its own origin in x-request-origin the refresh is
+    // refused as qwen.ai refused the worker's on 2026-11-27.
+    if (init.headers['x-request-origin'] !== CHAT) return jsonResponse({ success: false, code: 'Bad_Request' })
+    return refresh(init)
   }
   return asked
 }
@@ -1576,9 +1589,11 @@ function assertRefresh(xhr, url = REFRESH, timeoutMs = 10000) {
   assert.equal(xhr.handlerProperties, undefined)
   const sent = xhr.sent.headers
   // No Bearer: the front end's interceptor sets none for /auths/refresh. No
-  // Content-Type: axios drops it from a request without a body. No origin: the
-  // front end sets x-request-origin for everything but /auths/*.
-  for (const name of ['authorization', 'content-type', 'cookie', 'x-request-origin']) {
+  // Content-Type: axios drops it from a request without a body. No Cookie of
+  // its own: the browser adds the session's. What is sent is the page itself in
+  // x-request-origin: the interceptor sets it on what goes to /auths/* (and on
+  // three other auth paths) — on nothing else.
+  for (const name of ['authorization', 'content-type', 'cookie']) {
     assert.equal(name in sent, false, `${name} was sent`)
   }
   assert.deepEqual({ ...sent, timezone: '<the page’s clock>', 'x-request-id': '<a uuid>' }, {
@@ -1587,7 +1602,8 @@ function assertRefresh(xhr, url = REFRESH, timeoutMs = 10000) {
     source: 'web',
     version: '0.3.50',
     timezone: '<the page’s clock>',
-    'x-request-id': '<a uuid>'
+    'x-request-id': '<a uuid>',
+    'x-request-origin': CHAT
   })
   assert.match(sent.timezone, /^\S{3} \S{3} \d\d \d{4} \d\d:\d\d:\d\d GMT[+-]\d{4}$/)
   assert.match(sent['x-request-id'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
@@ -1932,6 +1948,47 @@ test('Qwen2API-xun: pageRefreshToken reads the end off the token when the answer
   }, { url: REFRESH, timeoutMs: 4000, sourceId: 'signin-worker' })
   assert.equal(assumed.ok, true)
   assert.ok(Math.abs(assumed.expiresAt - (Date.now() + 900000)) < 2000)
+})
+
+test('Qwen2API-xun: pageRefreshToken names the page it runs on in x-request-origin — the page’s own origin, wherever the page is', async () => {
+  // What the front end's interceptor sends: window.location.origin. The page says it of itself; nothing is hard-coded.
+  for (const origin of ['https://chat.qwen.com', 'http://127.0.0.1:3847']) {
+    const script = {
+      origin, storage: {},
+      fetch: () => jsonResponse({ success: true, data: { access_token: RENEWED, expires_at: Math.floor(Date.now() / 1000) + 900 } })
+    }
+    assert.equal((await inPageAsk(pageRefreshToken, script, { url: REFRESH, timeoutMs: 4000, sourceId: 'signin-worker' })).ok, true, origin)
+    assert.equal(script.xhrs.length, 1, origin)
+    assert.equal(script.xhrs[0].sent.url, REFRESH, origin)
+    assert.equal(script.xhrs[0].sent.headers['x-request-origin'], origin)
+  }
+})
+
+test('Qwen2API-xun: a refresh qwen.ai refuses under a 200, as it refused the worker’s own on 2026-11-27 — the code is on the worker’s line, and the call goes out all the same', async t => {
+  const signer = fakeBrowser()
+  const { post, health, dataDir } = await start(t, { signer })
+  const email = 'refused@example.invalid'
+  withProfile(dataDir, email)
+  signer.script.frontEnd = '0.3.50'
+  signer.script.storage = keptToken({ leftMs: 60000 })
+  // What qwen.ai answered the worker's refresh on 2026-11-27, while it went out without
+  // x-request-origin (the page's own origin): under a 200, with the code Bad_Request.
+  const asked = qwenAi(signer.script, () => jsonResponse({ success: false, code: 'Bad_Request' }))
+
+  const { answer, lines } = await logged(async lines => {
+    const response = await egress(post, email)
+    return { answer: { status: response.status, body: await response.json() }, lines }
+  })
+  assert.equal(answer.status, 200, lines.join('\n'))
+  // Said as it was said on prod — the code of the refusal on the line, under the status it came.
+  assert.ok(lines.some(line => /token-refresh failed \(refused, status 200, code Bad_Request, \d+ ms\)$/.test(line)), lines.join('\n'))
+  // The refresh was asked for, and the call went out after it, on the token the page had...
+  assert.deepEqual(asked.map(call => call.url), [REFRESH, `${CHAT}/api/v2/chats/new`])
+  assert.equal(asked[1].init.headers.authorization, 'Bearer page-access-token')
+  assert.equal(signer.script.storage.token, 'page-access-token')
+  // ...and no page was loaded for it.
+  assert.equal(signer.calls.filter(entry => entry.op === 'renew').length, 1)
+  assert.equal((await health()).residentPages, 1)
 })
 
 test('Qwen2API-xun: a refresh qwen.ai refuses, or one that does not get through, leaves the page’s token as it was', async () => {

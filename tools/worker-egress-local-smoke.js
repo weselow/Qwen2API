@@ -210,6 +210,16 @@ function startStandIn() {
                 'access-control-allow-credentials': 'true',
                 'content-type': 'application/json'
             }
+            // The page names itself in x-request-origin — the interceptor sets it on what goes to
+            // /auths/* (main.js of 0.3.50–0.3.54). Without it the refresh is refused as qwen.ai
+            // refused the worker's own on 2026-11-27: under a 200, with the code Bad_Request.
+            // `auth.refresh = 'bad_request'` gets the same answer for a request that does name
+            // the page, to see the worker say the refusal.
+            const pageOrigin = `http://127.0.0.1:${server.address().port}`
+            if (req.headers['x-request-origin'] !== pageOrigin || auth.refresh === 'bad_request') {
+                res.writeHead(200, allowed)
+                return res.end(JSON.stringify({ success: false, code: 'Bad_Request' }))
+            }
             // qwen.ai refusing the session: as the front end is refused, under 401.
             if (auth.refresh === 'refused') {
                 res.writeHead(401, allowed)
@@ -877,11 +887,14 @@ async function main() {
         // ...and the page's request hook signed it as one of the page's own.
         assert.equal(refresh.headers['x-stub-v'], '2.5.37')
         // No Bearer — the front end's interceptor sets none for /auths/refresh —
-        // no Content-Type, which axios drops from a request without a body, and
-        // no origin, which the front end sets for everything but /auths/*.
-        for (const name of ['authorization', 'content-type', 'x-request-origin']) {
+        // and no Content-Type, which axios drops from a request without a body.
+        // The page names itself in x-request-origin: the interceptor sets it on
+        // what goes to /auths/* (and three other auth paths), on nothing else
+        // (main.js of 0.3.50–0.3.54).
+        for (const name of ['authorization', 'content-type']) {
             assert.equal(refresh.headers[name], undefined, `${name} was sent`)
         }
+        assert.equal(refresh.headers['x-request-origin'], standIn.origin, tokenLines.join('\n'))
         assert.equal(refresh.headers.accept, 'application/json')
         assert.equal(refresh.headers['accept-language'], 'en-US,en;q=0.9')
         assert.equal(refresh.headers.source, 'web')
@@ -916,13 +929,28 @@ async function main() {
         assert.equal(JSON.parse(unrenewed.body.body).authorization, `Bearer ${standIn.state.pageToken}`)
         assert.ok(unrenewedLines.some(line => /token-refresh failed \(refused, status 401, code unauthorized, \d+ ms\)$/.test(line)), unrenewedLines.join('\n'))
         console.log('ok page token refused: the call went out all the same, on the token the page had')
+
+        // Refused the way qwen.ai refused the worker's own refresh on 2026-11-27 — under a 200,
+        // with Bad_Request: said so on the worker's line, and the call goes out all the same.
+        standIn.state.tokenSeconds = 60
+        assert.equal((await call('/renew', { email, force: true })).status, 200)
+        standIn.auth.refresh = 'bad_request'
+        const { answer: badRequest, lines: badRequestLines } = await logged(async lines => ({
+            lines, answer: await egress({ headers: { 'content-type': 'application/json' } })
+        }))
+        assert.equal(badRequest.status, 200, JSON.stringify(badRequest.body))
+        assert.equal(standIn.auth.asked.length, 3)
+        assert.equal(standIn.auth.asked[2].headers['x-request-origin'], standIn.origin)
+        assert.equal(JSON.parse(badRequest.body.body).authorization, `Bearer ${standIn.state.pageToken}`)
+        assert.ok(badRequestLines.some(line => /token-refresh failed \(refused, status 200, code Bad_Request, \d+ ms\)$/.test(line)), badRequestLines.join('\n'))
+        console.log('ok page token refused under a 200 with Bad_Request (as on 2026-11-27): said so, and the call went out all the same')
         standIn.auth.refresh = 'ok'
 
         // A token with its margin left is left alone: no refresh call.
         standIn.state.tokenSeconds = 3600
         assert.equal((await call('/renew', { email, force: true })).status, 200)
         assert.equal((await egress({ headers: { 'content-type': 'application/json' } })).status, 200)
-        assert.equal(standIn.auth.asked.length, 2, 'a token with its margin left was renewed')
+        assert.equal(standIn.auth.asked.length, 3, 'a token with its margin left was renewed')
         console.log('ok page token young: not renewed')
 
         // A clean stop closes the browser, which flushes the profile.
@@ -1087,14 +1115,28 @@ async function main() {
                 fs.mkdirSync(path.join(queueDir, 'account-' + crypto.createHash('sha256').update(who).digest('hex').slice(0, 32)), { recursive: true })
             }
             const loadsBefore = standIn.pageLoads()
-            const opened = await Promise.all(accounts.map(who =>
-                call('/egress', { email: who, url: '/api/echo', method: 'POST', timeoutMs: 30000 }, queuedUrl)))
+            const askedAt = Date.now()
+            const { opened, lines: queuedLines } = await logged(async lines => ({
+                lines,
+                opened: await Promise.all(accounts.map(who =>
+                    call('/egress', { email: who, url: '/api/echo', method: 'POST', timeoutMs: 30000 }, queuedUrl)))
+            }))
             assert.deepEqual(opened.map(answer => answer.status), [200, 200], JSON.stringify(opened.map(answer => answer.body)))
             const times = standIn.pageLoadTimes.slice(loadsBefore).sort((a, b) => a - b)
             assert.equal(times.length, 2)
-            // Timers never fire early.
-            assert.ok(times[1] - times[0] >= 600, `the second page was loaded ${times[1] - times[0]} ms after the first`)
-            console.log(`ok page loads take turns: two accounts opening their pages at once loaded them ${times[1] - times[0]} ms apart (the queue's interval here: 600 ms)`)
+            // Timers never fire early: the second load waited for its turn by at least the
+            // interval, and the queue says so itself on its line. It is not read off how far
+            // apart the two navigations reached the stand-in: a turn is for the browser's launch
+            // too (lib/page-load-queue.js), and when the first launch outlasts the interval both
+            // navigations follow it close together (2026-11-27: a wait of 816 ms, arrivals
+            // 414 ms apart — the queue's line was right, the measurement was not).
+            const waits = queuedLines.flatMap(line => (/page-load waited \((\d+) ms\)/.exec(line) || []).slice(1).map(Number))
+            assert.equal(waits.length, 1, `the queue's lines while the two pages opened:\n${queuedLines.join('\n')}`)
+            // The wait is counted from the second request's own arrival: the two need not land in the same millisecond.
+            assert.ok(waits[0] >= 595, `the second page waited ${waits[0]} ms for its turn`)
+            // And no navigation reached the stand-in before the second's turn had come.
+            assert.ok(Math.max(...times) >= askedAt + waits[0], `the later navigation came ${Math.max(...times) - askedAt} ms after the calls, the turn ${waits[0]} ms after them`)
+            console.log(`ok page loads take turns: two accounts opening their pages at once — the second waited ${waits[0]} ms for its turn (the queue's interval here: 600 ms)`)
         } finally {
             await queued.workerShutdown()
             await new Promise(resolve => queued.close(resolve))
