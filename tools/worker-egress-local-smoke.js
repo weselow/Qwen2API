@@ -1115,14 +1115,28 @@ async function main() {
                 fs.mkdirSync(path.join(queueDir, 'account-' + crypto.createHash('sha256').update(who).digest('hex').slice(0, 32)), { recursive: true })
             }
             const loadsBefore = standIn.pageLoads()
-            const opened = await Promise.all(accounts.map(who =>
-                call('/egress', { email: who, url: '/api/echo', method: 'POST', timeoutMs: 30000 }, queuedUrl)))
+            const askedAt = Date.now()
+            const { opened, lines: queuedLines } = await logged(async lines => ({
+                lines,
+                opened: await Promise.all(accounts.map(who =>
+                    call('/egress', { email: who, url: '/api/echo', method: 'POST', timeoutMs: 30000 }, queuedUrl)))
+            }))
             assert.deepEqual(opened.map(answer => answer.status), [200, 200], JSON.stringify(opened.map(answer => answer.body)))
             const times = standIn.pageLoadTimes.slice(loadsBefore).sort((a, b) => a - b)
             assert.equal(times.length, 2)
-            // Timers never fire early.
-            assert.ok(times[1] - times[0] >= 600, `the second page was loaded ${times[1] - times[0]} ms after the first`)
-            console.log(`ok page loads take turns: two accounts opening their pages at once loaded them ${times[1] - times[0]} ms apart (the queue's interval here: 600 ms)`)
+            // Timers never fire early: the second load waited for its turn by at least the
+            // interval, and the queue says so itself on its line. It is not read off how far
+            // apart the two navigations reached the stand-in: a turn is for the browser's launch
+            // too (lib/page-load-queue.js), and when the first launch outlasts the interval both
+            // navigations follow it close together (2026-11-27: a wait of 816 ms, arrivals
+            // 414 ms apart — the queue's line was right, the measurement was not).
+            const waits = queuedLines.flatMap(line => (/page-load waited \((\d+) ms\)/.exec(line) || []).slice(1).map(Number))
+            assert.equal(waits.length, 1, `the queue's lines while the two pages opened:\n${queuedLines.join('\n')}`)
+            // The wait is counted from the second request's own arrival: the two need not land in the same millisecond.
+            assert.ok(waits[0] >= 595, `the second page waited ${waits[0]} ms for its turn`)
+            // And no navigation reached the stand-in before the second's turn had come.
+            assert.ok(Math.max(...times) >= askedAt + waits[0], `the later navigation came ${Math.max(...times) - askedAt} ms after the calls, the turn ${waits[0]} ms after them`)
+            console.log(`ok page loads take turns: two accounts opening their pages at once — the second waited ${waits[0]} ms for its turn (the queue's interval here: 600 ms)`)
         } finally {
             await queued.workerShutdown()
             await new Promise(resolve => queued.close(resolve))
