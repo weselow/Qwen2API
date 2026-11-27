@@ -7,6 +7,11 @@
 // Since Qwen2API-3ue.10 the same for images and video: a picture being generated, a
 // video task polled — where a client left alone kept a generation going for minutes.
 //
+// Since Qwen2API-jk9 (2026-11-27) also the whole retry of an answer without a stream: a
+// request whose first attempt died before a byte reached its client is made once more,
+// through the egress to the end — its connection going under its answer, and a chats/new
+// the worker gave up on — and the client gets the second answer behind a 200.
+//
 // Next to tests/client-gone.test.js and tests/client-gone-media.test.js, which drive
 // the handlers with what was measured, this runs the real thing: a real client on a
 // real socket, and the stand-in watching the application's side of the relay. No test
@@ -70,6 +75,11 @@ const TASK_ID = 'client-gone-smoke-task'
 // A request left alone polls again on the far side of that pause: waiting it out
 // is what tells a request that ended from one still asleep.
 const POLL_PAUSE_MS = 20000
+// How long the application waits before it asks again for a chats/new the worker gave up
+// on (src/utils/whole-answer-retry.js) — and below which that wait, measured, is not that:
+// a timer may fire short by a millisecond, and a clock tick takes a few.
+const CHATS_NEW_PAUSE_MS = 2000
+const CHATS_NEW_PAUSE_FLOOR_MS = CHATS_NEW_PAUSE_MS - 20
 
 const startListener = server => new Promise((resolve, reject) => {
   server.once('error', reject)
@@ -132,15 +142,29 @@ const PLANS = {
     ...closingFrames().map(frame => ({ ms: 0, frame }))
   ],
   // A video's answer: JSON, whole — the task to poll (the controller reads it to its end).
-  videoTask: () => [{ ms: 0, frame: JSON.stringify({ success: true, data: { task_id: TASK_ID } }) }]
+  videoTask: () => [{ ms: 0, frame: JSON.stringify({ success: true, data: { task_id: TASK_ID } }) }],
+  // An answer whose connection goes under it once it began (Qwen2API-jk9): a frame or two, and
+  // then the error event the worker ends the relay with when qwen.ai's side of it failed.
+  broken: () => [
+    { ms: 0, frame: answerFrame('cut ') },
+    { ms: LONG_ANSWER.everyMs, frame: answerFrame('off ') }
+  ]
 }
 // Which plans answer SSE, and which answer JSON.
 const ANSWERS_JSON = new Set(['videoTask'])
+// How a plan's relay ends other than by its last event: with the error event the worker
+// writes when the answer broke under it (signin-worker/server.js#relayEgress).
+const RELAY_FAILURES = { broken: 'egress_failed' }
 // What the page answers the video task's status with: done, with the video — or, for
 // a request that is to be left alone, not done.
 const TASK_DONE = { task_status: 'success', content: VIDEO_URL }
 const TASK_RUNNING = { task_status: 'running' }
 let taskStatus = TASK_DONE
+// Every chats/new the stand-in answered, and when it was asked.
+const chatsNew = []
+// True from the scenario: the next chats/new is answered as the worker answers a call its page
+// did not come back from in time — HTTP 504 egress_timeout, at once, not thirty seconds on.
+let chatsNewTimesOut = false
 
 async function main() {
   const { values } = parseArgs({ options: {
@@ -193,7 +217,15 @@ async function main() {
         url: call.url, redirected: false, cookies: []
       })
       const pathname = new URL(call.url, 'http://127.0.0.1').pathname
-      if (pathname === '/api/v2/chats/new') return pageAnswer({ success: true, data: { id: 'client-gone-smoke-chat' } })
+      if (pathname === '/api/v2/chats/new') {
+        chatsNew.push(Date.now())
+        // The worker's own refusal of a call its page did not answer in time, as its HTTP layer writes it.
+        if (chatsNewTimesOut) {
+          chatsNewTimesOut = false
+          return json(504, { code: 'egress_timeout', message: 'The resident page stopped responding.' })
+        }
+        return pageAnswer({ success: true, data: { id: 'client-gone-smoke-chat' } })
+      }
       // The status of the video task, polled for as long as the request lives.
       if (pathname === `/api/v1/tasks/status/${TASK_ID}`) {
         polls.push(Date.now())
@@ -205,7 +237,7 @@ async function main() {
     // one JSON event a line.
     const record = {
       id: relays.length + 1, plan: plan.name, wrapped: plan.wrapped === true,
-      started: Date.now(), sent: 0, closedAt: null, endedAt: null, seen: []
+      started: Date.now(), sent: 0, closedAt: null, endedAt: null, failedAt: null, seen: []
     }
     relays.push(record)
     const since = () => `${Date.now() - record.started} ms`
@@ -246,9 +278,18 @@ async function main() {
       if (!write({ type: 'chunk', data: Buffer.from(step.frame).toString('base64') })) return
       record.sent += 1
     }
-    write({ type: 'end', cookies: [] })
+    const failure = RELAY_FAILURES[record.plan]
+    if (failure) {
+      write({ type: 'error', code: failure, message: `In-page fetch failed (network_error: the connection went).` })
+      record.failedAt = Date.now()
+      // A failing plan answers once: the request the application makes again is answered as one a
+      // client that stays gets, so that a retry that is not delivered shows up as what it is.
+      plan = { name: 'short', wrapped: plan.wrapped }
+    } else {
+      write({ type: 'end', cookies: [] })
+      record.endedAt = Date.now()
+    }
     response.end()
-    record.endedAt = Date.now()
   })
   const upstreamPort = await startListener(standIn)
   const upstream = `http://127.0.0.1:${upstreamPort}`
@@ -379,6 +420,56 @@ async function main() {
         console.log(`PASS: ${label(request, stream)} — a client that stays gets its answer`)
       }
     }
+
+    // A whole answer asked for once more (Qwen2API-jk9). A request without a stream is answered whole, so
+    // when its first attempt dies the client has been told nothing — and the application makes the request
+    // again: a new chats/new, a new completions call, the answer read from its first byte. The two ways the
+    // first attempt died in the first hour of real traffic on 27.11, as the worker stands for them: the
+    // answer's connection going under it, and a chats/new the page did not answer in time — its 504 is
+    // answered at once; the application's pause before it asks again is the application's own.
+    for (const request of [requests[0], requests[2]]) {
+      const what = `${request.route} stream=false`
+      {
+        const relaysBefore = relays.length
+        const chatsBefore = chatsNew.length
+        plan = { name: 'broken' }
+        const response = await send(request, false, AbortSignal.timeout(30000))
+        const text = await response.text()
+        assert.equal(response.status, 200, `${what}, the answer broke: ${text}`)
+        assert.equal(textOf(request, false, text), 'pong', `${what}, the answer broke: the second answer, and not a byte of the first`)
+        const [broken, again] = relays.slice(relaysBefore)
+        assert.equal(broken?.failedAt !== null, true, `${what}, the answer broke: the first relay ended with the error event`)
+        assert.equal(again?.endedAt !== null, true, `${what}, the answer broke: the retried relay ran to its end`)
+        assert.equal(chatsNew.length, chatsBefore + 2, `${what}, the answer broke: a new chats/new for the retry, and only one`)
+        console.log(`PASS: ${what} — the answer's connection went under it, the request was made once more, ` +
+          'and the client got the second answer behind a 200')
+      }
+      {
+        const relaysBefore = relays.length
+        const chatsBefore = chatsNew.length
+        plan = { name: 'short', wrapped: false }
+        chatsNewTimesOut = true
+        const response = await send(request, false, AbortSignal.timeout(30000))
+        const text = await response.text()
+        assert.equal(response.status, 200, `${what}, chats/new timed out: ${text}`)
+        assert.equal(textOf(request, false, text), 'pong', `${what}, chats/new timed out: the client got the answer`)
+        assert.equal(relays.slice(relaysBefore).length, 1, `${what}, chats/new timed out: one relay, for the retry`)
+        const [timedOut, again, ...more] = chatsNew.slice(chatsBefore)
+        assert.equal(more.length, 0, `${what}, chats/new timed out: the request was asked once more, and only once`)
+        const waited = again - timedOut
+        assert.ok(waited >= CHATS_NEW_PAUSE_FLOOR_MS,
+          `${what}, chats/new timed out: the retry was asked ${waited} ms after the chats/new the worker gave up on`)
+        console.log(`PASS: ${what} — a chats/new the worker gave up on is asked again ${waited} ms later, and the client gets the answer behind a 200`)
+      }
+    }
+    // What the application says of it: a line when the retry begins, and one when its answer is delivered, by why.
+    const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g')
+    const said = applicationLogs.replace(ANSI, '')
+    for (const line of ['非流式整体重试 (原因: upstream_broke, egress_failed)', '非流式整体重试成功 (原因: upstream_broke, egress_failed)',
+      '非流式整体重试 (原因: chats_new_timeout)', '非流式整体重试成功 (原因: chats_new_timeout)']) {
+      assert.ok(said.includes(line), `the application does not say in its log: ${line}`)
+    }
+    console.log('PASS: a whole answer asked for once more — the application\'s log says of each retry that it began and was delivered, and why')
 
     // Images and video (Qwen2API-3ue.10): the routes of the two paths, each answered by
     // the plan of its kind. Nothing reaches a media client before its answer is whole —

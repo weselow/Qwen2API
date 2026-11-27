@@ -463,9 +463,89 @@ test('the shapes it reads are the shapes the code prints', () => {
         [persistence, 'v2 полный вход отложен (${email})'],
         [persistence, 'v2 полный вход невозможен (${email})'],
         [read('src/server.js'), 'chatCreationTransport: config.chatCreationTransport'],
-        [read('src/server.js'), 'completionsTransport: config.completionsTransport']
+        [read('src/server.js'), 'completionsTransport: config.completionsTransport'],
+        // Since Qwen2API-jk9 (2026-11-27): the two lines of a whole answer asked for once more.
+        [read('src/utils/whole-answer-retry.js'), 'logger.warn(`非流式整体重试 (原因: ${reason})`, \'REQUEST\')'],
+        [read('src/utils/whole-answer-retry.js'), 'logger.info(`非流式整体重试成功 (原因: ${reason})`, \'REQUEST\')']
     ]
     for (const [source, template] of printed) assert.ok(source.includes(template), `reworded: ${template}`)
+})
+
+// Since Qwen2API-jk9 (2026-11-27): a request without a stream whose first attempt died before a byte
+// reached its client is made once more, whole (src/utils/whole-answer-retry.js). The app says so twice:
+// when the retry begins, and when its answer is delivered.
+
+// The log as the app writes it while a whole answer is asked for once more: as the logger prints it, emoji in front.
+const retried = (minute, reason, delivered = true) => [
+    appLine(minute, 'WARN', 'REQUEST', `⚠️ 非流式整体重试 (原因: ${reason})`),
+    ...(delivered ? [appLine(minute, 'INFO', 'REQUEST', `📝 非流式整体重试成功 (原因: ${reason})`)] : [])
+]
+
+test('a whole answer asked for once more is counted — begun, by why, and delivered — and is not listed as unknown (Qwen2API-jk9)', () => {
+    const lines = [
+        ...STARTUP,
+        ...generation(1),
+        ...retried(2, 'upstream_broke, egress_failed'),
+        ...retried(3, 'network_error, ECONNRESET'),
+        ...retried(4, 'upstream_5xx, 502'),
+        ...retried(5, 'chats_new_timeout'),
+        ...retried(6, 'upstream_broke, page_closed'),
+        // Begun, and not delivered: the client left while the retry was under way.
+        ...retried(7, 'upstream_broke, egress_failed', false),
+        ...generation(20)
+    ]
+    const report = watch.summarize(lines)
+    assert.equal(report.counts.get('app.wholeAnswerRetry'), 6, 'every retry that began')
+    assert.equal(report.counts.get('app.wholeAnswerRetry.delivered'), 5, 'every retry whose answer reached the client')
+    // By why — what comes before the comma; the relay's code and the status stay in the line.
+    assert.equal(report.counts.get('app.wholeAnswerRetry.upstream_broke'), 3)
+    assert.equal(report.counts.get('app.wholeAnswerRetry.network_error'), 1)
+    assert.equal(report.counts.get('app.wholeAnswerRetry.upstream_5xx'), 1)
+    assert.equal(report.counts.get('app.wholeAnswerRetry.chats_new_timeout'), 1)
+    assert.equal(report.counts.get('app.unclassified.WARN'), undefined, 'the WARN is not an unknown warning')
+    assert.equal(report.unknown.size, 0)
+    const { verdict, why, text } = watch.render(report)
+    // A retry that delivered is a symptom, and the symptom is not complained of on its own: the break itself was
+    // not in these lines, and nothing else is.
+    assert.equal(verdict, 'OK', why.join('\n'))
+    assert.match(text, /wholeAnswerRetry {2}6/)
+    assert.match(text, /wholeAnswerRetry\.delivered {2}5/)
+    assert.match(text, /wholeAnswerRetry\.upstream_broke {2}3/)
+    assert.match(text, /wholeAnswerRetry\.chats_new_timeout {2}1/)
+})
+
+test('the why of a retry the counter reads are the reasons the retry is given, each spelled as the code spells it (Qwen2API-jk9)', () => {
+    // Read off the module's own words, without loading it: it brings in the request path and the account manager.
+    const helper = read('src/utils/whole-answer-retry.js')
+    const named = [...helper.matchAll(/^const (?:BROKEN|NETWORK_ERROR|UPSTREAM_5XX|CHATS_NEW_TIMED_OUT) = '([a-z_0-9]+)'$/gm)]
+    assert.deepEqual(named.map(([, reason]) => reason).sort(), ['chats_new_timeout', 'network_error', 'upstream_5xx', 'upstream_broke'])
+    for (const [, reason] of named) {
+        const counts = watch.summarize(retried(5, `${reason}, something after the comma`)).counts
+        assert.equal(counts.get('app.wholeAnswerRetry'), 1, reason)
+        assert.equal(counts.get(`app.wholeAnswerRetry.${reason}`), 1, reason)
+        assert.equal(counts.get('app.wholeAnswerRetry.delivered'), 1, reason)
+        assert.equal(counts.get('app.unclassified.WARN'), undefined, reason)
+        assert.equal(counts.get('app.unclassified.INFO'), undefined, reason)
+    }
+})
+
+test('a retry that was not delivered is not told from the lines alone — what ended it is, where it always was (Qwen2API-jk9)', () => {
+    // The retry's second attempt died under the application: that failure has its own line, as before.
+    const failed = watch.render(watch.summarize([
+        ...STARTUP,
+        ...generation(1, { ending: 'egress_failed' }),
+        ...retried(1, 'upstream_broke, egress_failed', false),
+        // What the Bun runtime prints after it, dump included.
+        appLine(1, 'ERROR', 'CHAT', '❌ 非流式聊天处理错误'),
+        'error: signin-worker egress: egress_failed (In-page fetch failed (network_error).)',
+        ...generation(20)
+    ]))
+    assert.equal(failed.verdict, 'LOOK')
+    assert.deepEqual(failed.why, ['1 answer(s) failed while the application handled them: 0 with a stream, 1 without', '1 stream(s) ended with an error'])
+    assert.equal(watch.summarize([
+        appLine(1, 'WARN', 'REQUEST', '⚠️ 非流式整体重试 (原因: upstream_broke, egress_failed)'),
+        appLine(1, 'ERROR', 'CHAT', '❌ 非流式聊天处理错误')
+    ]).counts.get('app.unclassified.ERROR'), undefined)
 })
 
 // Since Qwen2API-0c6 and Qwen2API-nch (2026-11-26): what the worker says beyond a status, and

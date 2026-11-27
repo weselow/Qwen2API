@@ -29,6 +29,12 @@
  *   3. the relay hands the frames on as they arrive, not once they are all in;
  *   4. a relay the worker could not carry ends in an error event: the
  *      application makes the call once more, and the client gets the answer;
+ *      then, since Qwen2API-jk9 (2026-11-27), the two ways the first attempt
+ *      of a request without a stream died in the first hour of real traffic
+ *      on 27.11 — its answer's connection going under it once it began, and a
+ *      chats/new the page did not answer in time (the worker's 504): the
+ *      application makes the whole request once more, and the client gets the
+ *      answer behind a 200;
  *   5. after a restart the session is back from disk: no sign-in, no reload;
  *   6. a WAF challenge page is a real 503: one reload, one retry, no password;
  *   7. the application starts once more, the session back from disk again — each
@@ -197,6 +203,13 @@ function standIn() {
         holdAfterHead: false,
         // The code the next relay fails with, before it has a head to send.
         failRelay: null,
+        // The code the next relay's answer breaks with, once it began (Qwen2API-jk9): the error event the
+        // worker ends the relay with when qwen.ai's side of it failed. Once: the request the application
+        // makes again is carried as any other.
+        breakRelay: null,
+        // The code the worker refuses the next chats/new with, as it does when the page did not answer
+        // the call in time (Qwen2API-jk9): answered as HTTP 504, at once.
+        refuseChatsNew: null,
         // What the next relay carries; null: the text answer.
         answer: null,
         // qwen.ai's verdicts on the page's next calls of any other address, by address, in order:
@@ -248,7 +261,7 @@ function standIn() {
         }
         const authorized = request.headers.authorization === `Bearer ${WORKER_TOKEN}`
         const body = raw ? JSON.parse(raw) : {}
-        calls.push({ route: pathname, authorized, body })
+        calls.push({ route: pathname, authorized, body, at: Date.now() })
         if (!authorized) return json(401, { code: 'unauthorized', message: 'Invalid worker token.' })
         // The application dropped an account (Qwen2API-2l0). The worker's /forget closes the
         // account's page; a relay of that account still open is cut with it, as a page's stream is
@@ -281,6 +294,13 @@ function standIn() {
             : (page === '/api/v2/chats/new' ? state.chatsNew : (state.answers[page] ||= [])).shift()
         if (verdict === 'refused') return json(200, egress({ success: false, data: { code: 'unauthorized', details: SECRET } }))
         if (verdict === 'challenge') return json(200, egress(CHALLENGE_PAGE, { 'content-type': 'text/html; charset=utf-8' }))
+        // The worker's own refusal of a chats/new its page did not answer in time (Qwen2API-jk9), as its
+        // HTTP layer writes it (signin-worker/lib/worker-errors.js: egress_timeout is a 504).
+        if (page === '/api/v2/chats/new' && state.refuseChatsNew) {
+            const code = state.refuseChatsNew
+            state.refuseChatsNew = null
+            return json(504, { code, message: 'The resident page stopped responding.' })
+        }
         // As qwen.ai answered the page's token call where its front end no longer asks (Qwen2API-3ue.12).
         if (verdict === 'not-allowed') return json(200, egress(REFUSED_PAGE, { 'content-type': 'text/html; charset=utf-8' }, 405))
         if (verdict === 'parsing') return json(200, egress({ success: true, data: { list: [{ file_id: FILE_ID, status: 'parsing' }] } }))
@@ -349,6 +369,10 @@ function standIn() {
         // profile deleted the worker answers 404 no_profile instead; that is not staged here.
         forgotten.delete(call.email)
         event({ type: 'chunk', data: Buffer.from(answer.pieces[0]).toString('base64') })
+        // The answer's connection goes under it once it began (Qwen2API-jk9).
+        const broke = state.breakRelay
+        state.breakRelay = null
+        if (broke) return response.end(`${JSON.stringify({ type: 'error', code: broke, message: `In-page fetch failed (${broke}).` })}\n`)
         await (hold || Promise.resolve())
         for (const piece of answer.pieces.slice(1)) event({ type: 'chunk', data: Buffer.from(piece).toString('base64') })
         response.end(`${JSON.stringify({ type: 'end', cookies: [cookie('ssxmod_itna', 'from-end')] })}\n`)
@@ -594,6 +618,52 @@ async function run({ startApplication, stopApplication, disposeApplication, bina
         assert.match(log(), /聊天请求传输错误 \(尝试 1\/2, code=ETIMEDOUT\): signin-worker egress: egress_timeout/)
         console.log('PASS: browser mode — a relay that fails is retried, and the client gets the answer')
 
+        // What the worker was asked since `from`: the route — and for a call of the page, its method and address.
+        const trail = from => worker.calls.slice(from).map(call => call.route !== '/egress' ? call.route
+            : `${call.body.method} ${new URL(call.body.url).pathname}${call.body.stream === true ? ' (stream)' : ''}`)
+
+        // 4a. Since Qwen2API-jk9 (2026-11-27): a relay that fails once the answer is under way, on a request
+        //     without a stream, is not the completions call's alone to make again — nothing has reached the
+        //     client —: the application makes the whole request once more, a new chats/new included, and the
+        //     client gets the second answer behind a 200.
+        worker.state.answer = { type: 'text/event-stream', pieces: [frame({ phase: 'answer', content: 'Unfinished, and' }), REST] }
+        worker.state.breakRelay = 'egress_failed'
+        const beforeBreak = worker.calls.length
+        const askedAgain = await whole(await chat(false))
+        assert.equal(askedAgain.status, 200, `${askedAgain.text}\n${evidence(application.logs)}`)
+        assert.equal(JSON.parse(askedAgain.text).choices[0].message.content, ANSWER, askedAgain.text)
+        assert.deepEqual(trail(beforeBreak), [
+            'POST /api/v2/chats/new', 'POST /api/v2/chat/completions (stream)',
+            'POST /api/v2/chats/new', 'POST /api/v2/chat/completions (stream)'
+        ], 'a chats/new, the relay that broke under its answer, and the whole request once more')
+        assert.ok(!askedAgain.text.includes('Unfinished'), 'a byte of the answer that broke reached the client')
+        // The application's last lines of a request can reach this pipe after its response reached the client.
+        await wait(() => /非流式整体重试 \(原因: upstream_broke, egress_failed\)/.test(log()), 'the log does not say the request was made again, and why')
+        await wait(() => /非流式整体重试成功 \(原因: upstream_broke, egress_failed\)/.test(log()), 'the log does not say the retried answer was delivered')
+        console.log('PASS: browser mode — an answer whose connection went under it, on a request without a stream: the whole request is made once more, and the client gets the answer behind a 200')
+
+        // 4b. A chats/new the page did not answer in time — the worker's 504 egress_timeout, answered here at
+        //     once rather than thirty seconds on: the application waits two seconds and makes the whole request
+        //     once more.
+        worker.state.refuseChatsNew = 'egress_timeout'
+        const beforeTimeout = worker.calls.length
+        const askedLater = await whole(await chat(false))
+        assert.equal(askedLater.status, 200, `${askedLater.text}\n${evidence(application.logs)}`)
+        assert.equal(JSON.parse(askedLater.text).choices[0].message.content, ANSWER, askedLater.text)
+        assert.deepEqual(trail(beforeTimeout), [
+            'POST /api/v2/chats/new', 'POST /api/v2/chats/new', 'POST /api/v2/chat/completions (stream)'
+        ], 'the chats/new that timed out, then the whole request once more')
+        // Between the chats/new the worker gave up on and the one after it. The floor leaves out what a timer
+        // may fire short by and a clock tick: what it rules out is no pause, or a shorter one.
+        const [timedOut, afterPause] = worker.calls.slice(beforeTimeout)
+            .filter(call => call.route === '/egress' && new URL(call.body.url).pathname === '/api/v2/chats/new')
+        const waited = afterPause.at - timedOut.at
+        assert.ok(waited >= 1900, `the request was asked again ${waited} ms after the chats/new the worker gave up on`)
+        await wait(() => /非流式整体重试 \(原因: chats_new_timeout\)/.test(log()), 'the log does not say the request was made again after the timed-out chats/new')
+        await wait(() => /非流式整体重试成功 \(原因: chats_new_timeout\)/.test(log()), 'the log does not say the retried answer was delivered')
+        console.log(`PASS: browser mode — a chats/new the worker gave up on: the whole request is made once more ${waited} ms later, ` +
+            'and the client gets the answer behind a 200')
+
         // 5. The session survives a restart: it is read back from disk, with no sign-in and no reload.
         await stopApplication(application)
         const callsBeforeRestart = worker.routes().length
@@ -640,9 +710,6 @@ async function run({ startApplication, stopApplication, disposeApplication, bina
                 tools: [{ type: 'function', function: { name: 'read_file', parameters: { type: 'object', properties: {} } } }]
             })
         })
-        // What the worker was asked since `from`: the route — and for a call of the page, its method and address.
-        const trail = from => worker.calls.slice(from).map(call => call.route !== '/egress' ? call.route
-            : `${call.body.method} ${new URL(call.body.url).pathname}${call.body.stream === true ? ' (stream)' : ''}`)
         // qwen.ai refuses the token call: the chat is made, the page is asked for the token once, and
         // the client's answer is a retryable 503. Nothing is uploaded.
         worker.state.answer = AGENT_ANSWER

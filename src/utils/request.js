@@ -940,10 +940,22 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
     // del cliente hornea uno nuevo. Cuesta como mucho un parse de mas.
     if (contextResult.reusedPrefix) invalidateContextPrefix(contextResult.prefixKey)
 
+    // Since Qwen2API-jk9 (2026-11-27): the HTTP status that stands on the failure the last attempt
+    // ended with, when one does — and null when none does (a transport that got no HTTP answer). It
+    // is qwen.ai's status on the head of completions, as the direct transports got it or as the
+    // page's fetch got it through the egress; or the status of whatever answered on the way to it
+    // (a proxy's, a WAF page's); or a 401 the egress sets itself, with no status of qwen.ai's
+    // behind it (browser-egress.js: a profile that no longer authenticates, and a session refused
+    // in the first frame under a 2xx head). Nothing here reads it for what the client gets — that
+    // is `failure`, as before. The whole retry of a request without a stream reads it, and takes a
+    // 5xx and nothing else (utils/whole-answer-retry.js).
+    const upstreamStatus = Number.isInteger(lastError?.response?.status) ? lastError.response.status : null
+
     return {
         status: false,
         response: null,
-        failure
+        failure,
+        upstreamStatus
     }
 }
 
@@ -1017,6 +1029,13 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
                     ? new ChatCreationError()
                     : new ChatCreationError('upstream_transport_error', 503)
             }
+            // Since Qwen2API-jk9 (2026-11-27): what the worker said of a chats/new it could not carry travels on.
+            // browser-egress.js#postChat throws the worker's SigninError, with its code — egress_timeout when
+            // the page did not answer in time — and that code was lost here, where the failure becomes the
+            // category the client gets. The category stays the same as ever; the whole retry of a request
+            // without a stream reads the code to know a timeout worth asking again
+            // (utils/whole-answer-retry.js). A direct transport has no worker's word, and adds nothing.
+            if (typeof error.workerCode === 'string') failure.workerCode = error.workerCode
         }
         logger.error(`Qwen chat creation failed: category=${failure.code}, status=${failure.status}`, 'CHAT')
         // jik.4：会话被上游拒绝（401/punish）——image/video 控制器直接调用

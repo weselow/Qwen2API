@@ -61,6 +61,7 @@ const { ensureAgentCurrentEnvelope } = require('../middlewares/chat-middleware.j
 const { mapIncomingModel } = require('../utils/model-map.js');
 const { createUpstreamResponseFilter } = require('../utils/sse.js');
 const { watchClient, isClientGone, consumeWhileClientStays } = require('../utils/client-gone.js');
+const { createWholeAnswerRetry } = require('../utils/whole-answer-retry.js');
 const { logger } = require('../utils/logger');
 const {
   assertNoUpstreamFailure,
@@ -2098,7 +2099,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
  * @param {object} res - Express 响应
  * @param {Object} ctx - 处理上下文
  * @param {object} upstream - 上游 axios 响应
- * @returns {Promise<void>} 完成 Promise
+ * @returns {Promise<boolean>} 答案已交付给客户端时为 true；处理器自己回答了失败时非 true
+ *   （utils/whole-answer-retry.js 以此区分「交付」与「答了失败」）
  */
 const handleAnthropicNonStream = async (res, ctx, upstream) => {
   const {
@@ -2697,6 +2699,9 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
       cache_read_input_tokens: 0
     }
   });
+  // Since Qwen2API-jk9 (2026-11-27): the answer was delivered. It is what the whole retry goes by to tell
+  // its second request's answer from a failure this answered on the way (utils/whole-answer-retry.js).
+  return true;
 };
 
 /**
@@ -2714,6 +2719,15 @@ const handleAnthropicMessages = async (req, res) => {
   // Vigilado hasta el final de la respuesta: un cliente que se va se lleva su
   // upstream, por la senal de req y de su socket (utils/client-gone.js).
   const client = watchClient(req);
+  // Since Qwen2API-jk9 (2026-11-27): a request without a stream whose first attempt dies before a byte of
+  // its answer reached the client is made once more, whole (utils/whole-answer-retry.js). Its budget is counted
+  // from here — the handler's start, ahead of the first chats/new — so it is made now; a request with a stream
+  // leaves it unused, as what a stream delivered cannot be taken back.
+  const wholeAnswer = createWholeAnswerRetry({ client });
+  // Whether the attempt being answered warned the client of a context it had to cut
+  // (utils/request.js#contextCompacted): the warning is set as the attempt is answered, and taken back
+  // when a second request is made for the client — the attempt before it died with nothing answered.
+  let compactedWarning = false;
   try {
     const compatibility = analyzeAnthropicCompatibility(req.body || {});
     const compatibilityHeaders = buildAnthropicCompatibilityHeaders(compatibility);
@@ -2735,52 +2749,88 @@ const handleAnthropicMessages = async (req, res) => {
     // la clave de sesion el reintento reutiliza el prefijo de historial ya subido en vez
     // de subir y parsear el historial entero otra vez (hasta 3 parses por turno HTTP).
     const upstreamOptions = { allowContextCompaction: !hasTools, contextPrefixKey };
+    // One request as the client made it: the first, and the whole retry after it — the same body and the
+    // same options again (Qwen2API-jk9).
     // The request's pictures were uploaded from this account's page: its chat is made on
     // it too (Qwen2API-fjk). A request that uploaded nothing names no account here.
-    upstreamResp = await sendChatRequest(body, {
-      ...upstreamOptions,
-      ...(built.uploadAccount ? { currentAccount: built.uploadAccount } : {})
-    });
-    currentAccount = upstreamResp.currentAccount || null;
-    if (!upstreamResp.status || !upstreamResp.response) {
-      // El fallo dice por que fallo: cuota 429 `rate_limit_error`, sobrecarga 529
-      // `overloaded_error`, transporte 503, sin clasificar 502 `api_error`. Nunca un
-      // `api_error` 500 para todo: eso es indistinguible de "servidor roto".
-      return writeAnthropicHttpFailure(
-        res,
-        upstreamResp.failure || unclassifiedFailure(502),
-        upstreamResp.message || 'Upstream did not produce a usable response'
-      );
-    }
+    let second = false;
+    const send = () => {
+      // The second request is the whole retry. The attempt before it died with nothing answered, and
+      // the warning it set for a context it had to cut is not the warning of whatever is answered next,
+      // delivered or not. Taken back before the request is made, while the answer is still free: every
+      // way the retry can end — a read, a refusal, a call that throws — then finds it gone.
+      if (second && compactedWarning) {
+        res.removeHeader('X-Qwen2API-Context-Compacted');
+        compactedWarning = false;
+      }
+      second = true;
+      return sendChatRequest(body, {
+        ...upstreamOptions,
+        ...(built.uploadAccount ? { currentAccount: built.uploadAccount } : {})
+      });
+    };
+    // What the catch outside needs to know of the request's answer — which account served it, and what it
+    // reused —, kept for every attempt: of a refusal too, which returns before the handlers see it.
+    const received = (answer) => {
+      upstreamResp = answer;
+      currentAccount = answer.currentAccount || null;
+      return answer;
+    };
+    // The request refused outright — no chat, no answer —, for the client to be told of it.
+    // El fallo dice por que fallo: cuota 429 `rate_limit_error`, sobrecarga 529
+    // `overloaded_error`, transporte 503, sin clasificar 502 `api_error`. Nunca un
+    // `api_error` 500 para todo: eso es indistinguible de "servidor roto".
+    const refuse = (answer) => writeAnthropicHttpFailure(
+      res,
+      received(answer).failure || unclassifiedFailure(502),
+      answer.message || 'Upstream did not produce a usable response'
+    );
+    // An answer the request got, streamed or read whole from its first byte.
+    const deliver = (answer) => {
+      received(answer);
 
-    // Aviso al cliente cuando el contexto se recortó en silencio. El fallback por fallo
-    // del adjunto deja pasar un 200 con una fracción del contexto original: sin esta
-    // cabecera el cliente cree que el modelo lo vio todo. Convención existente:
-    // anthropic.compatibility.js#X-Qwen2API-Anthropic-Warnings.
-    if (upstreamResp.contextCompacted) {
-      res.set('X-Qwen2API-Context-Compacted', String(upstreamResp.contextSerializedBytes || 0));
-    }
+      // Aviso al cliente cuando el contexto se recortó en silencio. El fallback por fallo
+      // del adjunto deja pasar un 200 con una fracción del contexto original: sin esta
+      // cabecera el cliente cree que el modelo lo vio todo. Convención existente:
+      // anthropic.compatibility.js#X-Qwen2API-Anthropic-Warnings.
+      if (answer.contextCompacted) {
+        res.set('X-Qwen2API-Context-Compacted', String(answer.contextSerializedBytes || 0));
+        compactedWarning = true;
+      }
 
-    const message_id = `msg_${generateUUID().replace(/-/g, '').slice(0, 24)}`;
-    const ctx = {
-      message_id,
-      model,
-      hasTools,
-      historyToolCalls,
-      toolChoice,
-      allowedToolNames,
-      toolSchemas,
-      requestBody: body,
-      currentAccount,
-      upstreamOptions,
-      client
+      const message_id = `msg_${generateUUID().replace(/-/g, '').slice(0, 24)}`;
+      const ctx = {
+        message_id,
+        model,
+        hasTools,
+        historyToolCalls,
+        toolChoice,
+        allowedToolNames,
+        toolSchemas,
+        requestBody: body,
+        currentAccount,
+        upstreamOptions,
+        client
+      };
+
+      // Read whole: true once the answer was delivered. Anything else this resolves with is a failure the
+      // handler answered itself, which is no delivery.
+      return req.body?.stream
+        ? handleAnthropicStream(res, ctx, answer.response)
+        : handleAnthropicNonStream(res, ctx, answer.response).then(delivered => delivered === true);
     };
 
     if (req.body?.stream) {
-      await handleAnthropicStream(res, ctx, upstreamResp.response);
-    } else {
-      await handleAnthropicNonStream(res, ctx, upstreamResp.response);
+      const answer = received(await send());
+      if (!answer.status || !answer.response) return refuse(answer);
+      await deliver(answer);
+      return;
     }
+    // Since Qwen2API-jk9 (2026-11-27): the first attempt, and — when it dies in a way the whole retry is
+    // for — the request made once more, answered by the same handler on the new answer. A request without a
+    // stream is over when this returns: delivered, or answered with the failure of its second attempt, or
+    // gone with its client.
+    await wholeAnswer.run({ send, refused: refuse, answer: deliver });
   } catch (error) {
     // The client went away and the upstream was closed for it: nothing failed,
     // and there is nobody to answer with an error.
