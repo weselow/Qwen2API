@@ -693,7 +693,26 @@ cookies сессии и без Bearer, — и кладёт ответ туда, 
 … page-load waited (12340 ms)                                   загрузка ждала очереди
 … page-load waited (119300 ms, a long line packed)               очередь была длиннее предела: загрузки пошли теснее
 … renew no reload (1 sessions)                                  продление ответило сессией, которую обновило открытие страницы: загрузки не было
+… forget session, page, profile deleted (2 sessions)            профиль удалён сразу
+… forget no session, no page, profile deleted (2 sessions)      у воркера не было ни сессии, ни страницы аккаунта
+… forget session, page, profile deferred (1 sessions)           профиль уйдёт после паузы: SIGNIN_FORGET_GRACE_MS
+… forget profile deleted after the pause (1 sessions)           пауза кончилась: профиль удалён
+… forget profile not removed (<код>)                            профиль не удалился: следом profile left
+… forget session, page, profile kept, a renewal still running (1 sessions)  продление аккаунта пережило /forget: может остаться сессия
+… forget a mark that names no profile of its own was left alone  старт воркера: пометка не тронута
+… forget a mark could not be read: its profile stays as it is   старт воркера: пометка не прочитана, профиль остался
 ```
+
+Итог профиля в ответе `/forget` — `deleted`, `left`, `deferred`, `kept`,
+`absent`; если вход или продление аккаунта пережили `/forget`, строка
+кончается на `, a login still running` или `, a renewal still running`. С
+паузой (`SIGNIN_FORGET_GRACE_MS`) ответ пишет `profile deferred`, а по её
+истечении выходит `forget profile deleted after the pause (N sessions)` либо
+`forget profile not removed after the pause (<код>)` и `forget profile left
+after the pause (N sessions)`. Счётчик считает их по итогу (`forget.deleted`,
+`forget.deferred`, `forget.afterThePause.deleted`, `forget.mark.leftAlone` и
+так далее), текст строк в отчёт не попадает; форма, которой он не знает, —
+`unparsed.worker`.
 
 `GET /health` показывает, что в силе: `pageTokenRefresh`, `streamWaitMs`,
 `loadMinIntervalMs`, `loadMaxWaitMs`, — и как длинна очередь загрузок:
