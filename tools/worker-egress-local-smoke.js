@@ -28,6 +28,11 @@
  * of two accounts take turns. (Not what qwen.ai makes of that call: it is
  * never asked.)
  *
+ * Since Qwen2API-qic (2026-11-28) a stream the stand-in answers with a
+ * refusal in the body of a 200 — JSON where an answer is SSE: the worker's
+ * line says it once the call is over, and the end carries the code. (Seen
+ * live once on a stream, on 2026-11-24, before the stream was a fetch.)
+ *
  * qwen.ai is never contacted: run this freely, it is not a live probe. Use it
  * after touching the worker's browser paths: signin-worker/server.js (the
  * sign-in path), lib/login-pacer.js, lib/resident-pages.js,
@@ -68,6 +73,9 @@ const WIDE = 'data: {"choices":[{"delta":{"content":"привет 中文テス�
 // What qwen.ai's WAF answered an API call with on 2026-11-24: status 200, a page.
 const CHALLENGE_PAGE = '<!doctype html> <meta charset="UTF-8"> <meta name="aliyun_waf_aa" content="stub"> ' +
     '<script> /* v2.0.1 */ </script>'
+// What /api/refused answers (Qwen2API-qic): a refusal in the body of a 200, as qwen.ai answered
+// chats/new on 2026-11-26.
+const REFUSAL = '{"success":false,"code":"unauthorized"}'
 
 /**
  * The stand-in page's request hook, as the real page's (baxiaCommon.js
@@ -348,6 +356,11 @@ function startStandIn() {
             })
         }
         if (req.url === '/api/sse') return sseFrames(res)
+        if (req.url === '/api/refused') {
+            // A refusal in the body of a 200, under a head that says JSON (Qwen2API-qic).
+            res.writeHead(200, { 'content-type': 'application/json' })
+            return res.end(REFUSAL)
+        }
         if (req.url === '/api/sse-wide') {
             res.writeHead(200, { 'content-type': 'text/event-stream' })
             const bytes = Buffer.from(WIDE, 'utf8')
@@ -736,6 +749,38 @@ async function main() {
         assert.equal(body, SSE_FRAMES.join(''), 'a frame cut inside a two-byte character must come back whole')
         assert.ok(chunkAt.at(-1) - chunkAt[0] >= 250, 'the chunks arrived together, not as they came')
         console.log(`ok stream: head, ${chunkAt.length} chunk(s) and the end relayed as they came (${Date.now() - streamStarted} ms)`)
+
+        // A refusal qwen.ai puts in the body of a 200 (Qwen2API-qic): the same
+        // stream, answered with JSON where an answer is SSE. qwen.ai answered
+        // a stream so on 2026-11-24, before the stream was a fetch
+        // (Qwen2API-3ue.9), and chats/new on 2026-11-26. Read once the call is
+        // over, off the start of the body the relay keeps for a challenge
+        // page: nothing is held back, and the end carries the code.
+        const refusalStarted = Date.now()
+        const refusal = await logged(async lines => {
+            const events = []
+            const opened = await relay({ url: '/api/refused', body: '{"stream":true}' })
+            for (;;) {
+                const event = await opened.next()
+                events.push(event)
+                if (event.type === 'end' || event.type === 'eof') return { events, said: lines }
+            }
+        })
+        // qwen.ai's answer as it was — the head, the body, the end —, in its
+        // order. (How many pieces the browser reports the body in is its own.)
+        const pieces = refusal.events.filter(event => event.type === 'chunk')
+        const order = [refusal.events[0].type, ...refusal.events.slice(1, -1).map(() => 'chunk'), refusal.events.at(-1).type]
+        assert.deepEqual(order, ['head', ...pieces.map(() => 'chunk'), 'end'], JSON.stringify(refusal.events))
+        assert.ok(pieces.length >= 1, 'the body did not reach the app')
+        assert.equal(refusal.events[0].headers['content-type'], 'application/json')
+        assert.equal(pieces.map(event => Buffer.from(event.data, 'base64').toString('utf8')).join(''), REFUSAL)
+        assert.equal(refusal.events.at(-1).refusal, 'unauthorized')
+        assert.ok(refusal.events.at(-1).cookies.some(cookie => cookie.name === 'standin'))
+        const line = refusal.said.find(said => /egress-stream \/api\/refused end \(/.test(said))
+        assert.match(line, /egress-stream \/api\/refused end \(\d+ ms\) — code unauthorized$/, refusal.said.join('\n'))
+        console.log(`ok stream refused in the body of a 200: the end carries the code, and the worker's line says it` +
+            ` (${Date.now() - refusalStarted} ms)`)
+        console.log(`   the worker's line: ${line.replace(/^\S+ /, '')}`)
 
         // Silence ends a stream: one chunk, then nothing. The page's own
         // timer cuts it, as it does for a whole-answer call.

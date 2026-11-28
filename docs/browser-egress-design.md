@@ -630,8 +630,8 @@ Playwright), `tests/browser-egress.test.js` (приложение против s
 | --- | --- | --- |
 | `{"type":"head","status":…,"url":…,"redirected":…,"headers":{…},"cookies":[…]}` | qwen.ai ответила заголовками | её статус и заголовки (имена в нижнем регистре); банка браузера на этот момент — `set-cookie` скрипту в странице не виден, поэтому банка едет отдельным полем |
 | `{"type":"chunk","data":"…"}` | qwen.ai прислала кусок тела | байты в base64: канал страницы переносит строки, а кусок может разрезать многобайтовый символ |
-| `{"type":"end","cookies":[…]}` | тело дочитано до конца | банка браузера на этот момент |
-| `{"type":"error","code":"…","message":"…"}` | стрим оборвался | код из того же ряда, что у целого `/egress` (`egress_timeout`, `egress_failed`, `egress_too_large`, `page_closed`, `browser_error`); всегда последнее событие |
+| `{"type":"end","cookies":[…],"refusal":"…"}` | тело дочитано до конца | банка браузера на этот момент; `refusal` — не всегда, а с Qwen2API-qic (28.11) и только когда голова ответа была 2xx с `content-type: application/json`, а тело началось с отказа qwen.ai (`{"success":false,"code":"unauthorized"}`, конверт `ret`): код, каким его называет строка лога воркера (`egress-stream … end (… ms) — code unauthorized`), или `no_code`, если отказ кода не называет. Читаются первые 4096 байтов тела, когда вызов окончен; SSE-ответ не читается. Приложение читает из `end` только `cookies` (`docs/signin-worker.md`, «Отказ в теле под статусом 200») |
+| `{"type":"error","code":"…","message":"…"}` | стрим оборвался | код из того же ряда, что у целого `/egress` (`egress_timeout`, `egress_failed`, `egress_too_large`, `page_closed`, `browser_error`); с Qwen2API-qic — ещё `refusal` на том же условии, что у `end`: стрим оборвался после 2xx-ответа, начавшегося с отказа, и строка воркера говорит об этом (`egress-stream … egress_failed (… ms) — code unauthorized`); всегда последнее событие |
 
 ### Воркер
 

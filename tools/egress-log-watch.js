@@ -65,6 +65,15 @@
  * video generation that did not finish, from ten minutes completions giving
  * no head. The app's clock carries no zone: its lines are read as UTC, the
  * host's time that both containers take.
+ *
+ * Since Qwen2API-qic (2026-11-28) a stream is read for a refusal as a whole
+ * answer is: the worker says on the line that ends a stream — its `end`, or
+ * the error it ended with — when qwen.ai's 2xx carried a refusal in the start
+ * of its body, and this tool counts it as `stream.refused.<code>` beside the
+ * 200 the head line already said, complains of it, and counts no such stream
+ * among the accepted. Seen live once, on 2026-11-24 — a stream the page made
+ * as an XMLHttpRequest, answered with the punish envelope under status 200 —
+ * and none recorded since the stream is a fetch (Qwen2API-3ue.9).
  */
 
 // Terminal colors, as the logger writes them on a console.
@@ -179,11 +188,12 @@ const challengeName = said => {
 }
 
 /**
- * A refusal qwen.ai put in the body of a whole answer, as the worker's line
- * says of it (Qwen2API-0c6): by its code ("code …"), or, one that names none,
- * by being one ("refused, no code"). Null when the line says neither. An
- * answer of a 2xx carries one note and no more — no headers, no body — so the
- * code is the whole rest of the line, whatever is in it.
+ * A refusal qwen.ai put in the body of a 2xx — of a whole answer, or of a
+ * stream, said on the line that ends it (Qwen2API-qic) —, as the worker's
+ * line says of it (Qwen2API-0c6): by its code ("code …"), or, one that
+ * names none, by being one ("refused, no code"). Null when the line says
+ * neither. Such an answer carries one note and no more — no headers, no
+ * body — so the code is the whole rest of the note, whatever is in it.
  * @param {string} [said] - What the worker wrote after " — "
  * @returns {{code: string}|null}
  */
@@ -299,10 +309,24 @@ function readWorkerLine(report, event, detail, at) {
         case 'egress-stream':
             if ((found = /^(\S+) -> (\d{3}) \(/.exec(detail))) bump(report, `stream.head.${found[2]}`)
             else if ((found = /^(\S+) end \(\d+ ms\)( — (.+))?$/.exec(detail))) {
-                bump(report, challengeName(found[2]) ? `stream.${challengeName(found[2])}` : 'stream.ended')
+                // What the line says after its time: a challenge page, or — since Qwen2API-qic — a refusal
+                // qwen.ai put in the body of the 2xx. A challenge page is HTML and never a refusal; an end
+                // that says neither is a stream that ended.
+                const challenge = challengeName(found[2])
+                const refusal = challenge ? null : bodyRefusal(found[3])
+                if (challenge) bump(report, `stream.${challenge}`)
+                else if (refusal) bump(report, `stream.refused.${refusal.code}`)
+                else bump(report, 'stream.ended')
             } else if (/^(\S+) cancelled \(/.test(detail)) bump(report, 'stream.cancelled')
-            else if ((found = /^(\S+) ([a-z_]+) \(/.exec(detail))) bump(report, `stream.failed.${found[2]}`)
-            else bump(report, 'unparsed.worker')
+            // The line's time is read as the worker writes it, `(N ms)`, and not as anything in brackets up to the
+            // last bracket on the line: a refusal's code may end with a bracket of its own, or carry the words of a note.
+            else if ((found = /^(\S+) ([a-z_]+) \(\d+ ms\)( — (.+))?$/.exec(detail))) {
+                bump(report, `stream.failed.${found[2]}`)
+                // A stream that ended with an error is said the same of a 2xx answer that began as a refusal
+                // (Qwen2API-qic): counted beside its error, not instead of it.
+                const refusal = bodyRefusal(found[4])
+                if (refusal) bump(report, `stream.refused.${refusal.code}`)
+            } else bump(report, 'unparsed.worker')
             return
         case 'request': {
             // The app's calls are POSTs to a route; anything else that reached the
@@ -595,6 +619,13 @@ function complaints(report) {
         why.push(`qwen.ai refused ${inBody.reduce((sum, [, , hits]) => sum + hits, 0)} call(s) in the body of a 2xx: ${
             inBody.map(([path, code, hits]) => `${said(path)} ${code} ${hits}`).join(', ')}`)
     }
+    // The same of a stream (Qwen2API-qic): said on the line that ended it, or on the error it ended with.
+    // The name is stream.refused.<code>, by the code as the worker's line shows it.
+    const inStream = [...report.counts].filter(([name]) => name.startsWith('stream.refused.'))
+    if (inStream.length) {
+        why.push(`qwen.ai refused ${inStream.reduce((sum, [, hits]) => sum + hits, 0)} stream(s) in the body of a 2xx: ${
+            inStream.map(([name, hits]) => `${name.slice('stream.refused.'.length)} ${hits}`).join(', ')}`)
+    }
     if (total(report, 'app.workerRefused.')) why.push(`the worker could not serve ${total(report, 'app.workerRefused.')} call(s)`)
     // What the app answers its client with when a page was reloaded under its answer, and the relay broke (Qwen2API-nch).
     // On the Anthropic route there is one handler for an answer with a stream and without: said as its own count.
@@ -659,9 +690,11 @@ function complaints(report) {
     // A 401 head of a stream is the app's to recover from inside the request (one
     // reload, one retry), so one is counted and not complained of. Refused more
     // often than accepted is the shape of 23.11: every call refused, the page
-    // reloaded for each, refused again. A challenged stream is no accepted one.
+    // reloaded for each, refused again. A challenged stream is no accepted one,
+    // nor is one qwen.ai refused in the body of a 2xx (Qwen2API-qic).
     const refused = count('stream.head.401')
-    const accepted = count('stream.head.200') - count('stream.challenge') - count('stream.challenge.kept')
+    const accepted = count('stream.head.200') - count('stream.challenge') - count('stream.challenge.kept') -
+        total(report, 'stream.refused.')
     if (refused > accepted) why.push(`streams refused as 401 more often than accepted: ${refused} refused, ${accepted} accepted`)
     if (count('renew.forced') && total(report, 'stream.head.') && !count('stream.ended')) {
         why.push(`${count('renew.forced')} forced reload(s), and not one stream finished`)

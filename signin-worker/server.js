@@ -59,6 +59,10 @@
  * answer that is no 2xx by its code, its headers and the start of its body
  * (egress-fetch.js#answerNote) — none that could hold a credential.
  *
+ * Since Qwen2API-qic (2026-11-28) the line that ends a stream says it too,
+ * when qwen.ai's 2xx carried a refusal in the start of its body
+ * (egress-fetch.js#streamRefusal), and the stream's last event carries the code.
+ *
  * Since Qwen2API-nch, Qwen2API-ops and Qwen2API-xun (2026-11-26), for many
  * accounts:
  *
@@ -703,6 +707,19 @@ function createServer(overrides = {}) {
      * that is an ordinary error status, with the codes /egress always had.
      * After it the status is spent, so a failure travels as the last event.
      *
+     * Since Qwen2API-qic (2026-11-28) the last event, and the line that ends
+     * the stream, say when qwen.ai's 2xx carried a refusal in the start of its
+     * body — `{"success":false,"code":"unauthorized"}`, or the punish
+     * envelope's `ret` lines: `end` and `error` then carry `refusal`, the code
+     * as the line shows it (`no_code` for a refusal that names none), and the
+     * line says ` — code …` or ` — refused, no code`. Read once the call is
+     * over, off the start of the body the relay keeps anyway for a challenge
+     * page; only of an answer whose head says JSON, never of a stream of SSE
+     * frames (egress-fetch.js#streamRefusal; seen live once, on 2026-11-24,
+     * before the stream was a fetch). The app reads `cookies` of `end` and
+     * `code` with `message` of `error`, so the field changes nothing on its
+     * side.
+     *
      * The app cancelling is it closing the connection — the body of its own
      * request is long gone by then. That ends the stream here AND the request
      * in the page (resident-pages.js#abort): a request already running there is
@@ -752,17 +769,22 @@ function createServer(overrides = {}) {
                 log('egress-stream', `${pathname} cancelled (${Date.now() - started} ms)`)
                 return
             }
-            await frame({ type: 'end', cookies: result.cookies })
+            // What a 2xx answer carried in the start of its body (Qwen2API-qic): said on the line, and carried to the app.
+            const { refusal } = result
+            await frame({ type: 'end', cookies: result.cookies, ...(refusal ? { refusal: refusal.code } : {}) })
             res.end()
-            log('egress-stream', `${pathname} end (${Date.now() - started} ms)${CHALLENGE_NOTE[result.challenge] || ''}`)
+            log('egress-stream', `${pathname} end (${Date.now() - started} ms)${CHALLENGE_NOTE[result.challenge] || ''}${refusal ? refusal.note : ''}`)
         } catch (error) {
             const code = error.code && STATUS_FOR_CODE[error.code] ? error.code : 'browser_error'
             if (!res.headersSent) {
                 if (!gone) throw error
                 return
             }
-            log('egress-stream', `${pathname} ${code} (${Date.now() - started} ms)`)
-            await frame({ type: 'error', code, message: error.message || 'Signin worker failure.' })
+            // A stream that ends with an error is said the same of a 2xx answer that began as a
+            // refusal: the error carries it (resident-pages.js#stream).
+            const { refusal } = error
+            log('egress-stream', `${pathname} ${code} (${Date.now() - started} ms)` + (refusal ? refusal.note : ''))
+            await frame({ type: 'error', code, message: error.message || 'Signin worker failure.', ...(refusal ? { refusal: refusal.code } : {}) })
             res.end()
         } finally {
             req.socket.off('close', onGone)

@@ -497,6 +497,10 @@ test('the shapes it reads are the shapes the code prints', () => {
         [worker, 'egressMaxTimeoutMs: overrides.egressMaxTimeoutMs ?? envInt(\'SIGNIN_EGRESS_MAX_TIMEOUT_MS\', 600000)'],
         [read('src/utils/account.js'), "deferred: '，浏览器配置稍后删除'"],
         [read('src/utils/account.js'), "`页面${forgotten.page ? '已关闭' : '本无'}${FORGET_PROFILE_NOTE[forgotten.profile] || ''}）`"],
+        // Since Qwen2API-qic (2026-11-28): what the line that ends a stream says of a refusal in the body of a 2xx.
+        [worker, "${CHALLENGE_NOTE[result.challenge] || ''}${refusal ? refusal.note : ''}`)"],
+        [worker, "log('egress-stream', `${pathname} ${code} (${Date.now() - started} ms)` + (refusal ? refusal.note : ''))"],
+        [read('signin-worker/lib/egress-fetch.js'), 'return { code, note: answerNote('],
         [worker, "`${session ? 'session' : 'no session'}, ${page ? 'page' : 'no page'}, profile ${profile}`"],
         [worker, '`, a ${pending} still running`'],
         [worker, "`profile not removed (${error.code || 'error'})`"],
@@ -1405,4 +1409,103 @@ test('a 503 on the head of a stream is named and said as a 502 is', () => {
         assert.equal(watch.render(report).verdict, 'LOOK')
         assert.deepEqual(watch.complaints(report), [`stream.head.${status}: 1`])
     }
+})
+
+// Since Qwen2API-qic (2026-11-28): a refusal qwen.ai put in the body of a 2xx that streamed. The
+// worker says it on the line that ends the stream — its end, or the error it ended with. Before,
+// the stream read as accepted: `stream.head.200` off its head line, `stream.ended` off its end.
+// Seen live once, on 2026-11-24 — a stream the page made as an XMLHttpRequest, answered with the
+// punish envelope under 200 (docs/browser-egress-design.md); chats/new was refused so on
+// 2026-11-26 (Qwen2API-0c6, above).
+
+test('a refusal qwen.ai put in the body of a 2xx that streamed is counted as the refusal it is, beside the 200 of its head, and said — not as a stream that ended well (Qwen2API-qic)', () => {
+    // The worker's lines, as signin-worker/server.js prints them: the head, then what the stream came to.
+    const stream = (minute, ending) => [
+        `${at(minute)} egress-stream ${COMPLETIONS} -> 200 (900 ms, 1/16 pages)`,
+        `${at(minute)} egress-stream ${COMPLETIONS} ${ending}`
+    ]
+    const report = watch.summarize([
+        ...generation(1, { first: true }),
+        ...stream(11, 'end (120 ms) — code unauthorized'),
+        ...stream(11, 'end (121 ms) — code FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::x'),
+        // A refusal that names no code is a refusal all the same.
+        ...stream(12, 'end (120 ms) — refused, no code'),
+        // The same said of a stream that ended with an error: beside its error, not instead of it.
+        ...stream(13, 'egress_failed (1000 ms) — code unauthorized')
+    ])
+    // The head line said 200 of each of them; the line that ended the stream says what the answer was.
+    assert.equal(report.counts.get('stream.head.200'), 5)
+    assert.equal(report.counts.get('stream.ended'), 1)
+    assert.equal(report.counts.get('stream.refused.unauthorized'), 2)
+    assert.equal(report.counts.get('stream.refused.FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::x'), 1)
+    assert.equal(report.counts.get('stream.refused.no_code'), 1)
+    assert.equal(report.counts.get('stream.failed.egress_failed'), 1)
+    assert.equal(report.lines.worker, 14)
+    assert.equal([...report.counts].filter(([name]) => name.startsWith('unparsed.')).length, 0)
+    const { verdict, why, text } = watch.render(report)
+    assert.equal(verdict, 'LOOK')
+    assert.deepEqual(why, [
+        'qwen.ai refused 4 stream(s) in the body of a 2xx: unauthorized 2, FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::x 1, no_code 1',
+        '1 stream(s) ended with an error'
+    ])
+    // The report says names and counts, and nothing more of a line.
+    assert.match(text, /completions streams\n {4}ended {2}1\n {4}failed\.egress_failed {2}1\n {4}head\.200 {2}5\n/)
+    assert.match(text, / {4}refused\.FAIL_SYS_USER_VALIDATE \| RGV587_ERROR::SM::x {2}1\n {4}refused\.no_code {2}1\n {4}refused\.unauthorized {2}2\n/)
+    assert.doesNotMatch(text, /900 ms|120 ms|121 ms|1000 ms|refused, no code|chat\/completions/)
+    // A refused stream is something to judge the egress by, as a refused call is.
+    assert.equal(watch.render(watch.summarize(stream(5, 'end (120 ms) — code unauthorized'))).verdict, 'LOOK')
+})
+
+test('a stream qwen.ai refused in the body is no accepted one: the 401s are counted against the answers that were not refused (Qwen2API-qic)', () => {
+    const stream = (minute, status, ending) => [
+        `${at(minute)} egress-stream ${COMPLETIONS} -> ${status} (900 ms, 1/16 pages)`,
+        `${at(minute)} egress-stream ${COMPLETIONS} ${ending}`
+    ]
+    // One answer that was a refusal in the body of a 200, and one refusal of the session: nothing accepted.
+    const refused = watch.render(watch.summarize([
+        ...stream(5, 200, 'end (120 ms) — code unauthorized'),
+        ...stream(6, 401, 'end (20 ms)')
+    ]))
+    assert.deepEqual(refused.why, [
+        'qwen.ai refused 1 stream(s) in the body of a 2xx: unauthorized 1',
+        'streams refused as 401 more often than accepted: 1 refused, 0 accepted'
+    ])
+    // The same on a stream that ended with an error.
+    assert.ok(watch.complaints(watch.summarize([
+        ...stream(5, 200, 'egress_failed (1000 ms) — code unauthorized'),
+        ...stream(6, 401, 'end (20 ms)')
+    ])).includes('streams refused as 401 more often than accepted: 1 refused, 0 accepted'))
+    // An end the line does not call a refusal is an accepted answer, as it always was: one against one is no pattern.
+    assert.deepEqual(watch.complaints(watch.summarize([
+        ...stream(5, 200, 'end (120 ms)'),
+        ...stream(6, 401, 'end (20 ms)')
+    ])), [])
+})
+
+test('a refusal’s code is read whole on the line that ends a stream — a bracket in it, or the words of a note — because the time in brackets is the line’s own (Qwen2API-qic)', () => {
+    // refusalCode (signin-worker/lib/egress-fetch.js) passes the answer's `error`, `error.code` and `ret` lines
+    // through as they are: a code may end with a bracket, or carry the words of a note. The line's own
+    // brackets hold its time, `(N ms)`, and nothing else.
+    const read = ending => watch.summarize([
+        `${at(5)} egress-stream ${COMPLETIONS} -> 200 (900 ms, 1/16 pages)`,
+        `${at(5)} egress-stream ${COMPLETIONS} ${ending}`
+    ]).counts
+    const refusals = counts => [...counts].filter(([name]) => name.startsWith('stream.refused.'))
+    for (const ending of ['end (120 ms) — code invalid token (retry)', 'egress_failed (1000 ms) — code invalid token (retry)']) {
+        const counts = read(ending)
+        assert.deepEqual(refusals(counts), [['stream.refused.invalid token (retry)', 1]], ending)
+        assert.equal([...counts].filter(([name]) => name.startsWith('unparsed.')).length, 0, ending)
+    }
+    // On the error line the refusal is beside the error, as ever.
+    assert.equal(read('egress_failed (1000 ms) — code invalid token (retry)').get('stream.failed.egress_failed'), 1)
+    // One refusal of one code: not one of `y`, read off what looks like a note inside the code.
+    for (const ending of ['egress_failed (1000 ms) — code x) — code y', 'end (120 ms) — code x) — code y']) {
+        assert.deepEqual(refusals(read(ending)), [['stream.refused.x) — code y', 1]], ending)
+    }
+    assert.equal(read('egress_failed (1000 ms) — code x) — code y').get('stream.failed.egress_failed'), 1)
+    // Said as it is, once.
+    assert.deepEqual(watch.complaints(watch.summarize([
+        `${at(5)} egress-stream ${COMPLETIONS} -> 200 (900 ms, 1/16 pages)`,
+        `${at(5)} egress-stream ${COMPLETIONS} egress_failed (1000 ms) — code x) — code y`
+    ])), ['qwen.ai refused 1 stream(s) in the body of a 2xx: x) — code y 1', '1 stream(s) ended with an error'])
 })
