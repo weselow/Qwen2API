@@ -29,7 +29,8 @@
  * what is the page's own about its token — how long it has left, and the
  * front end's call that renews it without a reload (pageTokenState,
  * pageRefreshToken) — and what the log quotes of a whole answer that qwen.ai
- * refused (answerNote).
+ * refused (answerNote). Since Qwen2API-qic (2026-11-28) what it quotes of a
+ * stream that was refused the same way (streamRefusal).
  */
 
 const crypto = require('node:crypto')
@@ -762,6 +763,15 @@ function isRefusal(payload) {
 }
 
 /**
+ * The code qwen.ai refused an answer in the body with (refusalCode), as a log
+ * line may show it: one line, short, and with nothing in it that looks like a
+ * credential. '' when the answer names none. What the line of a whole answer
+ * shows of a code (answerNote) and what a stream's line and last event show of
+ * it (streamRefusal) both come from here, so the two cannot come apart.
+ */
+const shownCode = payload => quoted(masked(refusalCode(payload)), 80).trim()
+
+/**
  * What the log says of qwen.ai's whole answer beyond its status (Qwen2API-0c6).
  * A refusal that travels in the body of a 2xx is said by its code — that is
  * what told an accepted call from a refused one on 2026-11-26 — or, a refusal
@@ -783,8 +793,7 @@ function answerNote({ status, headers, body }) {
     }
     const accepted = status >= 200 && status < 300
     const refusal = isRefusal(payload)
-    // The code as a log line may show it: one line, short, and with nothing in it that looks like a credential.
-    const shown = quoted(masked(refusalCode(payload)), 80).trim()
+    const shown = shownCode(payload)
     const notes = []
     if (shown && (refusal || !accepted)) notes.push(`code ${shown}`)
     else if (refusal && accepted) notes.push('refused, no code')
@@ -797,6 +806,56 @@ function answerNote({ status, headers, body }) {
         notes.push(`body: ${quoted(masked(text), QUOTED_BODY_CHARS)}`)
     }
     return notes.length ? ` — ${notes.join('; ')}` : ''
+}
+
+// Since Qwen2API-qic (2026-11-28) a stream is said so too, once it is over. An
+// answer that arrives piece by piece is read off the start of its body, which
+// the relay keeps anyway to recognise a challenge page
+// (resident-pages.js#stream): nothing is held back from the frames for it. The
+// start already kept is joined once for the reading, when the call is over.
+// Seen live once: on 2026-11-24 qwen.ai answered a stream the page made as an
+// XMLHttpRequest with status 200 and the punish envelope in the body, and the
+// worker's log said no more than `-> 200` and `end`
+// (docs/browser-egress-design.md). None recorded since the stream is a fetch
+// (Qwen2API-3ue.9). The content-type of that answer was not written down, so
+// whether this would have read it — only a head that says JSON is read — is
+// not known. On 2026-11-26 chats/new was refused in the body of a 200.
+
+// Of the start of a stream's body, this much is looked into for a refusal. A refusal is named when
+// its JSON document ends within these bytes, with nothing but whitespace after it up to the limit
+// (JSON.parse does not mind whitespace after a document), whatever the body carries beyond. A
+// document the limit cuts inside does not parse: it is not called a refusal, whatever it began like.
+const REFUSAL_HEAD_BYTES = 4096
+// How a refusal that names no code is named in an event of the relay. The line says "refused, no
+// code" (answerNote); tools/egress-log-watch.js counts such a refusal under the same word.
+const NO_CODE = 'no_code'
+
+/** Is this answer JSON, as its content-type says — `application/json`, with a charset or without? The answer's headers, names in lower case. */
+const isJsonAnswer = headers => /^application\/json\s*(?:;|$)/i.test(String((headers && headers['content-type']) || '').trim())
+
+/**
+ * The refusal qwen.ai put in the body of a 2xx answer that streamed
+ * (Qwen2API-qic): read off the start of the body once the call is over, by
+ * what a whole answer is read by (isRefusal, refusalCode, answerNote). Only an
+ * answer whose head says JSON is read — a stream of SSE frames may quote the
+ * words of a refusal as text —, and only one of a 2xx: an answer that is no
+ * 2xx is said by its status, as before. Null when there is nothing to say.
+ * @param {?{status: number, headers: Object<string,string>}} head - The answer's head, as the page reported it
+ * @param {Buffer[]} start - The start of the body, in the pieces it arrived in
+ * @returns {{code: string, note: string}|null} `code`: what qwen.ai refused with, as a log line
+ *   may show it — NO_CODE for a refusal that names none —, for the event of the relay;
+ *   `note`: what the log says after the line's own words — ' — code …' or ' — refused, no code'
+ */
+function streamRefusal(head, start) {
+    if (!head || head.status < 200 || head.status >= 300 || !isJsonAnswer(head.headers)) return null
+    const body = Buffer.concat(start).subarray(0, REFUSAL_HEAD_BYTES).toString('utf8')
+    let payload = null
+    try {
+        payload = JSON.parse(body)
+    } catch { /* not JSON: no document, or one the limit cut — no refusal is named */ }
+    if (!isRefusal(payload)) return null
+    const code = shownCode(payload) || NO_CODE
+    return { code, note: answerNote({ status: head.status, headers: head.headers, body }) }
 }
 
 /**
@@ -872,6 +931,8 @@ module.exports = {
     pageCall, pageAbortStream, pageTokenState, pageRefreshToken, readFrontEndVersion, normalizeEgress,
     isChallengePage, isHtmlAnswer, answerNote, CODE_FOR_OUTCOME,
     ABORT_REASON, STREAM_CHANNEL, STREAM_ABORTS, PAGE_HEADERS, CHALLENGE_HEAD_BYTES,
+    // What a stream that was refused in the body of a 2xx says of it (resident-pages.js#stream).
+    streamRefusal, isJsonAnswer, REFUSAL_HEAD_BYTES,
     // For the worker's own lines about a page's token (resident-pages.js#freshen).
     quoted, masked
 }

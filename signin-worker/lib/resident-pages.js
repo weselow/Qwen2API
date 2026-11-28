@@ -63,13 +63,21 @@
  * keep it pending on a challenge page, and to ignore an abort through their
  * wrapper. So a challenge answered to a stream is read off the page's network,
  * and the call in the page ends from its own signal, whatever its fetch does.
+ *
+ * Since Qwen2API-qic (2026-11-28) a stream says, once it is over, when qwen.ai's
+ * 2xx carried a refusal in the start of its body — as a whole answer's line
+ * says since Qwen2API-0c6 (egress-fetch.js#streamRefusal). Nothing is kept
+ * back for it: the start of the body is what stream() keeps anyway to
+ * recognise a challenge page, and it is read when the call is over, never
+ * while a frame waits. Seen live once, on 2026-11-24, before the stream was
+ * a fetch (egress-fetch.js#streamRefusal).
  */
 
 const fs = require('node:fs')
 const { WorkerError } = require('./worker-errors')
 const {
     pageCall, pageAbortStream, pageTokenState, pageRefreshToken, readFrontEndVersion, isChallengePage, isHtmlAnswer,
-    CODE_FOR_OUTCOME, ABORT_REASON, STREAM_CHANNEL, STREAM_ABORTS, CHALLENGE_HEAD_BYTES, quoted, masked
+    CODE_FOR_OUTCOME, ABORT_REASON, STREAM_CHANNEL, STREAM_ABORTS, CHALLENGE_HEAD_BYTES, quoted, masked, streamRefusal
 } = require('./egress-fetch')
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -690,15 +698,23 @@ function createResidents({
      * fetch back: the call is cut below, and ends with that, whatever its
      * fetch does afterwards.
      *
+     * Since Qwen2API-qic (2026-11-28) a 2xx answer whose head says JSON is
+     * read for a refusal in the start of its body once the call is over — off
+     * what was kept to recognise a challenge page, so no frame waits on it. It
+     * is `refusal` on the result, and on the error thrown when the call fails
+     * after such an answer.
+     *
      * @param {object} entry
      * @param {{url: string, init: object, timeoutMs: number}} request as normalizeEgress returned it
      * @param {object} sink
      * @param {number} sink.id - What abort() names this stream by
      * @param {(event: object) => Promise<void>|void} sink.onEvent - May take its time: the page waits
-     * @returns {Promise<{cookies: ?Object[], aborted: boolean, challenge?: 'page'|'network'}>} the jar
-     *   at the end; `aborted` when the app went away and the request was cut
-     *   for it; `challenge` when the answer was a WAF challenge page
-     * @throws {WorkerError} the call's own failures, as fetch() throws them
+     * @returns {Promise<{cookies: ?Object[], aborted: boolean, challenge?: 'page'|'network',
+     *   refusal?: {code: string, note: string}}>} the jar at the end; `aborted` when the app went
+     *   away and the request was cut for it; `challenge` when the answer was a WAF challenge page;
+     *   `refusal` when qwen.ai's 2xx carried a refusal in the start of its body (Qwen2API-qic)
+     * @throws {WorkerError} the call's own failures, as fetch() throws them — with `refusal` on
+     *   it when the call failed after a 2xx answer that began as one (Qwen2API-qic)
      */
     async function stream(entry, request, { id, onEvent }) {
         let timer = null
@@ -715,7 +731,8 @@ function createResidents({
             timer.unref?.()
         }
         // The answer as relayed so far: its head and the start of its body
-        // are what a challenge page is recognised by.
+        // are what a challenge page is recognised by — and, of a 2xx that says
+        // JSON, a refusal in the body (Qwen2API-qic).
         let head = null
         const start = []
         let startBytes = 0
@@ -794,7 +811,20 @@ function createResidents({
                 throw new WorkerError(CODE_FOR_OUTCOME[outcome.error] || 'egress_failed',
                     `In-page request failed (${outcome.error}${outcome.message ? `: ${outcome.message}` : ''}).`)
             }
-            return { cookies: await currentCookies(entry), aborted: false, ...verdict(head?.headers, Buffer.concat(start), 'page') }
+            // Read once the body is over (Qwen2API-qic): no frame ever waited for it.
+            const refusal = streamRefusal(head, start)
+            return {
+                cookies: await currentCookies(entry), aborted: false,
+                ...verdict(head?.headers, Buffer.concat(start), 'page'),
+                ...(refusal ? { refusal } : {})
+            }
+        } catch (error) {
+            // What a 2xx answer began as is said of a stream that ends with an error all the same
+            // (Qwen2API-qic): it travels on the error, for the line and the error event
+            // (server.js#relayEgress).
+            const refusal = streamRefusal(head, start)
+            if (refusal && error && typeof error === 'object') error.refusal = refusal
+            throw error
         } finally {
             clearTimeout(timer)
             streams.delete(id)

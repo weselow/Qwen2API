@@ -510,9 +510,11 @@ test('the log says what was forgotten, never the email, and the log counter read
   // Emails never become log lines (docs/signin-worker.md, "API sidecar").
   assert.equal(lines.some(line => line.includes(email)), false)
 
-  // tools/egress-log-watch.js, as the live session reads a worker's log: both lines it knows are counted, none is found unparsed.
+  // tools/egress-log-watch.js, as the live session reads a worker's log: the three lines it knows are counted —
+  // the forget line by what became of the profile (Qwen2API-j5f) —, none is found unparsed.
   const report = summarize(lines)
   assert.equal(report.counts.get('pages.closed.forgotten'), 1)
   assert.equal(report.counts.get('workerHttp.forget.200'), 1)
+  assert.equal(report.counts.get('forget.kept'), 1)
   assert.equal(report.counts.has('unparsed.worker'), false)
 })

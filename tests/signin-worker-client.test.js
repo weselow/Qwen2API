@@ -414,3 +414,54 @@ test('signin worker client carries a streaming egress call, and its failures (Qw
     restore()
   }
 })
+
+test('signin worker client takes the end and error events of a stream qwen.ai refused in the body of a 200 as the worker writes them, and yields the refusal (Qwen2API-qic)', { timeout: 10000 }, async t => {
+  // Since Qwen2API-qic the worker says on the stream's last event when its 2xx began as a refusal:
+  // the lines signin-worker/server.js#relayEgress writes, to the byte — the same ones
+  // tests/signin-worker-egress-stream.test.js checks the worker for. The reader of the relay
+  // accepts them and yields what they carry; what it means is the caller's to say.
+  const CHAT = 'https://chat.qwen.ai'
+  const head = '{"type":"head","status":200,"url":"' + CHAT + '/api/v2/chat/completions","redirected":false,' +
+    '"headers":{"content-type":"application/json"},"cookies":[]}'
+  const chunk = '{"type":"chunk","data":"' + Buffer.from('{"success":false,"code":"unauthorized"}').toString('base64') + '"}'
+  const refused = { type: 'end', cookies: [], refusal: 'unauthorized' }
+  const scripted = new Map([
+    ['{"type":"end","cookies":[],"refusal":"unauthorized"}', [refused]],
+    ['{"type":"end","cookies":[],"refusal":"no_code"}', [{ type: 'end', cookies: [], refusal: 'no_code' }]],
+    ['{"type":"error","code":"egress_failed","message":"In-page request failed (network_error: Failed to fetch).","refusal":"unauthorized"}',
+      [{ type: 'error', code: 'egress_failed', message: 'In-page request failed (network_error: Failed to fetch).', refusal: 'unauthorized' }]],
+    // The same end behind the head and the body it was read off, as the worker always writes them.
+    [[head, chunk, '{"type":"end","cookies":[],"refusal":"unauthorized"}'].join('\n'),
+      [{ type: 'head', status: 200, url: `${CHAT}/api/v2/chat/completions`, redirected: false, headers: { 'content-type': 'application/json' }, cookies: [] },
+        { type: 'chunk', data: Buffer.from('{"success":false,"code":"unauthorized"}').toString('base64') }, refused]]
+  ])
+  let line = ''
+  const server = http.createServer((req, res) => {
+    req.on('data', () => {})
+    return req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+      res.end(`${line}\n`)
+    })
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections?.() }))
+  const restore = freshClient({
+    API_KEY: 'offline',
+    V2_SESSION_MODE: 'browser',
+    QWEN_CHAT_PROXY_URL: CHAT,
+    SIGNIN_WORKER_URL: `http://127.0.0.1:${server.address().port}`,
+    SIGNIN_WORKER_TOKEN: 'shared-secret'
+  })
+  try {
+    const client = require('../src/utils/signin-worker-client')
+    const request = { url: '/api/v2/chat/completions', headers: { 'content-type': 'application/json' }, body: '{}', timeoutMs: 5000 }
+    for (const [written, expected] of scripted) {
+      line = written
+      const events = []
+      for await (const event of (await client.egressStream('a@example.invalid', null, request)).frames) events.push(event)
+      assert.deepEqual(events, expected, written)
+    }
+  } finally {
+    restore()
+  }
+})

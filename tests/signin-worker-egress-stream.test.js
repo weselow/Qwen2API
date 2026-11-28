@@ -9,8 +9,10 @@ const vm = require('node:vm')
 const { createServer, relayWriter } = require('../signin-worker/server')
 const { createResidents } = require('../signin-worker/lib/resident-pages')
 const {
-    pageCall, pageAbortStream, STREAM_CHANNEL, STREAM_ABORTS, ABORT_REASON
+    pageCall, pageAbortStream, STREAM_CHANNEL, STREAM_ABORTS, ABORT_REASON, streamRefusal, isJsonAnswer, answerNote
 } = require('../signin-worker/lib/egress-fetch')
+// The log counter reads the lines the worker writes (Qwen2API-qic): a line of this file's own, through it.
+const { summarize } = require('../tools/egress-log-watch')
 const { pageGlobals, pageLocation, pageFetch, pageStorage, xmlHttpRequest, pageDocument } = require('./helpers/fake-xml-http-request')
 
 // The streaming /egress (Qwen2API-3ue.3): qwen.ai's answer relayed to the app
@@ -793,7 +795,10 @@ test('what goes wrong before qwen.ai answered is an ordinary error status, not a
   const dead = await post('/egress', { email, ...streamCall })
   assert.equal(dead.status, 502)
   assert.match(dead.headers.get('content-type'), /application\/json/)
-  assert.equal((await dead.json()).code, 'egress_failed')
+  const deadBody = await dead.json()
+  assert.equal(deadBody.code, 'egress_failed')
+  // No head came, so there was no answer to read: nothing of a refusal, not an empty word of one (Qwen2API-qic).
+  assert.equal('refusal' in deadBody, false)
   // The page is fine; it is qwen.ai that did not answer.
   assert.equal((await health()).residentPages, 1)
 
@@ -806,7 +811,9 @@ test('what goes wrong before qwen.ai answered is an ordinary error status, not a
   signer.contexts[0].page.emit('crash')
   const failed = await dying
   assert.equal(failed.status, 502)
-  assert.equal((await failed.json()).code, 'page_closed')
+  const failedBody = await failed.json()
+  assert.equal(failedBody.code, 'page_closed')
+  assert.equal('refusal' in failedBody, false)
 })
 
 test('what goes wrong after qwen.ai answered is the relay’s last event', { timeout: 10000 }, async t => {
@@ -821,6 +828,9 @@ test('what goes wrong after qwen.ai answered is the relay’s last event', { tim
     await upstream.opened
     return { upstream, opened }
   }
+  // These answers are SSE, and none began as a refusal: the error that ends them says nothing of
+  // one — no field at all, not an empty word of it (Qwen2API-qic).
+  const unrefused = event => assert.equal('refusal' in event, false, JSON.stringify(event))
 
   // The connection dropping under the body.
   const dropped = await serving()
@@ -830,6 +840,7 @@ test('what goes wrong after qwen.ai answered is the relay’s last event', { tim
   assert.deepEqual(cut.map(event => event.type), ['head', 'chunk', 'error'])
   assert.equal(cut[2].code, 'egress_failed')
   assert.match(cut[2].message, /network_error/)
+  unrefused(cut[2])
 
   // Silence past the budget: cut inside the page.
   const stalled = await serving({ timeoutMs: 200 })
@@ -839,12 +850,14 @@ test('what goes wrong after qwen.ai answered is the relay’s last event', { tim
   assert.deepEqual(quiet.map(event => event.type), ['head', 'chunk', 'error'])
   assert.equal(quiet[2].code, 'egress_timeout')
   assert.ok(Date.now() - since >= 190, 'the stream was cut before its silence ran out')
+  unrefused(quiet[2])
 
   // More body than the worker is allowed to relay.
   const big = await serving()
   big.upstream.push('x'.repeat(100))
   const tooLarge = await readAll(big.opened)
   assert.deepEqual(tooLarge.map(event => [event.type, event.code]), [['head', undefined], ['error', 'egress_too_large']])
+  unrefused(tooLarge[1])
   // The request inside the page was cut, not left to run its course.
   assert.equal(signer.script.fetches.at(-1).aborted, true)
 
@@ -858,7 +871,9 @@ test('what goes wrong after qwen.ai answered is the relay’s last event', { tim
   assert.equal((await crashed.opened.next()).type, 'head')
   assert.equal((await crashed.opened.next()).type, 'chunk')
   signer.contexts[0].page.emit('crash')
-  assert.deepEqual((await readAll(crashed.opened)).map(event => [event.type, event.code]), [['error', 'page_closed']])
+  const died = await readAll(crashed.opened)
+  assert.deepEqual(died.map(event => [event.type, event.code]), [['error', 'page_closed']])
+  unrefused(died[0])
 })
 
 test('a stream is not held to the whole-answer size cap', { timeout: 10000 }, async t => {
@@ -1266,6 +1281,426 @@ test('a challenge the page’s hooks keep from a streaming call is relayed by th
   assert.equal((await health()).residentPages, 1)
 })
 
+// Since Qwen2API-qic (2026-11-28): the line that ends a stream says when qwen.ai's 2xx carried a
+// refusal in the start of its body — as a whole answer's line says since Qwen2API-0c6
+// (signin-worker-egress.test.js). Before, such a stream read as accepted, in the log and in the
+// log counter. It is read off the start of the body the relay keeps for a challenge page, once the
+// call is over: nothing waits for it. Seen live once, on 2026-11-24 — a stream the page made as an
+// XMLHttpRequest, answered with the punish envelope under 200 (docs/browser-egress-design.md);
+// chats/new was refused so on 2026-11-26.
+
+// qwen.ai's answer to a stream as JSON, fed by hand (feedable): `said` is the content-type it
+// names — null for none at all —, and the status it comes under.
+const jsonFeedable = (said = 'application/json', status = 200) => {
+  const upstream = feedable()
+  upstream.headers = said === null ? {} : { 'content-type': said }
+  upstream.status = status
+  return upstream
+}
+// One stream of a scripted answer, start to finish: what the app got, and the worker's lines.
+const streamed = (relay, email, upstream, feed) => logged(async lines => {
+  const opened = await relay(email)
+  await upstream.opened
+  await feed(upstream)
+  return { events: await readAll(opened), lines }
+})
+// What the worker said of streams, without its time stamps; the milliseconds were its own.
+const streamSaid = lines => lines.filter(line => line.includes('egress-stream '))
+  .map(line => line.replace(/^\S+ /, '').replace(/\(\d+ ms/, '(N ms'))
+const HEADED = 'egress-stream /api/v2/chat/completions -> 200 (N ms, 1/16 pages)'
+const ENDED = 'egress-stream /api/v2/chat/completions end (N ms)'
+
+test('Qwen2API-qic: a refusal qwen.ai puts in the body of a 200 that streamed is said on the line that ends the stream, and the end event carries its code', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { relay, health, dataDir } = await start(t, { signer })
+  const email = 'refused-stream@example.invalid'
+  withProfile(dataDir, email)
+  signer.script.cookies = [cookie('cna', 'live')]
+  // The code where the app reads it, as chats/new was refused on 2026-11-26: on the answer, and on its data.
+  const said = []
+  for (const body of [
+    { success: false, code: 'unauthorized' },
+    { success: false, data: { code: 'unauthorized', details: 'private-upstream-refusal-fixture' } }
+  ]) {
+    const upstream = jsonFeedable()
+    signer.script.fetch = upstream.fetch
+    const { events, lines } = await streamed(relay, email, upstream, async () => {
+      upstream.push(JSON.stringify(body))
+      upstream.finish()
+    })
+    said.push(...lines)
+    // The app gets qwen.ai's answer as it was — it classifies it itself —, and the code with the end.
+    assert.deepEqual(events.map(event => event.type), ['head', 'chunk', 'end'])
+    assert.equal(events[0].headers['content-type'], 'application/json')
+    assert.equal(text(events[1]), JSON.stringify(body))
+    assert.deepEqual(events[2], { type: 'end', cookies: [cookie('cna', 'live')], refusal: 'unauthorized' })
+    // The log tells the refused stream from an accepted one, in the whole-answer line's own words...
+    assert.deepEqual(streamSaid(lines), [HEADED, `${ENDED} — code unauthorized`])
+    // ...and the log counter reads it as the refusal it is (tools/egress-log-watch.js).
+    const counted = summarize(lines).counts
+    assert.equal(counted.get('stream.head.200'), 1)
+    assert.equal(counted.get('stream.refused.unauthorized'), 1)
+    assert.equal(counted.get('stream.ended'), undefined)
+  }
+  // What travels with a refusal is for the app, which has the body; not the log.
+  assert.equal(said.join('\n').includes('private-upstream-refusal-fixture'), false)
+  assert.equal((await health()).residentPages, 1)
+})
+
+test('Qwen2API-qic: the punish envelope under a 200 that streamed is said by its lines, as a whole answer’s is', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { relay, dataDir } = await start(t, { signer })
+  const email = 'punished-stream@example.invalid'
+  withProfile(dataDir, email)
+  // What qwen.ai's risk control answers with; and what only a refusal carries, success not in the answer at all.
+  for (const [body, code] of [
+    [{ ret: ['FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR::SM::x'] }, 'FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::x'],
+    [{ error: { code: 'FAIL_SYS_USER_VALIDATE', details: 'Unable to process your request' } }, 'FAIL_SYS_USER_VALIDATE']
+  ]) {
+    const upstream = jsonFeedable()
+    signer.script.fetch = upstream.fetch
+    const { events, lines } = await streamed(relay, email, upstream, async () => {
+      upstream.push(JSON.stringify(body))
+      upstream.finish()
+    })
+    assert.deepEqual(events.map(event => event.type), ['head', 'chunk', 'end'])
+    assert.deepEqual(events.at(-1), { type: 'end', cookies: [], refusal: code })
+    assert.deepEqual(streamSaid(lines), [HEADED, `${ENDED} — code ${code}`])
+  }
+})
+
+test('Qwen2API-qic: a refusal that names no code is said to be one — on the line, and in the end event', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { relay, dataDir } = await start(t, { signer })
+  const email = 'refused-unsaid@example.invalid'
+  withProfile(dataDir, email)
+  const said = []
+  for (const body of [{ success: false }, { success: false, message: 'Something went wrong.' }]) {
+    const upstream = jsonFeedable()
+    signer.script.fetch = upstream.fetch
+    const { events, lines } = await streamed(relay, email, upstream, async () => {
+      upstream.push(JSON.stringify(body))
+      upstream.finish()
+    })
+    said.push(...lines)
+    assert.deepEqual(events.at(-1), { type: 'end', cookies: [], refusal: 'no_code' })
+    assert.deepEqual(streamSaid(lines), [HEADED, `${ENDED} — refused, no code`])
+  }
+  // What qwen.ai said with it is for the app, which has the body; not the log.
+  assert.equal(said.join('\n').includes('Something went wrong.'), false)
+})
+
+test('Qwen2API-qic: a text/event-stream answer is not read for a refusal, whatever its text says', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { relay, dataDir } = await start(t, { signer })
+  const email = 'quoted-refusal@example.invalid'
+  withProfile(dataDir, email)
+  // A stream of frames may quote the words of a refusal as text — an answer about this very
+  // code. And not even the bare JSON is looked into under a head that does not say JSON: the
+  // body is the app's to read, as every SSE answer is.
+  for (const piece of ['data: {"success":false,"code":"unauthorized"}\n\n', '{"success":false,"code":"unauthorized"}']) {
+    const upstream = jsonFeedable('text/event-stream')
+    signer.script.fetch = upstream.fetch
+    const { events, lines } = await streamed(relay, email, upstream, async () => {
+      upstream.push(piece)
+      upstream.finish()
+    })
+    assert.deepEqual(kinds(events), ['head', piece, 'end'])
+    assert.deepEqual(events.at(-1), { type: 'end', cookies: [] })
+    assert.deepEqual(streamSaid(lines), [HEADED, ENDED])
+  }
+})
+
+test('Qwen2API-qic: a JSON answer that is no refusal is an ordinary stream — nothing said of it, nothing carried', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { relay, dataDir } = await start(t, { signer })
+  const email = 'plain-json@example.invalid'
+  withProfile(dataDir, email)
+  // An accepted call may carry a code of its own: it is not quoted as a refusal's.
+  for (const body of ['{"success":true}', '{"code":"0"}', '{"success":true,"code":"OK","data":{}}', '[1,2]', '{"ret":[]}', '']) {
+    const upstream = jsonFeedable()
+    signer.script.fetch = upstream.fetch
+    const { events, lines } = await streamed(relay, email, upstream, async () => {
+      if (body) upstream.push(body)
+      upstream.finish()
+    })
+    assert.deepEqual(kinds(events), ['head', ...(body ? [body] : []), 'end'])
+    assert.deepEqual(events.at(-1), { type: 'end', cookies: [] })
+    assert.deepEqual(streamSaid(lines), [HEADED, ENDED])
+  }
+})
+
+test('Qwen2API-qic: a long body is relayed as it arrives, nothing held back — and past the limit a refusal it begins like is not called one', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { relay, dataDir } = await start(t, { signer })
+  const email = 'long-refusal@example.invalid'
+  withProfile(dataDir, email)
+  const bare = '{"success":false,"code":"unauthorized","pad":""}'
+  const padded = size => bare.replace('""', `"${'x'.repeat(size)}"`)
+
+  // qwen.ai is answering still: a JSON answer reaches the app piece by piece, as an SSE one does,
+  // and the end follows the last piece.
+  const upstream = jsonFeedable()
+  signer.script.fetch = upstream.fetch
+  const { rest, lines } = await logged(async lines => {
+    const opened = await relay(email)
+    await upstream.opened
+    // A piece that arrives eventually is no proof that it came while the answer ran: each is
+    // waited for here and now.
+    const inTime = (promise, what) => Promise.race([
+      promise,
+      new Promise((resolve, reject) => {
+        setTimeout(() => reject(new Error(`${what} did not arrive while qwen.ai was still answering`)), 2000)
+      })
+    ])
+    assert.equal((await inTime(opened.next(), 'the head')).type, 'head')
+    const pieces = [bare.slice(0, -2), 'x'.repeat(3000), 'x'.repeat(2000), '"}']
+    for (const [at, piece] of pieces.entries()) {
+      upstream.push(piece)
+      assert.deepEqual(await inTime(opened.next(), `piece ${at + 1}`), { type: 'chunk', data: Buffer.from(piece).toString('base64') })
+    }
+    upstream.finish()
+    return { rest: await readAll(opened), lines }
+  })
+  // Past the limit of 4096 bytes, and cut inside the document: it does not parse, so it is not called
+  // a refusal.
+  assert.deepEqual(kinds(rest), ['end'])
+  assert.deepEqual(streamSaid(lines), [HEADED, ENDED])
+
+  // The limit itself. A refusal is named when its document is complete within the first 4096 bytes:
+  // one 4096 bytes long is, and so is that document with a line break after it — JSON.parse does not
+  // mind whitespace after a document. A document the limit cuts inside, one byte longer, does not parse.
+  const wholeDoc = padded(4096 - bare.length)
+  for (const [body, code] of [[wholeDoc, 'unauthorized'], [`${wholeDoc}\n`, 'unauthorized'], [padded(4097 - bare.length), null]]) {
+    const whole = jsonFeedable()
+    signer.script.fetch = whole.fetch
+    const { events, lines } = await streamed(relay, email, whole, async () => {
+      whole.push(body)
+      whole.finish()
+    })
+    assert.deepEqual(events.map(event => event.type), ['head', 'chunk', 'end'])
+    assert.deepEqual(events.at(-1), { type: 'end', cookies: [], ...(code ? { refusal: code } : {}) }, `${Buffer.byteLength(body)} bytes`)
+    assert.deepEqual(streamSaid(lines), [HEADED, `${ENDED}${code ? ` — code ${code}` : ''}`], `${Buffer.byteLength(body)} bytes`)
+  }
+})
+
+test('Qwen2API-qic: an answer that is no 2xx is said by its status, as before — whatever JSON its body carries', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { relay, dataDir } = await start(t, { signer })
+  const email = 'refused-by-status@example.invalid'
+  withProfile(dataDir, email)
+  for (const status of [401, 500]) {
+    const upstream = jsonFeedable('application/json', status)
+    signer.script.fetch = upstream.fetch
+    const { events, lines } = await streamed(relay, email, upstream, async () => {
+      upstream.push('{"success":false,"code":"invalid token"}')
+      upstream.finish()
+    })
+    assert.deepEqual(events.map(event => event.type), ['head', 'chunk', 'end'])
+    assert.equal(events[0].status, status)
+    assert.deepEqual(events.at(-1), { type: 'end', cookies: [] })
+    assert.deepEqual(streamSaid(lines), [HEADED.replace('-> 200', `-> ${status}`), ENDED])
+  }
+})
+
+test('Qwen2API-qic: a stream that ends with an error after a 2xx answer that began as a refusal is said of it too — on the line and in the error event', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { relay, health, dataDir } = await start(t, { signer })
+  const email = 'refused-then-cut@example.invalid'
+  withProfile(dataDir, email)
+  const upstream = jsonFeedable()
+  signer.script.fetch = upstream.fetch
+  const opened = await relay(email)
+  await upstream.opened
+  assert.equal((await opened.next()).type, 'head')
+  // qwen.ai's refusal is with the app...
+  upstream.push('{"success":false,"code":"unauthorized"}')
+  assert.equal(text(await opened.next()), '{"success":false,"code":"unauthorized"}')
+  // ...and the body then dies under it: the connection dropping.
+  const { rest, lines } = await logged(async lines => {
+    upstream.fail(new TypeError('Failed to fetch'))
+    return { rest: await readAll(opened), lines }
+  })
+  assert.deepEqual(rest.map(event => event.type), ['error'])
+  assert.equal(rest[0].code, 'egress_failed')
+  assert.match(rest[0].message, /network_error/)
+  assert.equal(rest[0].refusal, 'unauthorized')
+  assert.deepEqual(streamSaid(lines), ['egress-stream /api/v2/chat/completions egress_failed (N ms) — code unauthorized'])
+  // The page is none the worse.
+  assert.equal((await health()).residentPages, 1)
+})
+
+test('Qwen2API-qic: a refusal that arrives in two pieces is seen whole', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { relay, dataDir } = await start(t, { signer })
+  const email = 'refused-in-pieces@example.invalid'
+  withProfile(dataDir, email)
+  const upstream = jsonFeedable()
+  signer.script.fetch = upstream.fetch
+  // The start of the body is collected across the chunks, not read off the first.
+  const { events, lines } = await streamed(relay, email, upstream, async () => {
+    upstream.push('{"success":false,"code":"un')
+    upstream.push('authorized"}')
+    upstream.finish()
+  })
+  assert.deepEqual(kinds(events), ['head', '{"success":false,"code":"un', 'authorized"}', 'end'])
+  assert.deepEqual(events.at(-1), { type: 'end', cookies: [], refusal: 'unauthorized' })
+  assert.deepEqual(streamSaid(lines), [HEADED, `${ENDED} — code unauthorized`])
+})
+
+test('Qwen2API-qic: an answer is read for a refusal only when its head says JSON — with a charset or without, whatever its case; never without the header', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { relay, dataDir } = await start(t, { signer })
+  const email = 'typed@example.invalid'
+  withProfile(dataDir, email)
+  for (const [said, code] of [
+    ['application/json; charset=utf-8', 'unauthorized'], ['application/json;charset=UTF-8', 'unauthorized'],
+    ['Application/JSON', 'unauthorized'], [null, null]
+  ]) {
+    const upstream = jsonFeedable(said)
+    signer.script.fetch = upstream.fetch
+    const { events, lines } = await streamed(relay, email, upstream, async () => {
+      upstream.push('{"success":false,"code":"unauthorized"}')
+      upstream.finish()
+    })
+    assert.deepEqual(events.at(-1), { type: 'end', cookies: [], ...(code ? { refusal: code } : {}) })
+    assert.deepEqual(streamSaid(lines), [HEADED, `${ENDED}${code ? ` — code ${code}` : ''}`], String(said))
+  }
+})
+
+test('Qwen2API-qic: an ordinary SSE stream is relayed as it was — every frame, every line', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { post, streamCall, dataDir } = await start(t, { signer })
+  const email = 'untouched@example.invalid'
+  withProfile(dataDir, email)
+  signer.script.cookies = [cookie('cna', 'live')]
+  const upstream = feedable()
+  signer.script.fetch = upstream.fetch
+  // The relay as the app reads it off the wire: one JSON object per line.
+  const frame = Buffer.from('data: {"choices":[{"delta":{"content":"при"}}]}\n\n')
+  const split = frame.indexOf(Buffer.from('р')) + 1
+  const { wire, lines } = await logged(async lines => {
+    const response = await post('/egress', { email, ...streamCall })
+    await upstream.opened
+    upstream.pushBytes(frame.subarray(0, split))
+    upstream.pushBytes(frame.subarray(split))
+    upstream.push('data: [DONE]\n\n')
+    upstream.finish()
+    return { wire: await response.text(), lines }
+  })
+  const jar = JSON.stringify(cookie('cna', 'live'))
+  // Each piece the bytes that arrived — a frame cut inside a two-byte character comes back as its two pieces.
+  assert.deepEqual(wire.split('\n').filter(Boolean), [
+    `{"type":"head","status":200,"url":"${COMPLETIONS}","redirected":false,"headers":{"content-type":"text/event-stream"},"cookies":[${jar}]}`,
+    `{"type":"chunk","data":"${frame.subarray(0, split).toString('base64')}"}`,
+    `{"type":"chunk","data":"${frame.subarray(split).toString('base64')}"}`,
+    `{"type":"chunk","data":"${Buffer.from('data: [DONE]\n\n').toString('base64')}"}`,
+    `{"type":"end","cookies":[${jar}]}`
+  ])
+  assert.deepEqual(streamSaid(lines), [HEADED, ENDED])
+})
+
+test('Qwen2API-qic: the lines the worker writes of a refused stream are these, to the byte — the ones the application’s reader of the relay is tried with', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { post, streamCall, dataDir } = await start(t, { signer })
+  const email = 'literal@example.invalid'
+  withProfile(dataDir, email)
+  // One stream as the application's reader takes it off the wire, a line at a time
+  // (src/utils/signin-worker-client.js#relayFrames; the same lines in tests/signin-worker-client.test.js).
+  // `feed` may wait for lines before it goes on.
+  const wireOf = async feed => {
+    const upstream = jsonFeedable()
+    signer.script.fetch = upstream.fetch
+    const reader = (await post('/egress', { email, ...streamCall })).body.getReader()
+    let wire = ''
+    const lines = async count => {
+      while (wire.split('\n').filter(Boolean).length < count) wire += Buffer.from((await reader.read()).value).toString('utf8')
+    }
+    await upstream.opened
+    await feed(upstream, lines)
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) return wire.split('\n').filter(Boolean)
+      wire += Buffer.from(value).toString('utf8')
+    }
+  }
+  const REFUSAL = '{"success":false,"code":"unauthorized"}'
+  const chunk = body => `{"type":"chunk","data":"${Buffer.from(body).toString('base64')}"}`
+  // The end of a refused stream, with its code...
+  assert.deepEqual(await wireOf(async upstream => {
+    upstream.push(REFUSAL)
+    upstream.finish()
+  }), [
+    `{"type":"head","status":200,"url":"${COMPLETIONS}","redirected":false,"headers":{"content-type":"application/json"},"cookies":[]}`,
+    chunk(REFUSAL),
+    '{"type":"end","cookies":[],"refusal":"unauthorized"}'
+  ])
+  // ...with no code to name...
+  assert.deepEqual(await wireOf(async upstream => {
+    upstream.push('{"success":false}')
+    upstream.finish()
+  }), [
+    `{"type":"head","status":200,"url":"${COMPLETIONS}","redirected":false,"headers":{"content-type":"application/json"},"cookies":[]}`,
+    chunk('{"success":false}'),
+    '{"type":"end","cookies":[],"refusal":"no_code"}'
+  ])
+  // ...and the error it ended with, the code after the message.
+  assert.deepEqual(await wireOf(async (upstream, lines) => {
+    upstream.push(REFUSAL)
+    await lines(2) // the head and the refusal are with the app
+    upstream.fail(new TypeError('Failed to fetch'))
+  }), [
+    `{"type":"head","status":200,"url":"${COMPLETIONS}","redirected":false,"headers":{"content-type":"application/json"},"cookies":[]}`,
+    chunk(REFUSAL),
+    '{"type":"error","code":"egress_failed","message":"In-page request failed (network_error: Failed to fetch).","refusal":"unauthorized"}'
+  ])
+})
+
+test('Qwen2API-qic: a code that looks like a credential is not shown as itself — not on the line, not in the event', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { relay, dataDir } = await start(t, { signer })
+  const email = 'credential-code@example.invalid'
+  withProfile(dataDir, email)
+  const upstream = jsonFeedable()
+  signer.script.fetch = upstream.fetch
+  const { events, lines } = await streamed(relay, email, upstream, async () => {
+    upstream.push('{"success":false,"code":"Bearer private-upstream-token"}')
+    upstream.finish()
+  })
+  // The app has qwen.ai's answer as it was, and classifies it itself...
+  assert.deepEqual(events.map(event => event.type), ['head', 'chunk', 'end'])
+  assert.equal(text(events[1]), '{"success":false,"code":"Bearer private-upstream-token"}')
+  // ...and what the worker says of the code is masked, the same in the event and on the line, as a
+  // whole answer's line masks it (answerNote).
+  assert.deepEqual(events.at(-1), { type: 'end', cookies: [], refusal: '<credential>' })
+  assert.deepEqual(streamSaid(lines), [HEADED, `${ENDED} — code <credential>`])
+  assert.equal(lines.join('\n').includes('private-upstream-token'), false)
+})
+
+test('Qwen2API-qic: a stream that falls silent after a 2xx answer began as a refusal is cut by the page’s own timer — and the error line and the error event carry the code', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const { relay, health, dataDir } = await start(t, { signer })
+  const email = 'refused-then-silent@example.invalid'
+  withProfile(dataDir, email)
+  const upstream = jsonFeedable()
+  signer.script.fetch = upstream.fetch
+  const opened = await relay(email, { timeoutMs: 200 })
+  await upstream.opened
+  assert.equal((await opened.next()).type, 'head')
+  upstream.push('{"success":false,"code":"unauthorized"}')
+  assert.equal(text(await opened.next()), '{"success":false,"code":"unauthorized"}')
+  // Then qwen.ai says nothing more, and the body never ends: the page's own timer cuts the call.
+  const since = Date.now()
+  const { rest, lines } = await logged(async lines => ({ rest: await readAll(opened), lines }))
+  assert.deepEqual(rest.map(event => event.type), ['error'])
+  assert.equal(rest[0].code, 'egress_timeout')
+  assert.equal(rest[0].refusal, 'unauthorized')
+  assert.ok(Date.now() - since >= 190, 'the stream was cut before its silence ran out')
+  assert.deepEqual(streamSaid(lines), ['egress-stream /api/v2/chat/completions egress_timeout (N ms) — code unauthorized'])
+  // The page is none the worse.
+  assert.equal((await health()).residentPages, 1)
+})
+
 /* ------------------------------------------------------- the service on its own -- */
 
 test('the page is held back while the app is behind: nothing is reported over an unacknowledged event', { timeout: 10000 }, async t => {
@@ -1539,6 +1974,119 @@ test('a chunk after a long silence, taken slowly by the app, is not a hung page'
   take()
   assert.deepEqual(await done, { cookies: [], aborted: false })
   assert.equal(signer.contexts[0].closed, false)
+})
+
+test('the service says of a stream what qwen.ai’s 2xx began as: a refusal is on its result, and on the error it throws after one (Qwen2API-qic)', { timeout: 10000 }, async t => {
+  const signer = fakeBrowser()
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwen-signin-stream-refused-'))
+  const residents = createResidents({ signer, profileDir: email => path.join(dataDir, email), drainMs: 10, frontEndMs: 50 })
+  t.after(async () => {
+    await residents.shutdown()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  })
+  fs.mkdirSync(path.join(dataDir, 'a@example.invalid'))
+  const call = { url: COMPLETIONS, init: { method: 'POST', headers: {} }, timeoutMs: 5000 }
+
+  // An answer that is no refusal: no word of one.
+  let upstream = feedable()
+  signer.script.fetch = upstream.fetch
+  const page = await residents.acquire('a@example.invalid')
+  const plain = residents.stream(page, call, { id: 1, onEvent: () => {} })
+  await upstream.opened
+  upstream.push('data: x\n\n')
+  upstream.finish()
+  assert.deepEqual(await plain, { cookies: [], aborted: false })
+
+  // A refusal in the body of a 200: on the result, with the note the log makes of it.
+  upstream = jsonFeedable()
+  signer.script.fetch = upstream.fetch
+  const refused = residents.stream(page, call, { id: 2, onEvent: () => {} })
+  await upstream.opened
+  upstream.push('{"success":false,"code":"unauthorized"}')
+  upstream.finish()
+  assert.deepEqual(await refused, {
+    cookies: [], aborted: false, refusal: { code: 'unauthorized', note: ' — code unauthorized' }
+  })
+
+  // The call failing after such an answer: on the error, for the line and the error event.
+  upstream = jsonFeedable()
+  signer.script.fetch = upstream.fetch
+  const delivered = []
+  const cut = residents.stream(page, call, { id: 3, onEvent: event => { delivered.push(event.type) } })
+    .then(value => value, error => error)
+  await upstream.opened
+  await until(() => delivered.length === 1) // the head
+  upstream.push('{"success":false,"code":"unauthorized"}')
+  await until(() => delivered.length === 2) // the refusal is with the app
+  upstream.fail(new TypeError('Failed to fetch'))
+  const failed = await cut
+  assert.equal(failed.code, 'egress_failed')
+  assert.deepEqual(failed.refusal, { code: 'unauthorized', note: ' — code unauthorized' })
+
+  // A call that fails before any head comes: there was no answer to read, and the error says nothing
+  // of a refusal — no field at all, not an empty one.
+  signer.script.fetch = async () => { throw new TypeError('Failed to fetch') }
+  const early = await residents.stream(page, call, { id: 4, onEvent: () => {} }).then(value => value, error => error)
+  assert.equal(early.code, 'egress_failed')
+  assert.equal('refusal' in early, false)
+})
+
+test('Qwen2API-qic: streamRefusal says of a stream’s start what answerNote says of a whole answer — and nothing of the rest', () => {
+  const json = { status: 200, headers: { 'content-type': 'application/json' } }
+  const read = (body, head = json) => streamRefusal(head, [Buffer.from(body)])
+  // A refusal in the body of a 2xx: its code, wherever the app reads it from — and the line in the
+  // whole answer's own words.
+  for (const [body, code] of [
+    ['{"success":false,"code":"unauthorized"}', 'unauthorized'],
+    ['{"success":false,"data":{"code":"unauthorized"}}', 'unauthorized'],
+    ['{"success":false,"error":{"code":"invalid token"}}', 'invalid token'],
+    ['{"success":false,"error":"forbidden"}', 'forbidden'],
+    ['{"ret":["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::SM::x"]}', 'FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::x'],
+    ['{"error":{"code":"FAIL_SYS_USER_VALIDATE","details":"Unable to process your request"}}', 'FAIL_SYS_USER_VALIDATE'],
+    ['{"success":false}', 'no_code'],
+    ['{"success":false,"message":"Something went wrong."}', 'no_code'],
+    // The code as a log line may show it: one line of at most 80 characters, as a whole answer's is.
+    [`{"success":false,"code":"${'y'.repeat(100)}"}`, 'y'.repeat(80)]
+  ]) {
+    const found = read(body)
+    assert.deepEqual(found, { code, note: ` — ${code === 'no_code' ? 'refused, no code' : `code ${code}`}` }, body)
+    assert.equal(found.note, answerNote({ status: 200, headers: json.headers, body }), body)
+  }
+  // A code that looks like a credential is shown as little of itself as a whole answer's is — on
+  // the line, and in the event.
+  assert.deepEqual(read('{"success":false,"code":"Bearer private-upstream-token"}'), { code: '<credential>', note: ' — code <credential>' })
+  // The start of the body is read in the pieces it arrived in.
+  assert.equal(streamRefusal(json, [Buffer.from('{"success":false,"code":"un'), Buffer.from('authorized"}')]).code, 'unauthorized')
+
+  const refusal = '{"success":false,"code":"unauthorized"}'
+  // Nothing to say of a head that is no 2xx — the line says its status —, that does not say JSON,
+  // that says nothing, or that never came.
+  for (const head of [null, { status: 401, headers: json.headers }, { status: 503, headers: json.headers },
+    { status: 200, headers: { 'content-type': 'text/event-stream' } }, { status: 200, headers: {} }]) {
+    assert.equal(streamRefusal(head, [Buffer.from(refusal)]), null)
+  }
+  // ...nor of a body that is no JSON, is JSON and no refusal, or never came.
+  for (const body of ['', 'data: {"success":false}\n\n', '{"success":true}', '{"code":"0"}', '[1,2]', '<!doctype html>']) {
+    assert.equal(read(body), null, body)
+  }
+  // The limit: a refusal is named when its document is complete within the first 4096 bytes, and not
+  // when the limit cuts inside the document, whatever it began like. Whitespace after the document is
+  // nothing (JSON.parse does not mind it): a line break makes the body 4097 bytes long, and the
+  // refusal is named all the same — in one piece, or with the line break in a piece of its own.
+  const bare = '{"success":false,"code":"unauthorized","pad":""}'
+  const padded = size => bare.replace('""', `"${'x'.repeat(size)}"`)
+  const whole = padded(4096 - bare.length)
+  assert.equal(read(whole).code, 'unauthorized')
+  assert.equal(read(`${whole}\n`).code, 'unauthorized')
+  assert.equal(read(`${whole}\n\n \t`).code, 'unauthorized')
+  assert.equal(streamRefusal(json, [Buffer.from(whole), Buffer.from('\n')]).code, 'unauthorized')
+  assert.equal(read(padded(4097 - bare.length)), null)
+  // The gate is what the head says the answer is: `application/json` with a charset or without, in
+  // any case; no other type, and no header at all.
+  assert.deepEqual([
+    'application/json', 'application/json; charset=utf-8', 'application/json;charset=UTF-8', 'Application/JSON', ' application/json ',
+    'text/event-stream', 'application/problem+json', '', undefined
+  ].map(said => isJsonAnswer(said === undefined ? {} : { 'content-type': said })), [true, true, true, true, true, false, false, false, false])
 })
 
 // Since Qwen2API-xun (2026-11-26; the page's token is signin-worker-egress.test.js's

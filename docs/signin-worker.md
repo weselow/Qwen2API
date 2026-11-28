@@ -308,6 +308,45 @@ XMLHttpRequest'ом qwen.ai его отказывала, `fetch`ем — про�
   прежде чем поток появится у него, — клиент, ушедший в это время, закроет
   реле не сразу, а когда ответ получен. CLI идёт мимо воркера.
 
+**Отказ в теле под статусом 200 (Qwen2API-qic, 2026-11-28).** О целом ответе
+воркер пишет с Qwen2API-0c6, чем тот был сверх статуса: отказ qwen.ai в теле 200 —
+кодом (`chats/new -> 200 (…) — code unauthorized`). Стрим говорит то же, когда
+вызов окончен. Строка, которой он кончается, несёт ` — code <код>` или ` —
+refused, no code`:
+
+```text
+egress-stream /api/v2/chat/completions end (5200 ms) — code unauthorized
+egress-stream /api/v2/chat/completions egress_failed (1000 ms) — code unauthorized
+```
+
+(вторая — тот же отказ у стрима, окончившегося ошибкой), а последнее событие
+реле — `end` или `error` — несёт поле `refusal` с этим кодом, `no_code`, если
+отказ кода не называет: `{"type":"end","cookies":[…],"refusal":"unauthorized"}`.
+Читается начало тела — первые 4096 байтов — уже после вызова, из того, что реле и
+так держит, чтобы узнать страницу-проверку: ни один кадр не ждёт и ничего не
+удерживается от приложения; удерженное начало тела (до 64 КБ) один раз
+соединяется для чтения, когда вызов окончен. Только если голова ответа — 2xx и её
+`content-type` говорит `application/json` (с кодировкой или без). Отказ назван,
+когда его JSON-документ целиком умещается в этих 4096 байтах, а после него до
+предела — только пробельные символы (перенос строки в конце не мешает); документ,
+обрезанный пределом посередине, не разбирается и отказом не называется, как бы он
+ни начинался. SSE-ответ не читается: его текст может цитировать слова отказа как
+текст ответа, — и отказ, пришедший в ответе под `text/event-stream`, строка не
+называет: `… end` без пометки не доказывает, что ответ был принят.
+Страница-проверка — HTML и отказом не бывает; её пометка остаётся на своём месте.
+Приложение читает из `end` только `cookies`, из `error` — `code` и `message`, так
+что поле ничего не меняет на его стороне: ответ оно классифицирует само. Счётчик
+`tools/egress-log-watch.js` считает такую строку
+`stream.refused.<код>` (рядом с `stream.head.200` от строки головы, а у строки с
+ошибкой — рядом с `stream.failed.<код>`), подаёт `LOOK` и не считает этот стрим
+принятым. Живьём стрим с отказом в теле под 200 виден один раз, 24.11 на проде,
+до Qwen2API-3ue.9 — тогда стрим уходил XMLHttpRequest'ом: qwen.ai ответила
+статусом 200 и JSON-конвертом `FAIL_SYS_USER_VALIDATE` / `RGV587_ERROR`, у воркера
+`egress-stream … -> 200` и `… end` (`docs/browser-egress-design.md`, «Повторная
+выкатка того же дня»). `content-type` того ответа не записан — назвал бы его
+воркер теперь, неизвестно. С 25.11 стрим уходит `fetch`ем (Qwen2API-3ue.9); о
+таком ответе на него в репозитории записей нет. 26.11 в теле 200 отказал `chats/new`.
+
 Воркер и приложение обновляются вместе: старый воркер поле `stream`
 игнорирует и отвечает целым ответом — приложение не поймёт его как реле и
 ответит 503; запасного прямого запроса не будет. Откат —
@@ -693,7 +732,26 @@ cookies сессии и без Bearer, — и кладёт ответ туда, 
 … page-load waited (12340 ms)                                   загрузка ждала очереди
 … page-load waited (119300 ms, a long line packed)               очередь была длиннее предела: загрузки пошли теснее
 … renew no reload (1 sessions)                                  продление ответило сессией, которую обновило открытие страницы: загрузки не было
+… forget session, page, profile deleted (2 sessions)            профиль удалён сразу
+… forget no session, no page, profile deleted (2 sessions)      у воркера не было ни сессии, ни страницы аккаунта
+… forget session, page, profile deferred (1 sessions)           профиль уйдёт после паузы: SIGNIN_FORGET_GRACE_MS
+… forget profile deleted after the pause (1 sessions)           пауза кончилась: профиль удалён
+… forget profile not removed (<код>)                            профиль не удалился: следом profile left
+… forget session, page, profile kept, a renewal still running (1 sessions)  продление аккаунта пережило /forget: может остаться сессия
+… forget a mark that names no profile of its own was left alone  старт воркера: пометка не тронута
+… forget a mark could not be read: its profile stays as it is   старт воркера: пометка не прочитана, профиль остался
 ```
+
+Итог профиля в ответе `/forget` — `deleted`, `left`, `deferred`, `kept`,
+`absent`; если вход или продление аккаунта пережили `/forget`, строка
+кончается на `, a login still running` или `, a renewal still running`. С
+паузой (`SIGNIN_FORGET_GRACE_MS`) ответ пишет `profile deferred`, а по её
+истечении выходит `forget profile deleted after the pause (N sessions)` либо
+`forget profile not removed after the pause (<код>)` и `forget profile left
+after the pause (N sessions)`. Счётчик считает их по итогу (`forget.deleted`,
+`forget.deferred`, `forget.afterThePause.deleted`, `forget.mark.leftAlone` и
+так далее), текст строк в отчёт не попадает; форма, которой он не знает, —
+`unparsed.worker`.
 
 `GET /health` показывает, что в силе: `pageTokenRefresh`, `streamWaitMs`,
 `loadMinIntervalMs`, `loadMaxWaitMs`, — и как длинна очередь загрузок:
@@ -817,7 +875,11 @@ Qwen2API-nch, Qwen2API-ops): страница с токеном, котором�
 обновляет его своим запросом на другой адрес заглушки (`127.0.0.2` — с
 предзапросом браузера и cookies того хоста), и следующий вызов уходит на новом
 токене; продление ждёт идущий стрим (и до предела — не дольше); страницы двух
-аккаунтов, открываемые разом, грузятся по очереди. Запускать после
+аккаунтов, открываемые разом, грузятся по очереди. И отказ в теле под статусом
+200 у стрима (Qwen2API-qic): заглушка отвечает на потоковый вызов JSON-отказом под
+200 с `content-type: application/json` — смоук видит строку воркера
+`egress-stream /api/refused end (… ms) — code unauthorized` и конец реле с полем
+`refusal`. Запускать после
 правок `signin-worker/server.js`, `signin-worker/lib/login-pacer.js`,
 `signin-worker/lib/resident-pages.js`, `signin-worker/lib/egress-fetch.js`,
 `signin-worker/lib/page-load-queue.js`, `signin-worker/lib/browser-signin.js` и
@@ -933,7 +995,10 @@ headless начнёт помечаться WAF; в контейнере это �
   HTTP, отказы до и после ответа qwen.ai, отменяющееся приложение, стрим против
   перезагрузки и вытеснения, зависшая страница, остановка. И сам вызов —
   `fetch` в форме собственного вызова страницы (Qwen2API-3ue.9): что он нёс,
-  что не создаёт XMLHttpRequest и что вызов не ждёт свой `fetch`.
+  что не создаёт XMLHttpRequest и что вызов не ждёт свой `fetch`. И отказ в теле
+  200 у стрима (Qwen2API-qic): строка конца и события `end`/`error` с кодом,
+  предел в 4096 байтов, заголовок `content-type` как условие чтения, и что
+  куски идут приложению, не задерживаясь.
 - `tests/signin-worker-egress.test.js` — резидентные страницы и `/egress` с
   фейковым «Playwright»: страница исполняет настоящую в-страничную функцию в
   песочнице с поддельными XMLHttpRequest и `fetch`

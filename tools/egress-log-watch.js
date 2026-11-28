@@ -39,11 +39,46 @@
  * ended with an error, an answer that failed under the application), and a
  * retry that was not delivered is not a failure by itself — its client may
  * have gone away while it was under way.
+ *
+ * Since Qwen2API-j5f (2026-11-28) it knows what the logs of 27.11 showed,
+ * and names it instead of listing it as unknown. Of the app: a picture or a
+ * video whose generation failed — explained when the worker's log says a
+ * navigation's wait ran out from 30 s before the app's line to a second
+ * after it (a reload under its limit cutting the generation; the client
+ * gets a 503), and said when nothing does; a chat request that failed on
+ * every attempt, by what qwen.ai answered, by quota, or by the worker's
+ * code; a model with no MODEL_MAP entry; a session that was not saved; an
+ * answer that failed on the Anthropic route, said with the others; and
+ * requests the app ended because their account was removed meanwhile:
+ * each writes a WARN and up to two ERROR lines after it — the chat that
+ * could not be made, and whatever its handler writes —, read as that
+ * request's echo while each comes within two seconds of the one before,
+ * counted under the removal, and no complaint. Requests that continue
+ * together in one turn of the event loop — two that waited on one renewal
+ * write WARN, WARN, chats/new, chats/new, handler, handler — are told
+ * apart by a count of what is due, not by one chain. Of the worker: what
+ * became of a forgotten account's browser profile, by outcome, and a
+ * profile that could not be removed said so; and a 504 of an egress call
+ * by how long the call waited, against the limits the app gives its calls:
+ * under five minutes a call that did not return from the page in time
+ * (chats/new's own limit is half a minute), from five minutes a picture or
+ * video generation that did not finish, from ten minutes completions giving
+ * no head. The app's clock carries no zone: its lines are read as UTC, the
+ * host's time that both containers take.
+ *
+ * Since Qwen2API-qic (2026-11-28) a stream is read for a refusal as a whole
+ * answer is: the worker says on the line that ends a stream — its `end`, or
+ * the error it ended with — when qwen.ai's 2xx carried a refusal in the start
+ * of its body, and this tool counts it as `stream.refused.<code>` beside the
+ * 200 the head line already said, complains of it, and counts no such stream
+ * among the accepted. Seen live once, on 2026-11-24 — a stream the page made
+ * as an XMLHttpRequest, answered with the punish envelope under status 200 —
+ * and none recorded since the stream is a fetch (Qwen2API-3ue.9).
  */
 
 // Terminal colors, as the logger writes them on a console.
 const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g')
-const WORKER_LINE = /^(\d{4}-\d\d-\d\dT[\d:.]+Z) (request|egress-stream|egress|resident-open|resident-close|resident-shutdown|token-refresh|resident-wait|page-load|renew|session|silent-renew|signin-worker|stopping)\b ?(.*)$/
+const WORKER_LINE = /^(\d{4}-\d\d-\d\dT[\d:.]+Z) (request|egress-stream|egress|resident-open|resident-close|resident-shutdown|token-refresh|resident-wait|page-load|renew|session|silent-renew|signin-worker|stopping|forget)\b ?(.*)$/
 const APP_LINE = /^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \[(ERROR|WARN|INFO|SUCCESS|DEBUG)\] \[([^\]]+)\] ?(.*)$/
 // The app's start-up record prints its flags as an object on the lines after
 // it. The app runs on Bun, which quotes strings with double quotes; Node, on
@@ -62,6 +97,54 @@ const PAGE_DEATHS = ['unresponsive', 'page_crashed', 'context_closed', 'keepaliv
 const REFUSALS = ['upstream_session_unauthorized', 'upstream_waf_challenge']
 // How a refusal in the body of a 2xx that names no code is counted.
 const NO_CODE = 'no_code'
+const CHAT_REQUEST_FAILED = 'app.chatRequestFailed.'
+// How long before an app line a navigation's wait that ran out may lie and still be the reload
+// that cut the picture or the video the line is about: that long after the worker gave up
+// waiting, the app may still be writing its error (a slow reload).
+const MEDIA_CUT_BEFORE_MS = 30000
+// ...and how long after it: the app writes its lines to the second, the worker to the millisecond.
+const MEDIA_CUT_AFTER_MS = 1000
+// An egress call the worker answered with a 504, by the limit the app gave the call — the line says
+// only how long it waited (src/utils/browser-egress.js, src/controllers/chat.image.video.js): chats/new
+// and the JSON calls have half a minute (CHAT_TIMEOUT_MS, JSON_TIMEOUT_MS), a picture or video
+// generation five minutes (GENERATION_TIMEOUT_MS), completions ten (COMPLETIONS_TIMEOUT_MS). A slow
+// page opening adds to any of them. The values are the app's: tests/egress-log-watch.test.js reads
+// them off its source, and fails when one moves.
+const GENERATION_LIMIT_MS = 5 * 60 * 1000
+const COMPLETIONS_LIMIT_MS = 10 * 60 * 1000
+// How long after the last line of the echo of a removed account's request its next line may come: the
+// lines of one request are written in one turn of the event loop, and share a second of the app's clock
+// except across a boundary.
+const REMOVED_ECHO_MS = 2000
+// The app's WARN that it ended a request because its account was removed meanwhile
+// (src/utils/browser-egress.js#removedRequest); the account stands in the brackets.
+const REMOVED_REQUEST = 'The account was removed from the app while its request was out on it; the request ends here ('
+// What the app writes of a picture or a video that failed while it handled the request
+// (src/controllers/chat.image.video.js): the request for the generation itself failing —
+// which the cut of a video always writes, its answer being read whole inside that request —,
+// the main flow's line, and the line of the route that asked: the OpenAI endpoints of image
+// generation, image edit and video generation, and the image/video chat route. Seen live on
+// 27.11: the pair of image generation. The rest is the same family by the code, and by its
+// handlers run on 28.11: an edit writes the pair of its endpoint, a video three lines.
+const MEDIA_FAILED = [
+    '图片/视频请求失败', '图片/视频主流程异常', 'OpenAI 图片生成端点处理失败', 'OpenAI 图片编辑端点处理失败',
+    'OpenAI 视频生成端点处理失败', '图片视频资源处理错误'
+]
+
+/**
+ * An app line's time — local time with no zone — read as UTC, the host's
+ * time that both containers take on production. Not Date.parse: of a string
+ * without a zone it makes the machine's own, and on a developer's machine
+ * the moment moves by hours.
+ * @param {string} at - `YYYY-MM-DD HH:MM:SS`, as APP_LINE reads it
+ * @returns {number} milliseconds of the epoch
+ */
+function appTime(at) {
+    const [date, time] = at.split(' ')
+    const [year, month, day] = date.split('-').map(Number)
+    const [hour, minute, second] = time.split(':').map(Number)
+    return Date.UTC(year, month - 1, day, hour, minute, second)
+}
 
 /** One log line, stripped of terminal colors. */
 const plain = line => line.replace(ANSI, '')
@@ -71,7 +154,17 @@ const newReport = () => ({
     first: null, last: null, lines: { worker: 0, app: 0, other: 0 },
     counts: new Map(), unknown: new Map(), flags: null, browser: null, pages: { peak: 0, cap: 0 },
     // How long the worker's waits were: for a turn to load a page, and of a navigation for the page's streams.
-    waits: { load: 0, loadLongest: 0, stream: 0, streamLongest: 0 }
+    waits: { load: 0, loadLongest: 0, stream: 0, streamLongest: 0 },
+    // When the worker's waits for a page's streams ran out under an answer, on the worker's clock; and when
+    // the app said a picture or a video failed, on its own. The one is matched against the other when the
+    // feed is over (judgeMediaFailures). Not printed.
+    cutWaits: [], mediaFailures: [],
+    // What is due of the echo of the requests the app ended because their account was removed (Qwen2API-u50):
+    // how many chats/new lines, how many handler's lines, and when the last line of the run came on the
+    // app's clock — or null when no such request is being read (readRemovedEcho). Not printed.
+    removedEcho: null,
+    // A chat request failed and its message is on the next line (src/utils/request.js): that line is waited for.
+    chatRequestMessage: false
 })
 
 function bump(report, name, by = 1) {
@@ -95,11 +188,12 @@ const challengeName = said => {
 }
 
 /**
- * A refusal qwen.ai put in the body of a whole answer, as the worker's line
- * says of it (Qwen2API-0c6): by its code ("code …"), or, one that names none,
- * by being one ("refused, no code"). Null when the line says neither. An
- * answer of a 2xx carries one note and no more — no headers, no body — so the
- * code is the whole rest of the line, whatever is in it.
+ * A refusal qwen.ai put in the body of a 2xx — of a whole answer, or of a
+ * stream, said on the line that ends it (Qwen2API-qic) —, as the worker's
+ * line says of it (Qwen2API-0c6): by its code ("code …"), or, one that
+ * names none, by being one ("refused, no code"). Null when the line says
+ * neither. Such an answer carries one note and no more — no headers, no
+ * body — so the code is the whole rest of the note, whatever is in it.
  * @param {string} [said] - What the worker wrote after " — "
  * @returns {{code: string}|null}
  */
@@ -109,7 +203,92 @@ function bodyRefusal(said) {
     return said === 'refused, no code' ? { code: NO_CODE } : null
 }
 
-function readWorkerLine(report, event, detail) {
+/**
+ * Of the app's lines that say a picture or a video failed, which are what a
+ * navigation's wait that ran out cut — the worker's `resident-wait N still
+ * running`, from MEDIA_CUT_BEFORE_MS before the app's line to
+ * MEDIA_CUT_AFTER_MS after it — and which are failures of their own, said so.
+ * Judged when the feed is over, by time and never by the order of the feed:
+ * the two logs may come in either order, or interleaved.
+ * @param {object} report
+ */
+function judgeMediaFailures(report) {
+    for (const time of report.mediaFailures) {
+        const cut = report.cutWaits.some(wait => time - MEDIA_CUT_BEFORE_MS <= wait && wait <= time + MEDIA_CUT_AFTER_MS)
+        bump(report, cut ? 'app.mediaCutByReload' : 'app.mediaFailed')
+    }
+    report.mediaFailures = []
+}
+
+/**
+ * The kind of a failed chat request whose message came on the line after
+ * (src/utils/request.js): qwen.ai's status when it is axios's "Request
+ * failed with status code N" — as the console prints it, or under the quotes
+ * the file log puts round a string —; else "other".
+ * @param {object} report
+ * @param {string|null} said - The line after, or null when the feed ended on the bare line
+ */
+function saidChatRequestFailure(report, said) {
+    const found = said && /^"?Request failed with status code (\d{3})"?$/.exec(said)
+    bump(report, `app.chatRequestFailed.${found ? found[1] : 'other'}`)
+}
+
+/**
+ * The echo of the requests the app ended because their account was removed
+ * meanwhile (Qwen2API-u50). Each request writes a WARN, then up to two
+ * ERROR lines: the chat that could not be made, and whatever its handler
+ * writes. Requests of one account that waited on one renewal continue in one
+ * turn of the event loop, and write WARN, WARN, chats/new, chats/new,
+ * handler, handler: so what is due is counted, not followed as one chain.
+ * The WARN adds one to the chats/new lines due. An ERROR line of that shape,
+ * while one is due, is counted under the removal and makes a handler's line
+ * due; any ERROR line of the app's while one of those is due is counted the
+ * same way. With nothing due the run takes no line; the next line of it
+ * must come within REMOVED_ECHO_MS of the last. Any other line of the app's
+ * closes it. A line of neither side's log, or the worker's, does not: in one
+ * feed of both, a line of the app's stdout may land between its lines on stderr.
+ * @param {object} report
+ * @param {string} level - The line's level
+ * @param {string} message - The line's message, its emoji off
+ * @param {string} at - The line's time on the app's clock
+ * @param {boolean} opens - Whether the line is the WARN that ends a request
+ * @returns {boolean} Whether the line was read as the echo's, and nothing more is to be read of it
+ */
+function readRemovedEcho(report, level, message, at, opens) {
+    const time = report.removedEcho || opens ? appTime(at) : null
+    if (report.removedEcho && (time - report.removedEcho.at > REMOVED_ECHO_MS || (level !== 'ERROR' && !opens))) {
+        // Too late, or no line of the echo: the run is over, whatever this line is.
+        report.removedEcho = null
+    }
+    if (opens) {
+        // One request more of the removed account: its chats/new line is due.
+        const due = report.removedEcho || { chatsNew: 0, handler: 0 }
+        report.removedEcho = { chatsNew: due.chatsNew + 1, handler: due.handler, at: time }
+        return false
+    }
+    const run = report.removedEcho
+    if (!run) return false
+    if (run.chatsNew > 0 && message.startsWith('Qwen chat creation failed: category=upstream_transport_error')) {
+        // Only that category: the error a removed account's request throws is the transport one, status 503.
+        bump(report, 'app.removedAccount.chatsNew')
+        run.chatsNew--
+        run.handler++
+    } else if (run.handler > 0) {
+        // The handler's line, whatever the route wrote — `聊天处理错误`, `Anthropic Messages 处理错误`,
+        // a media endpoint's, an Agent round's —: the request is over.
+        bump(report, 'app.removedAccount.answerFailed')
+        run.handler--
+    } else {
+        // An ERROR that fits neither is not the echo: the line is another's, and reads as it always did.
+        report.removedEcho = null
+        return false
+    }
+    // With nothing due any more, the run takes no line: the next of the echo's shape is another's.
+    run.at = time
+    return true
+}
+
+function readWorkerLine(report, event, detail, at) {
     report.lines.worker++
     let found
     switch (event) {
@@ -130,19 +309,42 @@ function readWorkerLine(report, event, detail) {
         case 'egress-stream':
             if ((found = /^(\S+) -> (\d{3}) \(/.exec(detail))) bump(report, `stream.head.${found[2]}`)
             else if ((found = /^(\S+) end \(\d+ ms\)( — (.+))?$/.exec(detail))) {
-                bump(report, challengeName(found[2]) ? `stream.${challengeName(found[2])}` : 'stream.ended')
+                // What the line says after its time: a challenge page, or — since Qwen2API-qic — a refusal
+                // qwen.ai put in the body of the 2xx. A challenge page is HTML and never a refusal; an end
+                // that says neither is a stream that ended.
+                const challenge = challengeName(found[2])
+                const refusal = challenge ? null : bodyRefusal(found[3])
+                if (challenge) bump(report, `stream.${challenge}`)
+                else if (refusal) bump(report, `stream.refused.${refusal.code}`)
+                else bump(report, 'stream.ended')
             } else if (/^(\S+) cancelled \(/.test(detail)) bump(report, 'stream.cancelled')
-            else if ((found = /^(\S+) ([a-z_]+) \(/.exec(detail))) bump(report, `stream.failed.${found[2]}`)
-            else bump(report, 'unparsed.worker')
-            return
-        case 'request':
-            // The app's calls are POSTs to a route; anything else that reached the
-            // worker is listed under "other".
-            if ((found = /^(\w+) (\S+) -> (\d{3}) /.exec(detail))) {
-                const route = found[1] === 'POST' && /^\/\w+$/.test(found[2]) ? found[2].slice(1) : 'other'
-                bump(report, `workerHttp.${route}.${found[3]}`)
+            // The line's time is read as the worker writes it, `(N ms)`, and not as anything in brackets up to the
+            // last bracket on the line: a refusal's code may end with a bracket of its own, or carry the words of a note.
+            else if ((found = /^(\S+) ([a-z_]+) \(\d+ ms\)( — (.+))?$/.exec(detail))) {
+                bump(report, `stream.failed.${found[2]}`)
+                // A stream that ended with an error is said the same of a 2xx answer that began as a refusal
+                // (Qwen2API-qic): counted beside its error, not instead of it.
+                const refusal = bodyRefusal(found[4])
+                if (refusal) bump(report, `stream.refused.${refusal.code}`)
             } else bump(report, 'unparsed.worker')
             return
+        case 'request': {
+            // The app's calls are POSTs to a route; anything else that reached the
+            // worker is listed under "other". The line ends with how long the call took.
+            if ((found = /^(\w+) (\S+) -> (\d{3}) (\d+)ms$/.exec(detail)) || (found = /^(\w+) (\S+) -> (\d{3}) /.exec(detail))) {
+                const route = found[1] === 'POST' && /^\/\w+$/.test(found[2]) ? found[2].slice(1) : 'other'
+                bump(report, `workerHttp.${route}.${found[3]}`)
+                // An egress call the worker gave up on, by how long it waited (Qwen2API-jk9, Qwen2API-2ba): the
+                // line does not say which call it was, the time it took does — against the limits the app gives
+                // its calls (GENERATION_LIMIT_MS, COMPLETIONS_LIMIT_MS). A line without one is counted as it is.
+                if (route === 'egress' && found[3] === '504' && found[4]) {
+                    const waited = Number(found[4])
+                    bump(report, `workerHttp.egress.504.${
+                        waited >= COMPLETIONS_LIMIT_MS ? 'noHead' : waited >= GENERATION_LIMIT_MS ? 'generation' : 'noAnswer'}`)
+                }
+            } else bump(report, 'unparsed.worker')
+            return
+        }
         case 'resident-open':
             if ((found = /^ok \((\d+)\/(\d+) pages, front-end (\S+)\)$/.exec(detail))) {
                 bump(report, 'pages.opened')
@@ -170,6 +372,9 @@ function readWorkerLine(report, event, detail) {
                 bump(report, found[1] === 'ended' ? 'pageWait.ended' : 'pageWait.timedOut')
                 report.waits.stream++
                 report.waits.streamLongest = Math.max(report.waits.streamLongest, Number(found[3]))
+                // The answer the wait ran out under may be a picture or a video the app says failed: the
+                // worker's time of it is kept for the app's lines (judgeMediaFailures).
+                if (found[1] !== 'ended') report.cutWaits.push(Date.parse(at))
             } else bump(report, 'unparsed.worker')
             return
         }
@@ -209,22 +414,65 @@ function readWorkerLine(report, event, detail) {
                 report.browser = found[1]
             }
             return
+        case 'forget': {
+            // What became of a removed account's session, page and browser profile (Qwen2API-2l0, Qwen2API-t8s):
+            // the answer of /forget, by the profile's outcome; what came of a deletion put off to after a pause,
+            // said when the pause is over; what the worker's start made of the marks that outlived it. A profile
+            // that could not be removed is two lines — why, a code of the file system's, and the outcome —: the
+            // first is counted by itself, the code goes into no name.
+            if ((found = /^(?:session|no session), (?:page|no page), profile (deleted|left|deferred|kept|absent)(, a (?:login|renewal) still running)? \(\d+ sessions\)$/.exec(detail))) {
+                bump(report, `forget.${found[1]}`)
+                // A sign-in or a renewal of the account outlived /forget's patience: it may leave a session behind.
+                if (found[2]) bump(report, 'forget.pending')
+            } else if ((found = /^profile not removed (after the pause )?\(\w+\)$/.exec(detail))) {
+                bump(report, found[1] ? 'forget.afterThePause.notRemoved' : 'forget.notRemoved')
+            } else if ((found = /^profile (deleted|left) after the pause \(\d+ sessions\)$/.exec(detail))) {
+                bump(report, `forget.afterThePause.${found[1]}`)
+            } else if (detail === 'a mark that names no profile of its own was left alone') {
+                bump(report, 'forget.mark.leftAlone')
+            } else if (detail === 'a mark could not be read: its profile stays as it is') {
+                bump(report, 'forget.mark.unreadable')
+            } else bump(report, 'unparsed.worker')
+            return
+        }
         default:
             bump(report, 'worker.stopping')
     }
 }
 
-function readAppLine(report, level, message) {
+function readAppLine(report, level, message, at) {
     report.lines.app++
     // The logger puts its emoji in front of the message, and no message starts
     // with something that is not a letter, a digit or a quote.
     const first = /^\S+/.exec(message)?.[0]
     if (first && !/[\p{L}\p{N}"'`]/u.test(first)) message = message.slice(first.length).trimStart()
     let found
+    // The echo of the requests the app ended because their account was removed meanwhile (Qwen2API-u50):
+    // read before the line is sorted, for the echo is not read as what it looks like — not a refusal of
+    // chats/new, not an answer that failed, not a picture that failed, not an error nobody knows.
+    if (readRemovedEcho(report, level, message, at, message.startsWith(REMOVED_REQUEST) && message.endsWith(')'))) return
     if ((found = /^Qwen chat creation failed: category=([a-z0-9_]+)/.exec(message))) {
         bump(report, `app.chatsNewRefused.${found[1]}`)
     } else if (message.includes('chats/new через signin-worker не прошёл')) {
         bump(report, `app.workerRefused.chatsNew.${(/\(([a-z_]+)\)/.exec(message) || [null, 'unreachable'])[1]}`)
+    } else if (message === '发送聊天请求失败' || message.startsWith('发送聊天请求失败: ')) {
+        // Every attempt of a chat request failed (src/utils/request.js): its client got an error. Counted altogether,
+        // and by what failed. The forms with a colon say it on the line; of the bare one it is the message, which
+        // the logger prints on the line after it (saidChatRequestFailure).
+        bump(report, 'app.chatRequestFailed')
+        if (message.includes('completions через signin-worker не прошёл')) {
+            const code = (/\(([a-z_]+)\)/.exec(message) || [null, 'unreachable'])[1]
+            // The worker could not carry the completions call: counted as the refusal of the worker it always was...
+            bump(report, `app.workerRefused.completions.${code}`)
+            // ...and as the chat request that failed with it.
+            bump(report, `app.chatRequestFailed.worker.${code}`)
+        } else if (message === '发送聊天请求失败: 账户额度已耗尽') {
+            bump(report, 'app.chatRequestFailed.quota')
+        } else if (message === '发送聊天请求失败') {
+            report.chatRequestMessage = true
+        } else {
+            bump(report, 'app.chatRequestFailed.other')
+        }
     } else if (message.includes('completions через signin-worker не прошёл')) {
         bump(report, `app.workerRefused.completions.${(/\(([a-z_]+)\)/.exec(message) || [null, 'unreachable'])[1]}`)
     } else if (message.includes('v2 会话已续期')) {
@@ -233,10 +481,19 @@ function readAppLine(report, level, message) {
         bump(report, `app.recoveryFailed.${(/\): ([A-Za-z_]+)/.exec(message) || [null, 'error'])[1]}`)
     } else if (message.includes('v2 会话失效')) {
         bump(report, 'app.sessionDropped')
+    } else if (message.startsWith('v2 会话持久化失败 (')) {
+        // A session was not saved to storage (src/utils/v2-session-persistence.js): it costs a sign-in after a
+        // restart, not this request. The account on the line goes nowhere.
+        bump(report, 'app.sessionNotSaved')
     } else if (message.includes('v2 полный вход отложен')) {
         bump(report, 'app.reloginDeferred')
     } else if (message.includes('v2 полный вход невозможен')) {
         bump(report, 'app.reloginImpossible')
+    } else if (message.startsWith(REMOVED_REQUEST) && message.endsWith(')')) {
+        // The app ended a request because its account was removed meanwhile (src/utils/browser-egress.js): what is
+        // asked of a removed account, said once a request. Its own error lines follow, and are read as its echo
+        // (readRemovedEcho): this line opens the run, or adds a request to the one that is open.
+        bump(report, 'app.removedAccount')
     } else if (message === '聊天处理错误') {
         // An answer failed while the app was handling it (src/controllers/chat.js): one it had
         // begun to hand to its client ends in an error frame. The error is on the lines after.
@@ -244,6 +501,16 @@ function readAppLine(report, level, message) {
     } else if (message === '非流式聊天处理错误') {
         // The same of an answer without a stream: the client gets a 502.
         bump(report, 'app.wholeAnswerFailed')
+    } else if (message === 'Anthropic Messages 处理错误') {
+        // The same on the Anthropic route (src/controllers/anthropic.js), with a stream and without.
+        bump(report, 'app.anthropicFailed')
+    } else if (MEDIA_FAILED.includes(message)) {
+        // A picture or a video failed while the app handled its request: one line or several of one request
+        // (MEDIA_FAILED), each judged for itself. They are what a page reload that cut the generation under its
+        // limit leaves (the client gets a 503) where the worker says a navigation's wait ran out right there;
+        // elsewhere they are failures of their own. Which is which is judged when the feed is over
+        // (judgeMediaFailures).
+        report.mediaFailures.push(appTime(at))
     } else if ((found = /^非流式整体重试 \(原因: ([a-z_0-9]+)(?:, .*)?\)$/.exec(message))) {
         // Since Qwen2API-jk9 (2026-11-27): a request without a stream whose first attempt died before a byte
         // of its answer reached the client is made once more, whole (src/utils/whole-answer-retry.js). Counted
@@ -259,6 +526,15 @@ function readAppLine(report, level, message) {
         bump(report, 'app.retried')
     } else if (message.includes('服务器启动成功') || message.includes('v2 会话恢复完成')) {
         bump(report, 'app.started')
+    } else if (/^Model "[^"]*" has no MODEL_MAP entry, using "[^"]*" \(/.test(message)) {
+        // A client asked for a model the app does not know, and is answered with the map's stand-in for it
+        // (src/utils/model-map.js). One counter for all of them: the names are the clients' to send, and
+        // a listing does not grow by them.
+        bump(report, 'app.modelMapFallback')
+    } else if (message.startsWith('signin-worker 已忘掉账户 ') && message.endsWith('，浏览器配置稍后删除）')) {
+        // The app had the worker forget a removed account, and its browser profile goes after a pause
+        // (Qwen2API-t8s; src/utils/account.js): the worker's own `forget` lines say what came of it.
+        bump(report, 'app.forgetProfileDeferred')
     } else if (level === 'ERROR' || level === 'WARN') {
         bump(report, `app.unclassified.${level}`)
         // What the message is, without the account in it: a log owes nobody those.
@@ -272,18 +548,35 @@ function summarize(lines, report = newReport()) {
     for (const raw of lines) {
         const line = plain(raw).replace(/\r$/, '')
         let found
+        // The line after a bare `发送聊天请求失败` is its message when it is a line of neither side's log:
+        // read before the line is sorted, for that is what tells the two apart. It stays an "other" line;
+        // a line of a log, or none at all, means the message did not come.
+        if (report.chatRequestMessage) {
+            const logLine = WORKER_LINE.test(line) || APP_LINE.test(line) || FLAG_LINE.test(line)
+            saidChatRequestFailure(report, logLine ? null : line)
+        }
+        report.chatRequestMessage = false
         if ((found = WORKER_LINE.exec(line))) {
             note(report, found[1])
-            readWorkerLine(report, found[2], found[3])
+            readWorkerLine(report, found[2], found[3], found[1])
         } else if ((found = APP_LINE.exec(line))) {
             // The app's clock is local time without a zone: it does not feed the window.
-            readAppLine(report, found[2], found[4])
+            readAppLine(report, found[2], found[4], found[1])
         } else if ((found = FLAG_LINE.exec(line))) {
             report.flags = { ...(report.flags || {}), [found[1]]: found[3] }
         } else if (line.trim()) {
+            // Neither a line of the app's nor of the worker's: the echo of a removed account's request is
+            // not touched by it (readRemovedEcho) — in one feed of both, a line of the app's stdout may
+            // land between its lines on stderr.
             report.lines.other++
         }
     }
+    // When the feed is over: which of the app's picture and video failures a navigation's wait that ran out
+    // explains — by time, whichever log came first —, and the kind of a chat request whose message did not come.
+    judgeMediaFailures(report)
+    if (report.chatRequestMessage) saidChatRequestFailure(report, null)
+    // The report may be fed again: nothing of this feed is waited for any more.
+    report.chatRequestMessage = false
     return report
 }
 
@@ -326,19 +619,53 @@ function complaints(report) {
         why.push(`qwen.ai refused ${inBody.reduce((sum, [, , hits]) => sum + hits, 0)} call(s) in the body of a 2xx: ${
             inBody.map(([path, code, hits]) => `${said(path)} ${code} ${hits}`).join(', ')}`)
     }
+    // The same of a stream (Qwen2API-qic): said on the line that ended it, or on the error it ended with.
+    // The name is stream.refused.<code>, by the code as the worker's line shows it.
+    const inStream = [...report.counts].filter(([name]) => name.startsWith('stream.refused.'))
+    if (inStream.length) {
+        why.push(`qwen.ai refused ${inStream.reduce((sum, [, hits]) => sum + hits, 0)} stream(s) in the body of a 2xx: ${
+            inStream.map(([name, hits]) => `${name.slice('stream.refused.'.length)} ${hits}`).join(', ')}`)
+    }
     if (total(report, 'app.workerRefused.')) why.push(`the worker could not serve ${total(report, 'app.workerRefused.')} call(s)`)
     // What the app answers its client with when a page was reloaded under its answer, and the relay broke (Qwen2API-nch).
-    const failedAnswers = count('app.chatFailed') + count('app.wholeAnswerFailed')
+    // On the Anthropic route there is one handler for an answer with a stream and without: said as its own count.
+    const failedAnswers = count('app.chatFailed') + count('app.wholeAnswerFailed') + count('app.anthropicFailed')
     if (failedAnswers) {
         why.push(`${failedAnswers} answer(s) failed while the application handled them: ` +
-            `${count('app.chatFailed')} with a stream, ${count('app.wholeAnswerFailed')} without`)
+            `${count('app.chatFailed')} with a stream, ${count('app.wholeAnswerFailed')} without` +
+            (count('app.anthropicFailed') ? `, ${count('app.anthropicFailed')} on the Anthropic route` : ''))
+    }
+    // The same of a picture or a video (src/controllers/chat.image.video.js) where no navigation's wait that ran
+    // out lies by it (judgeMediaFailures): a failure of its own, not the cut a reload under its limit makes.
+    if (count('app.mediaFailed')) {
+        why.push(`${count('app.mediaFailed')} picture/video error line(s) in the app that no reload's wait for the page's streams explains: the reason is on the lines after`)
+    }
+    // A chat request that failed on every attempt (src/utils/request.js): its client got an error. Said by what
+    // failed, a request once. One the worker did not carry is said by "the worker could not serve" above, though
+    // it is counted here as well (readAppLine).
+    const failedRequests = [...report.counts]
+        .filter(([name]) => name.startsWith(CHAT_REQUEST_FAILED) && !name.startsWith(`${CHAT_REQUEST_FAILED}worker.`))
+        .sort(([a], [b]) => a.localeCompare(b))
+    if (failedRequests.length) {
+        const said = ([name, hits]) => {
+            const kind = name.slice(CHAT_REQUEST_FAILED.length)
+            if (/^\d{3}$/.test(kind)) return `${hits} with status ${kind}`
+            return kind === 'quota' ? `${hits} for a spent quota` : `${hits} otherwise`
+        }
+        why.push(`${failedRequests.reduce((sum, [, hits]) => sum + hits, 0)} chat request(s) failed: ${failedRequests.map(said).join(', ')}`)
     }
     // The worker's own answer to an egress call that was not a success. The app's
     // line says which code when the app's log is in the feed; the worker's alone still says it happened.
     const notServed = [...report.counts].filter(([name]) => /^workerHttp\.egress\.([3-5]\d\d)$/.test(name))
     if (notServed.length) {
         const statuses = notServed.map(([name]) => name.slice('workerHttp.egress.'.length)).sort().join(' and ')
-        why.push(`the worker answered ${notServed.reduce((sum, [, hits]) => sum + hits, 0)} egress call(s) with HTTP ${statuses}`)
+        // Of 504s, by how long the call waited against the limits the app gives its calls (readWorkerLine).
+        // Said of the kinds there are.
+        const kinds = []
+        if (count('workerHttp.egress.504.noAnswer')) kinds.push(`${count('workerHttp.egress.504.noAnswer')} in under five minutes (a call that did not return from the page in time — chats/new's limit is 30 s; Qwen2API-jk9)`)
+        if (count('workerHttp.egress.504.generation')) kinds.push(`${count('workerHttp.egress.504.generation')} after five minutes or more (a picture or video generation that did not finish in its limit of five)`)
+        if (count('workerHttp.egress.504.noHead')) kinds.push(`${count('workerHttp.egress.504.noHead')} after ten minutes or more (completions gave no head — Qwen2API-2ba)`)
+        why.push(`the worker answered ${notServed.reduce((sum, [, hits]) => sum + hits, 0)} egress call(s) with HTTP ${statuses}${kinds.length ? `: ${kinds.join(', ')}` : ''}`)
     }
     if (total(report, 'stream.failed.')) why.push(`${total(report, 'stream.failed.')} stream(s) ended with an error`)
     // Status 200, and a page: qwen.ai asked for a verification. Counted by
@@ -363,9 +690,11 @@ function complaints(report) {
     // A 401 head of a stream is the app's to recover from inside the request (one
     // reload, one retry), so one is counted and not complained of. Refused more
     // often than accepted is the shape of 23.11: every call refused, the page
-    // reloaded for each, refused again. A challenged stream is no accepted one.
+    // reloaded for each, refused again. A challenged stream is no accepted one,
+    // nor is one qwen.ai refused in the body of a 2xx (Qwen2API-qic).
     const refused = count('stream.head.401')
-    const accepted = count('stream.head.200') - count('stream.challenge') - count('stream.challenge.kept')
+    const accepted = count('stream.head.200') - count('stream.challenge') - count('stream.challenge.kept') -
+        total(report, 'stream.refused.')
     if (refused > accepted) why.push(`streams refused as 401 more often than accepted: ${refused} refused, ${accepted} accepted`)
     if (count('renew.forced') && total(report, 'stream.head.') && !count('stream.ended')) {
         why.push(`${count('renew.forced')} forced reload(s), and not one stream finished`)
@@ -382,6 +711,21 @@ function complaints(report) {
     if (count('pageLoad.packed')) why.push(`${count('pageLoad.packed')} page load(s) began closer than planned: the line was longer than its limit`)
     const died = PAGE_DEATHS.reduce((sum, reason) => sum + count(`pages.closed.${reason}`), 0)
     if (died) why.push(`${died} resident page(s) died (not evicted or shut down)`)
+    // What became of a removed account's browser profile (the worker's `forget` lines, readWorkerLine): one
+    // that could not be removed stays on the disk, and a mark that could not be read leaves its profile for good.
+    // Each count is said by its name, as the listing under "accounts forgotten" shows it.
+    const leftNow = count('forget.left')
+    const leftLater = count('forget.afterThePause.left')
+    const notRemoved = count('forget.notRemoved') + count('forget.afterThePause.notRemoved')
+    if (leftNow + leftLater + notRemoved) {
+        const byName = []
+        if (leftNow) byName.push(`left ${leftNow}`)
+        if (count('forget.notRemoved')) byName.push(`not removed ${count('forget.notRemoved')}`)
+        if (leftLater) byName.push(`left after the pause ${leftLater}`)
+        if (count('forget.afterThePause.notRemoved')) byName.push(`not removed after the pause ${count('forget.afterThePause.notRemoved')}`)
+        why.push(`${leftNow + leftLater || notRemoved} forgotten account(s): the browser profile could not be removed (${byName.join(', ')})`)
+    }
+    if (count('forget.mark.unreadable')) why.push(`${count('forget.mark.unreadable')} mark(s) of a deletion put off could not be read`)
     // Per account the limits are one reload in 30 s and one sign-in in 60 s; logs
     // name no account, so this is the weaker bound over all of them together.
     if (minutes !== null) {
@@ -433,6 +777,7 @@ function render(report) {
     section("the page's token, renewed in place", 'tokenRefresh.')
     section('navigations that waited for the page’s streams', 'pageWait.')
     section('page loads that waited for a turn', 'pageLoad.')
+    section('accounts forgotten: what became of their browser profiles', 'forget.')
     if (report.waits.load) out.push(`longest wait for a turn to load a page: ${report.waits.loadLongest} ms`)
     if (report.waits.stream) out.push(`longest a navigation waited for the page's streams: ${report.waits.streamLongest} ms`)
     section('other', 'worker.')
@@ -446,10 +791,11 @@ function render(report) {
     let verdict = 'OK'
     if (why.length) verdict = 'LOOK'
     // Without any, there is nothing to judge the egress by: a start-up line alone
-    // says nothing about what qwen.ai did.
+    // says nothing about what qwen.ai did; nor does the app's word of a profile that
+    // goes after a pause.
     else {
         const judged = total(report, 'egress.') + total(report, 'stream.') + total(report, 'workerHttp.egress.') +
-            total(report, 'app.') - count('app.started')
+            total(report, 'app.') - count('app.started') - count('app.forgetProfileDeferred')
         if (!judged) verdict = 'NOTHING TO JUDGE'
     }
     out.push(`verdict: ${verdict}${why.length ? `\n  - ${why.join('\n  - ')}` : ''}`)
