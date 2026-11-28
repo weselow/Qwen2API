@@ -43,7 +43,7 @@ services:
       - V2_SESSION_RELOGIN_MIN_INTERVAL_MS=${V2_SESSION_RELOGIN_MIN_INTERVAL_MS:-60000}
       - SIGNIN_WORKER_URL=http://signin-worker:3100
       - SIGNIN_WORKER_TOKEN=${SIGNIN_WORKER_TOKEN:-}
-      # Must stay above the worker's SIGNIN_LOGIN_MAX_WAIT_MS + SIGNIN_TIMEOUT_MS, and above a renewal's
+      # Must be at least the worker's SIGNIN_LOGIN_MAX_WAIT_MS + SIGNIN_TIMEOUT_MS, and at least a renewal's
       # worst wait: RESIDENT_STREAM_WAIT_MS + RESIDENT_LOAD_MAX_WAIT_MS + 2 x RESIDENT_LOAD_MIN_INTERVAL_MS
       # + 25000 (the calls in flight, the token settling after the reload) + the reload itself: about 200000 by default.
       - SIGNIN_WORKER_TIMEOUT_MS=${SIGNIN_WORKER_TIMEOUT_MS:-240000}
@@ -100,8 +100,13 @@ services:
       - RESIDENT_LOAD_MAX_WAIT_MS=${RESIDENT_LOAD_MAX_WAIT_MS:-120000}
       # Removing an account in the app tells the worker (POST /forget), which
       # drops its session and closes its page. Set to true, the browser
-      # profile goes too: an account added again then signs in afresh.
+      # profile goes too — not at once, but after the pause below: an account
+      # added again inside it keeps its profile and skips the sign-in
+      # (Qwen2API-t8s); one added again after it signs in afresh.
       - SIGNIN_FORGET_DELETES_PROFILE=${SIGNIN_FORGET_DELETES_PROFILE:-false}
+      # The pause before a removed account's profile is deleted, in ms.
+      # 0 = at once.
+      - SIGNIN_FORGET_GRACE_MS=${SIGNIN_FORGET_GRACE_MS:-120000}
     # One Chromium profile per account; keep them on a volume so auth.qwen.ai
     # sessions survive restarts and renewal stays a silent reload.
     volumes:

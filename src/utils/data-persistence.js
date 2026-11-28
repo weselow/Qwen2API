@@ -213,13 +213,20 @@ class DataPersistence {
   /**
    * 保存单个账户的 v2 会话。已删除的账户拒绝恢复写入——
    * 会话 token 是 bearer 凭据，绝不能因迟到的续期而复活。
+   * The sign-in that adds an account is the exception (Qwen2API-jwh): it
+   * publishes before the new record is saved, and its session is the
+   * addition's own, like a record saved with allowCreate. The mark stays
+   * until that record is saved — every other write is still refused
+   * (Qwen2API-u50).
+   * @param {Object} [options]
+   * @param {boolean} [options.allowCreate] - The session is the sign-in's that adds the account
    * @returns {Promise<boolean>} 写入是否成功
    */
-  async saveV2Session(email, session) {
+  async saveV2Session(email, session, { allowCreate = false } = {}) {
     if (!email || !session) return false
     const key = this._accountKey(email)
     return enqueueAccountTask(key, async () => {
-      if (deletedAccountKeys.has(key)) return false
+      if (deletedAccountKeys.has(key) && !allowCreate) return false
       try {
         switch (config.dataSaveMode) {
           case 'redis':

@@ -15,7 +15,7 @@ const {
     assertChatChallengeBreakerClosed, bindChatChallengeContext, chatChallengeFrom,
     isWafChallengeError, noteChatChallengeAnswer, releaseChatProbe, ChatCreationError, isTransportInterruption
 } = require('../utils/upstream-error.js')
-const { ClientGoneError, isClientGone, watchClient } = require('../utils/client-gone.js')
+const { ClientGoneError, isClientGone, watchClient, assertClientStays, sleepWhileClientStays } = require('../utils/client-gone.js')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
@@ -35,34 +35,6 @@ const GENERATION_TIMEOUT_MS = 1000 * 60 * 5
  * there before it goes on, and lets ClientGoneError out as it is — no error
  * line, no second attempt, no answer built for a client that is gone.
  */
-
-/** Throws ClientGoneError once the client has gone: what every step asks before it goes on. */
-const assertClientStays = (client) => {
-    if (client && client.gone()) throw new ClientGoneError()
-}
-
-/**
- * `sleep` for as long as the client stays: a client that goes away ends the
- * wait at once with ClientGoneError, instead of leaving the request asleep for
- * the rest of the pause (a video task is polled every twenty seconds).
- */
-const sleepWhileClientStays = (ms, client) => new Promise((resolve, reject) => {
-    if (client && client.gone()) {
-        reject(new ClientGoneError())
-        return
-    }
-    let unsubscribe = null
-    const timer = setTimeout(() => {
-        if (unsubscribe) unsubscribe()
-        resolve()
-    }, ms)
-    if (client) {
-        unsubscribe = client.onGone(() => {
-            clearTimeout(timer)
-            reject(new ClientGoneError())
-        })
-    }
-})
 
 /**
  * Closes `stream` when the client goes away: on the egress this closes the
@@ -909,7 +881,7 @@ const buildInternalMediaItem = (mediaType, mediaURL) => {
  *   图片从它的页面传上去，生成也在它上面建（Qwen2API-fjk）；不带则照旧由轮换器取
  * @returns {Promise<object>} 内部媒体内容项
  */
-const uploadMultipartMediaFile = async (file, mediaType, requestAccount = null) => {
+const uploadMultipartMediaFile = async (file, mediaType, requestAccount = null, client = null) => {
     if (!file?.buffer) {
         throw new Error('上传文件内容为空')
     }
@@ -917,7 +889,7 @@ const uploadMultipartMediaFile = async (file, mediaType, requestAccount = null) 
     const fallbackExtension = mediaType === 'video' ? 'mp4' : 'png'
     const originalFilename = file.originalname || `upload.${fallbackExtension}`
     const uploadAccount = uploadAccountOf(requestAccount)
-    const uploadResult = await uploadFileToQwenOss(file.buffer, originalFilename, uploadAccount ? uploadAccount.token : null, uploadAccount)
+    const uploadResult = await uploadFileToQwenOss(file.buffer, originalFilename, uploadAccount ? uploadAccount.token : null, uploadAccount, client ? { client } : {})
 
     if (!uploadResult || uploadResult.status !== 200) {
         throw new Error('文件上传失败')
@@ -933,7 +905,7 @@ const uploadMultipartMediaFile = async (file, mediaType, requestAccount = null) 
  * @param {(() => object|null)|null} [requestAccount] - 该请求所用的那一个账户（Qwen2API-fjk），同 uploadMultipartMediaFile
  * @returns {Promise<object|null>} 内部媒体内容项
  */
-const normalizeInlineMediaItem = async (value, mediaType, requestAccount = null) => {
+const normalizeInlineMediaItem = async (value, mediaType, requestAccount = null, client = null) => {
     const mediaURL = extractInlineMediaURL(value, mediaType)
     if (!mediaURL) {
         return null
@@ -952,7 +924,7 @@ const normalizeInlineMediaItem = async (value, mediaType, requestAccount = null)
     const base64Content = matchedDataURI[2]
     const fileExtension = mimeType?.split('/')[1] || (mediaType === 'video' ? 'mp4' : 'png')
     const uploadAccount = uploadAccountOf(requestAccount)
-    const uploadResult = await uploadFileToQwenOss(Buffer.from(base64Content, 'base64'), `upload.${fileExtension}`, uploadAccount ? uploadAccount.token : null, uploadAccount)
+    const uploadResult = await uploadFileToQwenOss(Buffer.from(base64Content, 'base64'), `upload.${fileExtension}`, uploadAccount ? uploadAccount.token : null, uploadAccount, client ? { client } : {})
 
     if (!uploadResult || uploadResult.status !== 200) {
         throw new Error('文件上传失败')
@@ -969,16 +941,16 @@ const normalizeInlineMediaItem = async (value, mediaType, requestAccount = null)
  * @param {(() => object|null)|null} [requestAccount] - 该请求所用的那一个账户（Qwen2API-fjk），同 uploadMultipartMediaFile
  * @returns {Promise<Array<object>>} 媒体内容项列表
  */
-const collectRequestMediaItems = async (req, fieldName, mediaType, requestAccount = null) => {
+const collectRequestMediaItems = async (req, fieldName, mediaType, requestAccount = null, client = null) => {
     const mediaItems = []
     const matchedFiles = (req.files || []).filter(file => file.fieldname === fieldName)
 
     for (const file of matchedFiles) {
-        mediaItems.push(await uploadMultipartMediaFile(file, mediaType, requestAccount))
+        mediaItems.push(await uploadMultipartMediaFile(file, mediaType, requestAccount, client))
     }
 
     for (const value of ensureArray(req.body?.[fieldName])) {
-        const normalizedMediaItem = await normalizeInlineMediaItem(value, mediaType, requestAccount)
+        const normalizedMediaItem = await normalizeInlineMediaItem(value, mediaType, requestAccount, client)
         if (normalizedMediaItem) {
             mediaItems.push(normalizedMediaItem)
         }
@@ -2030,7 +2002,8 @@ const handleOpenAIImagesEdit = async (req, res) => {
     // from its page, and the generation is made on it too (Qwen2API-fjk).
     const uploadAccount = oneAccountForRequest()
     try {
-        const imageItems = await collectRequestMediaItems(req, 'image', 'image', uploadAccount.get)
+        // Under the watch too: a client that goes away takes the upload of its pictures with it (Qwen2API-4l1).
+        const imageItems = await collectRequestMediaItems(req, 'image', 'image', uploadAccount.get, client)
         if (imageItems.length === 0) {
             return sendOpenAIErrorResponse(res, {
                 status: 400,

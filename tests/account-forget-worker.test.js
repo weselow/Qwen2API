@@ -356,6 +356,8 @@ test('the app and the real worker route, end to end: a removed account leaves no
   const signer = fakeResidentBrowser()
   const server = createServer({
     dataDir, token: 'e2e-secret', signer, forgetDeletesProfile: true,
+    // The profile goes at once here; with the pause it is the next test's.
+    forgetGraceMs: 0,
     frontEndMs: 100, settleStableMs: 40, settlePollMs: 10, settleTimeoutMs: 300,
     minLoginIntervalMs: 1, loadMinIntervalMs: 1, tokenRefreshMinIntervalMs: 1
   })
@@ -395,4 +397,60 @@ test('the app and the real worker route, end to end: a removed account leaves no
   assert.equal(accountManager.getAllAccountKeys().length, 0)
   assert.equal(lines.warn.length, 0)
   assert.ok(lines.info.some(line => line.includes(email) && line.includes('浏览器配置已删除')), lines.info.join('\n'))
+})
+
+test('the app and the real worker route, end to end: with the pause the removal is answered at once, and the profile goes after it', { timeout: 20000 }, async t => {
+  // The worker's default since Qwen2API-t8s: a removed account's profile is deleted after a pause,
+  // which the app does not wait for — and its answer, "deferred", is one the app understands.
+  const { createServer } = require('../signin-worker/server')
+  const { fakeResidentBrowser } = require('./helpers/fake-resident-browser')
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'qwen-account-forget-e2e-'))
+  const signer = fakeResidentBrowser()
+  // Long enough that a loaded runner's page close does not eat it: the removal must answer well inside it.
+  const pauseMs = 2500
+  const server = createServer({
+    dataDir, token: 'e2e-secret', signer, forgetDeletesProfile: true, forgetGraceMs: pauseMs,
+    frontEndMs: 100, settleStableMs: 40, settlePollMs: 10, settleTimeoutMs: 300,
+    minLoginIntervalMs: 1, loadMinIntervalMs: 1, tokenRefreshMinIntervalMs: 1
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  const origin = `http://127.0.0.1:${server.address().port}`
+  const saved = { signinWorkerUrl: config.signinWorkerUrl, signinWorkerToken: config.signinWorkerToken, accounts: accountManager.accountTokens }
+  config.signinWorkerUrl = origin
+  config.signinWorkerToken = 'e2e-secret'
+  t.after(async () => {
+    Object.assign(config, { signinWorkerUrl: saved.signinWorkerUrl, signinWorkerToken: saved.signinWorkerToken })
+    accountManager.accountTokens = saved.accounts
+    accountManager.accountRotator.setAccounts(saved.accounts)
+    await server.workerShutdown()
+    await new Promise(resolve => server.close(resolve))
+    await fs.rm(dataDir, { recursive: true, force: true })
+  })
+  const lines = capture(t)
+
+  const email = 'end-to-end-paused@example.invalid'
+  const profile = path.join(dataDir, 'account-' + crypto.createHash('sha256').update(email).digest('hex').slice(0, 32))
+  await fs.mkdir(profile, { recursive: true })
+  const account = record(email)
+  accountManager.accountTokens = [account]
+  accountManager.accountRotator.setAccounts(accountManager.accountTokens)
+  await signinWorker.egress(email, account, {
+    url: 'https://chat.qwen.ai/api/v2/chats/new', method: 'POST', headers: {}, body: '{}', timeoutMs: 5000
+  })
+
+  const before = Date.now()
+  assert.equal(await accountManager.removeAccount(email), true)
+  assert.equal(Date.now() - before < pauseMs, true, 'the removal did not wait for the pause')
+  assert.equal(signer.contexts[0].closed, true)
+  await fs.stat(profile)
+  assert.equal(accountManager.getAllAccountKeys().length, 0)
+  assert.equal(lines.warn.length, 0)
+  assert.ok(lines.info.some(line => line.includes(email) && line.includes('浏览器配置稍后删除')), lines.info.join('\n'))
+  const deadline = Date.now() + 8000
+  while (true) {
+    try { await fs.stat(profile) } catch (error) { if (error.code !== 'ENOENT') throw error; break }
+    if (Date.now() > deadline) throw new Error('the profile was not removed after the pause')
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  assert.equal(Date.now() - before >= pauseMs, true, 'not before the pause is over')
 })

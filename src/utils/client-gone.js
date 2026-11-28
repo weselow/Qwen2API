@@ -218,9 +218,44 @@ const consumeWhileClientStays = async (stream, onFrame, { client = null, shouldS
   }
 }
 
+/**
+ * Throws ClientGoneError once the client has gone: what every step that is no
+ * stream asks before it goes on — the token call, the upload and the parse of
+ * a file (Qwen2API-4l1). A caller that brings no client reads as it did before.
+ */
+const assertClientStays = (client) => {
+  if (client && client.gone()) throw new ClientGoneError()
+}
+
+/**
+ * `sleep` for as long as the client stays: a client that goes away ends the
+ * wait at once with ClientGoneError, instead of leaving the request asleep for
+ * the rest of the pause (a file's parse is polled, a video task every twenty
+ * seconds).
+ */
+const sleepWhileClientStays = (ms, client) => new Promise((resolve, reject) => {
+  if (client && client.gone()) {
+    reject(new ClientGoneError())
+    return
+  }
+  let unsubscribe = null
+  const timer = setTimeout(() => {
+    if (unsubscribe) unsubscribe()
+    resolve()
+  }, ms)
+  if (client) {
+    unsubscribe = client.onGone(() => {
+      clearTimeout(timer)
+      reject(new ClientGoneError())
+    })
+  }
+})
+
 module.exports = {
   ClientGoneError,
   isClientGone,
   watchClient,
-  consumeWhileClientStays
+  consumeWhileClientStays,
+  assertClientStays,
+  sleepWhileClientStays
 }

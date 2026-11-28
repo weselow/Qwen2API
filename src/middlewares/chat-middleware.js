@@ -3,6 +3,7 @@ const { isChatType, isThinkingEnabled, parserModel, parserMessages, extractMedia
 const { buildToolSystemPrompt, foldToolMessages } = require('../utils/tool-prompt.js')
 const { buildAgentTurnDirective, buildToolHistoryLedger, extractHistoryToolCalls } = require('../utils/agent-turn.js')
 const { logger } = require('../utils/logger')
+const { watchClient, isClientGone } = require('../utils/client-gone')
 const { mapIncomingModel } = require('../utils/model-map.js')
 
 const shouldEnableToolRuntime = (tools, chatType, toolChoice) => (
@@ -233,7 +234,16 @@ const processRequestBody = async (req, res, next) => {
     // from its page, and the chat is made on it too (Qwen2API-fjk). Nothing is taken for a
     // request that uploads nothing.
     const uploadAccount = oneAccountForRequest()
-    const parsedMessages = await parserMessages(preparedMessages, thinkingConfig, chatType, uploadAccount.get)
+    // Watched while the pictures of the request are uploaded: a client that goes away takes
+    // the upload with it, and nothing is asked of qwen.ai for it (Qwen2API-4l1). The
+    // controller watches the same request again for the answer.
+    const uploadClient = watchClient(req)
+    let parsedMessages
+    try {
+      parsedMessages = await parserMessages(preparedMessages, thinkingConfig, chatType, uploadAccount.get, uploadClient)
+    } finally {
+      uploadClient.dispose()
+    }
 
     // 将解析后的消息填充到 React UI 格式的消息对象中
     // 取最后一条用户消息作为主消息内容，历史消息通过 content 传递
@@ -322,6 +332,8 @@ const processRequestBody = async (req, res, next) => {
 
     next()
   } catch (e) {
+    // The client went away and its request was ended for it: nothing failed, and nobody is left to answer.
+    if (isClientGone(e)) return
     logger.error('处理请求体时发生错误', 'MIDDLEWARE', '', e)
     res.status(500)
       .json({

@@ -5,6 +5,9 @@ const { logger } = require('./logger')
 const { generateUUID } = require('./tools.js')
 const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig, describeEgress } = require('./proxy-helper')
 const { buildRequestHeaders } = require('./header-profile')
+// The client of the request, on its way out, ends the upload, the parse and its
+// polls (Qwen2API-4l1): what every step asks before it goes on.
+const { isClientGone, assertClientStays, sleepWhileClientStays } = require('./client-gone')
 const config = require('../config/index.js')
 
 // Taken when a call is made, not at the top: the egress carries the session
@@ -328,10 +331,13 @@ const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileConte
  * @param {string} originalFilename - 原始文件名 (例如 "image.png")。
  * @param {string} authToken - 通义千问认证Token (纯token，不含Bearer)。
  * @param {Object} [account] - 账户对象（用于解析账号级代理）
+ * @param {Object} [options]
+ * @param {Object|null} [options.client] - watchClient(req) 的结果：客户已离开时不再请求令牌，
+ *   令牌拿到后也不再发送字节（Qwen2API-4l1）；不带则照旧
  * @returns {Promise<{file_url: string, file_id: string, message: string}>} 包含上传后的URL、文件ID和成功消息。
  * @throws {Error} 如果任何步骤失败。
  */
-const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, account) => {
+const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, account, options = {}) => {
     try {
         // 参数验证
         if (!fileBuffer || !originalFilename || !authToken) {
@@ -349,6 +355,9 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, acco
             throw new Error(`文件大小超出限制，最大允许 ${UPLOAD_CONFIG.maxFileSize / 1024 / 1024}MB`)
         }
 
+        // Gone before the token call: nothing is asked of qwen.ai for a client that left (Qwen2API-4l1).
+        assertClientStays(options.client)
+
         logger.info(`开始上传文件: ${originalFilename} (${filesize} bytes, ${mimeType})`, 'UPLOAD', '📤')
 
         // 第一步：获取STS Token
@@ -360,6 +369,9 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, acco
             0,
             account
         )
+
+        // Gone while the token call was out: the bytes are not sent (Qwen2API-4l1).
+        assertClientStays(options.client)
 
         // 第二步：上传到OSS
         await uploadToOssWithSts(fileBuffer, credentials, file_info, mimeType, 0, account);
@@ -373,6 +385,8 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, acco
             message: '文件上传成功'
         }
     } catch (error) {
+        // The client's going is no failure of the upload: nothing is said of it.
+        if (isClientGone(error)) throw error
         logger.error('文件上传流程失败', 'UPLOAD', '', error)
         throw error
     }
@@ -444,6 +458,10 @@ const parseChallenge = (fileId, egress) => Object.assign(
 const parseUploadedTextFile = async (fileId, authToken, account, options = {}) => {
     if (!fileId || !authToken) throw new Error('解析文档缺少 fileId 或认证 Token')
     const egress = describeEgress(account)
+    // Gone before the parse, or between two of its polls: nothing more is asked, and the
+    // pause between the polls ends at once (Qwen2API-4l1).
+    const client = options.client || null
+    assertClientStays(client)
 
     const baseUrl = getChatBaseUrl()
     const timeoutMs = Math.max(1000, Number(options.timeoutMs) || 30000)
@@ -483,6 +501,7 @@ const parseUploadedTextFile = async (fileId, authToken, account, options = {}) =
     const intervalMs = Math.max(50, Number(options.intervalMs) || 500)
     let lastStatus = ''
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        assertClientStays(client)
         const response = await postViaEgress('/api/v2/files/parse/status', { file_id_list: [fileId] })
         throwIfParseServiceFailed(response, fileId, egress)
         const payload = unwrapApiData(response)
@@ -495,7 +514,7 @@ const parseUploadedTextFile = async (fileId, authToken, account, options = {}) =
             throw new Error(record?.error_msg || record?.message || 'Qwen 文档解析失败')
         }
         if (status) lastStatus = status
-        if (attempt < maxAttempts) await delay(intervalMs)
+        if (attempt < maxAttempts) await sleepWhileClientStays(intervalMs, client)
     }
 
     throw new Error(`Qwen 文档解析超时: ${fileId} (last status="${lastStatus || 'none'}")`)
@@ -645,7 +664,7 @@ const uploadAgentContextFile = async (text, authToken, account, options = {}) =>
     assertParseBreakerClosed(account)
     takeParseSlot(account)
     const filename = options.filename || `QWEN2API_AGENT_CONTEXT_${Date.now()}.txt`
-    const uploaded = await uploadFileToQwenOss(content, filename, authToken, account)
+    const uploaded = await uploadFileToQwenOss(content, filename, authToken, account, options)
     try {
         await parseUploadedTextFile(uploaded.file_id, authToken, account, options)
     } catch (error) {

@@ -1250,6 +1250,10 @@ const handleChatCompletion = async (req, res) => {
         const requestMessages = Array.isArray(req.body.messages) ? req.body.messages : []
         const upstreamOptions = {
             allowContextCompaction: req.has_tools !== true,
+            // `client`: a client that goes away ends the chat's creation and the attachment of a
+            // context too, before the completions call — on the agent's turns and the compensating
+            // sends as well, which take these same options (Qwen2API-4l1).
+            client,
             contextPrefixKey: buildContextPrefixKey({
                 userId: req.body.user,
                 model,
@@ -1362,6 +1366,9 @@ const handleChatCompletion = async (req, res) => {
         })
 
     } catch (error) {
+        // The client went away and its request was ended for it (the chat's creation, the
+        // attachment of a context, the read): nothing failed, and nobody is left to answer.
+        if (isClientGone(error)) return
         logger.error('聊天处理错误', 'CHAT', '', error)
         // Adjunto de contexto caido con tools: 503 reintentable (gemelo del 529 de
         // anthropic.js). Cualquier otra cosa conserva el 500 de siempre.

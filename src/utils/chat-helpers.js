@@ -9,6 +9,8 @@ const { writeToolResultMediaNote } = require('./agent-turn.js')
 // Referencia al módulo, no desestructurada: un binding desestructurado no se puede
 // sustituir desde un test y la prueba acabaría pegando a la red de verdad.
 const uploadModule = require('./upload.js')
+// The client of the request, on its way out, ends the upload of its pictures (Qwen2API-4l1).
+const { assertClientStays, isClientGone } = require('./client-gone')
 const { getLatestModels } = require('../models/models-map.js')
 const accountManager = require('./account.js')
 const CacheManager = require('./img-caches.js')
@@ -171,9 +173,11 @@ const buildNormalizedMediaItem = (mediaType, url) => {
  * @param {object} imgCacheManager - 图片缓存管理器
  * @param {(() => object|null)|null} [requestAccount] - 该请求所用的那一个账户（oneAccountForRequest）：
  *   图片从它的页面传上去，聊天也在它上面建（Qwen2API-fjk）；不带则照旧由轮换器取
+ * @param {object|null} [client] - What watchClient(req) returns: gone, the upload is not begun
  * @returns {Promise<object|null>} 规范化后的媒体内容项
+ * @throws {ClientGoneError} 客户端已离开：不上传，不记错误，原样放行
  */
-const normalizeMediaContentItem = async (item, imgCacheManager, requestAccount = null) => {
+const normalizeMediaContentItem = async (item, imgCacheManager, requestAccount = null, client = null) => {
     const mediaDescriptor = getMediaDescriptor(item)
     if (!mediaDescriptor?.url) {
         return null
@@ -212,10 +216,15 @@ const normalizeMediaContentItem = async (item, imgCacheManager, requestAccount =
             }
         }
 
+        // Gone before the picture's upload: nothing is asked of qwen.ai for a client that left (Qwen2API-4l1).
+        assertClientStays(client)
         const buffer = Buffer.from(base64Content, 'base64')
         // On the request's account, that the chat is made on too (Qwen2API-fjk).
         const uploadAccount = uploadAccountOf(requestAccount)
-        const uploadResult = await uploadModule.uploadFileToQwenOss(buffer, filename, uploadAccount ? uploadAccount.token : null, uploadAccount)
+        // The client goes along: gone while the token call is out, the bytes are not sent.
+        const uploadResult = await uploadModule.uploadFileToQwenOss(
+            buffer, filename, uploadAccount ? uploadAccount.token : null, uploadAccount, client ? { client } : {}
+        )
 
         if (!uploadResult || uploadResult.status !== 200) {
             return null
@@ -227,6 +236,8 @@ const normalizeMediaContentItem = async (item, imgCacheManager, requestAccount =
 
         return buildNormalizedMediaItem(mediaType, uploadResult.file_url)
     } catch (error) {
+        // The client's going is no failure of the upload: said as nothing, and let out as it is.
+        if (isClientGone(error)) throw error
         logger.error(`${mediaType === 'video' ? '视频' : '图片'}上传失败`, 'UPLOAD', '', error)
         return null
     }
@@ -424,14 +435,14 @@ const formatHistoryMessages = (messages) => {
  *   消息里的图片在它上面上传，聊天也在它上面建（Qwen2API-fjk）；不带则照旧由轮换器取
  * @returns {Promise<Array>} 解析后的消息数组
  */
-const parserMessages = async (messages, thinking_config, chat_type, requestAccount = null) => {
+const parserMessages = async (messages, thinking_config, chat_type, requestAccount = null, client = null) => {
     try {
         const feature_config = thinking_config
 
         // 如果只有一条消息,使用原有逻辑处理（不标注角色）
         if (messages.length <= 1) {
             logger.network('单条消息，使用原格式处理', 'PARSER')
-            return await processOriginalLogic(messages, thinking_config, chat_type, imgCacheManager, requestAccount)
+            return await processOriginalLogic(messages, thinking_config, chat_type, imgCacheManager, requestAccount, client)
         }
 
         // 多条消息的情况:分离历史消息和最后一条消息
@@ -455,7 +466,7 @@ const parserMessages = async (messages, thinking_config, chat_type, requestAccou
                 if (item.type === 'text') {
                     lastMessageText += item.text || ''
                 } else if (isMediaContentItem(item)) {
-                    const normalizedMediaItem = await normalizeMediaContentItem(item, imgCacheManager, requestAccount)
+                    const normalizedMediaItem = await normalizeMediaContentItem(item, imgCacheManager, requestAccount, client)
                     if (normalizedMediaItem) {
                         finalContent.push(normalizedMediaItem)
                     }
@@ -512,6 +523,8 @@ const parserMessages = async (messages, thinking_config, chat_type, requestAccou
         }
 
     } catch (e) {
+        // The client's going is no failure of the parsing: let out as it is, for nobody to be answered.
+        if (isClientGone(e)) throw e
         logger.error('消息解析失败', 'PARSER', '', e)
         return [
             {
@@ -537,7 +550,7 @@ const parserMessages = async (messages, thinking_config, chat_type, requestAccou
  * @param {(() => object|null)|null} [requestAccount] - 该请求所用的那一个账户（oneAccountForRequest），图片在它上面上传
  * @returns {Promise<Array>} 处理后的消息数组
  */
-const processOriginalLogic = async (messages, thinking_config, chat_type, imgCacheManager, requestAccount = null) => {
+const processOriginalLogic = async (messages, thinking_config, chat_type, imgCacheManager, requestAccount = null, client = null) => {
     const feature_config = thinking_config
 
     for (let message of messages) {
@@ -555,7 +568,7 @@ const processOriginalLogic = async (messages, thinking_config, chat_type, imgCac
 
             for (let item of message.content) {
                 if (isMediaContentItem(item)) {
-                    const normalizedMediaItem = await normalizeMediaContentItem(item, imgCacheManager, requestAccount)
+                    const normalizedMediaItem = await normalizeMediaContentItem(item, imgCacheManager, requestAccount, client)
                     if (normalizedMediaItem) {
                         newContent.push(normalizedMediaItem)
                     }

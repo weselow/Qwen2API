@@ -72,6 +72,8 @@ async function start(t, { script, ...options } = {}) {
     // keeps the page loads of every account apart, and the token refreshes,
     // are signin-worker-egress.test.js's.
     minLoginIntervalMs: 1, loadMinIntervalMs: 1, tokenRefreshMinIntervalMs: 1, minRenewDelayMs: 60000,
+    // A profile goes at once here; the pause before it goes is signin-worker-forget-grace.test.js's.
+    forgetGraceMs: 0,
     ...options
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -508,9 +510,11 @@ test('the log says what was forgotten, never the email, and the log counter read
   // Emails never become log lines (docs/signin-worker.md, "API sidecar").
   assert.equal(lines.some(line => line.includes(email)), false)
 
-  // tools/egress-log-watch.js, as the live session reads a worker's log: both lines it knows are counted, none is found unparsed.
+  // tools/egress-log-watch.js, as the live session reads a worker's log: the three lines it knows are counted —
+  // the forget line by what became of the profile (Qwen2API-j5f) —, none is found unparsed.
   const report = summarize(lines)
   assert.equal(report.counts.get('pages.closed.forgotten'), 1)
   assert.equal(report.counts.get('workerHttp.forget.200'), 1)
+  assert.equal(report.counts.get('forget.kept'), 1)
   assert.equal(report.counts.has('unparsed.worker'), false)
 })

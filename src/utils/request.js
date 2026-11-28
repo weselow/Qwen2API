@@ -9,6 +9,9 @@ const { postCompletions } = require('./impersonate-transport.js')
 const browserEgress = require('./browser-egress.js')
 const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
+// The client of the request, on its way out, ends what precedes the completions call too —
+// the chat's creation and the attachment of a context (Qwen2API-4l1).
+const { assertClientStays, isClientGone } = require('./client-gone')
 const { buildRequestHeaders } = require('./header-profile')
 const lab = require('./v2-lab-sessions')
 const sessionPersistence = require('./v2-session-persistence')
@@ -596,6 +599,8 @@ const externalizeOversizedAgentContext = async (
 
     let file
     try {
+        // Gone already: the uploader is not called — whoever it is (Qwen2API-4l1).
+        assertClientStays(options.client)
         if (bakeHistory !== null) {
             const bake = uploader(bakeHistory, currentToken, currentAccount, {
                 ...options,
@@ -611,6 +616,9 @@ const externalizeOversizedAgentContext = async (
             file = await uploader(originalContent, currentToken, currentAccount, options)
         }
     } catch (error) {
+        // The client's going is no failure of the attachment: said as nothing, compacted to
+        // nothing, and wrapped in nothing — it goes out as it is (Qwen2API-4l1).
+        if (isClientGone(error)) throw error
         // Sin permiso explicito un adjunto fallido NO se disimula. Un turno con tools que
         // ve una fraccion del historial repite lo ya hecho (3 duplicados y 7 turnos
         // desbocados en 6 min el 2026-09-09, todos tras caer el parse de Qwen; cero antes).
@@ -680,6 +688,8 @@ const externalizeOversizedAgentContext = async (
  * 发送聊天请求
  * @param {Object} body - 请求体
  * @param {Object} [options] - Cuenta y continuidad de la solicitud
+ * @param {Object|null} [options.client] - What watchClient(req) returns: a client that
+ *   goes away ends the chat's creation and the attachment of a context (Qwen2API-4l1)
  * @returns {Promise<Object>} 响应结果
  */
 const sendChatRequest = async (body, options = {}) => {
@@ -753,6 +763,10 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
 
     if (!lab.authOrigin) applyProxyToAxiosConfig(requestConfig, currentAccount);
 
+    // Gone while the account was taken: no chat is made for a client that left (Qwen2API-4l1).
+    const client = options.client || null
+    assertClientStays(client)
+
     const chatType = body.chat_type || body.messages?.[0]?.chat_type || 't2t'
     const chat_id = options.chatId || await generateChatID(currentToken, body.model, currentAccount, chatType)
     if (!chat_id) {
@@ -794,6 +808,9 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
         parentId,
         messages
     }
+    // Gone while the chat was created: nothing is uploaded or parsed for it (the empty chat
+    // stays in the account's history, as one does that is created before an attachment fails).
+    assertClientStays(client)
     const contextResult = await externalizeOversizedAgentContext(
         rawPayload,
         currentToken,
@@ -801,7 +818,8 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
         // Solo quien conoce la peticion (¿lleva tools?) puede permitir compactar.
         {
             allowContextCompaction: options.allowContextCompaction === true,
-            contextPrefixKey: options.contextPrefixKey || null
+            contextPrefixKey: options.contextPrefixKey || null,
+            ...(client ? { client } : {})
         }
     )
     const payload = contextResult.payload

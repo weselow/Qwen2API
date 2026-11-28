@@ -158,10 +158,12 @@ const FORGET_TIMEOUT_MS = 35000
  * The app dropped the account: the worker forgets it too (Qwen2API-2l0) — the
  * session it cached, with its silent-renew timer, and the resident page. An
  * account the worker never saw is forgotten all the same. Whether the browser
- * profile goes with it is the worker's own setting.
+ * profile goes with it is the worker's own setting: deleted at once, or after
+ * a pause (`deferred`, Qwen2API-t8s) that any request the worker then takes
+ * for the account takes back — the sign-in of an adding again, a call.
  * @param {string} email
  * @param {number} [timeoutMs]
- * @returns {Promise<{session: boolean, page: boolean, profile: 'kept'|'deleted'|'absent'|'left',
+ * @returns {Promise<{session: boolean, page: boolean, profile: 'kept'|'deleted'|'deferred'|'absent'|'left',
  *   pending?: 'login'|'renewal'}>}
  *   what the worker dropped; `profile` says what became of the browser profile;
  *   `pending` when the worker gave up waiting for a sign-in or a renewal that
@@ -171,7 +173,7 @@ const FORGET_TIMEOUT_MS = 35000
 async function forgetAccount(email, timeoutMs = FORGET_TIMEOUT_MS) {
     const answer = (await postWorker('/forget', { email }, timeoutMs)).data
     if (answer?.ok !== true || typeof answer.session !== 'boolean' || typeof answer.page !== 'boolean' ||
-        !['kept', 'deleted', 'absent', 'left'].includes(answer.profile) ||
+        !['kept', 'deleted', 'deferred', 'absent', 'left'].includes(answer.profile) ||
         (answer.pending !== undefined && !['login', 'renewal'].includes(answer.pending))) {
         throw new SigninError('signin_upstream_error', 502, 'Signin worker returned a malformed forget.')
     }

@@ -1,0 +1,12 @@
+# The sign-in worker's runtime as prod runs it: signin-worker/Dockerfile builds
+# FROM node:20-slim. The worker's own test files are run on it — CI's
+# worker-node20 job, and tools/gate-image/run-worker-tests.js by hand
+# (Qwen2API-25q). How: AGENTS.md, "The test gate".
+#
+#   MSYS_NO_PATHCONV=1 docker build -t qwen2api-gate-node20 -f tools/gate-image/Dockerfile.node20 tools/gate-image
+#
+# openssl and git for the same tests as in Dockerfile.
+FROM node:20-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssl git \
+    && rm -rf /var/lib/apt/lists/*

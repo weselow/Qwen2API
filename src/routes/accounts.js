@@ -200,7 +200,8 @@ const processBatchAccountItem = async (task, account) => {
   updateBatchTaskMessage(task)
 
   try {
-    const authToken = await accountManager.login(email, password, proxy)
+    // allowCreate: the sign-in's session is stored for an account added again too (Qwen2API-jwh).
+    const authToken = await accountManager.login(email, password, proxy, { allowCreate: true })
     if (!authToken) {
       throw new Error('登录失败')
     }
@@ -365,7 +366,8 @@ router.post('/setAccount', adminKeyVerify, async (req, res) => {
       return res.status(409).json({ error: '账号已存在' })
     }
 
-    const authToken = await accountManager.login(email, password, normalizedProxy, { throwOnFailure: true })
+    // allowCreate: the sign-in's session is stored for an account added again too (Qwen2API-jwh).
+    const authToken = await accountManager.login(email, password, normalizedProxy, { throwOnFailure: true, allowCreate: true })
     if (!authToken) {
       return res.status(401).json({ error: '登录失败' })
     }
