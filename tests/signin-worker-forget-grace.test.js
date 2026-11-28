@@ -161,8 +161,12 @@ test('removed and not added again: the profile is deleted once the pause is over
   assert.equal(Date.now() - before < graceMs, true, 'and /forget did not wait for the pause')
   await until(() => !profileThere(dataDir, email), 8000, 'the profile removed after the pause')
   assert.equal(Date.now() - before >= graceMs, true, 'not before the pause is over')
-  // One line says what became of the profile, and it carries no email.
-  assert.equal(lines.filter(line => /^\S+ forget profile deleted after the pause \(\d+ sessions\)$/.test(line)).length, 1)
+  // One line says what became of the profile, and it carries no email. Waited for, not read the
+  // moment the directory is gone: the worker writes it after the removal (server.js#runDeletion),
+  // and a poll of the test can see the directory gone a turn of the event loop before that.
+  const afterThePause = () => lines.filter(line => /^\S+ forget profile deleted after the pause \(\d+ sessions\)$/.test(line))
+  await until(() => afterThePause().length > 0, 8000, "the worker's line of the removal after the pause")
+  assert.equal(afterThePause().length, 1)
   assert.equal(lines.some(line => line.includes(email)), false)
   assert.equal((await worker.call('/renew', { email })).status, 404)
   assert.equal((await worker.egress(email)).code, 'no_profile')
